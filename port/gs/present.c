@@ -44,6 +44,10 @@ static void display_of(SDL_Window *w, SDL_Rect *full, SDL_Rect *usable);
    (this file is host code). */
 __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#elif defined(__SWITCH__)
+#include <switch.h>
+#define WINDOW_FLAGS 0
+#define FIXED_SCREEN 1  /* the console's screen */
 #elif defined(__ANDROID__)
 #define WINDOW_FLAGS 0
 #define FIXED_SCREEN 1  /* the whole screen, immersive (landscape: android_main.c's hint) */
@@ -68,6 +72,13 @@ static void window_target(void *unused)
     target.kind = GS_WINDOW_WIN32;
     target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
     target.b = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, NULL);
+#elif defined(__SWITCH__)
+    target.kind = GS_WINDOW_NX;
+    target.a = (uintptr_t)nwindowGetDefault();
+    {   /* dhd.ini's vsync = 0: presents never wait for a free image (the compositor keeps its 60 Hz: no tearing) */
+        const char *vsync = getenv("DHD_VSYNC");
+        nwindowSetSwapInterval(nwindowGetDefault(), vsync && !strcmp(vsync, "0") ? 0 : 1);
+    }
 #elif defined(__ANDROID__)
     target.kind = GS_WINDOW_ANDROID;
     target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
@@ -94,7 +105,7 @@ static void window_target(void *unused)
    make_window's hints; SDL_SetWindowIcon would give the title bar one 512-pixel picture scaled
    down) and the APK's. Elsewhere nothing else gives the window one (Linux) or it is the bundle's
    own picture (macOS): port/res/icon.png, embedded by build_host64.py. */
-#if defined(_WIN32) || defined(__ANDROID__)
+#if defined(_WIN32) || defined(__ANDROID__) || defined(__SWITCH__)
 static void window_icon(void) {}
 #else
 #include "dhd_icon.inc"  /* dhd_icon_png: port/res/icon.png's bytes */
@@ -278,7 +289,8 @@ static int wait_target(int tries)
     return 0;
 }
 
-/* ---- the app in the background (phones: SDL sends these events on Android and iOS only) ---- */
+/* ---- the app in the background (phones: SDL sends these events on Android and iOS only; the
+   Switch: nx_host.c's focus_pass sends them) ---- */
 static volatile int app_background; /* the app is in the background (lifecycle_watch): the game waits */
 static volatile int surface_dropped; /* lifecycle_watch dropped the surface: app_background_wait makes it again */
 
@@ -291,7 +303,9 @@ static bool SDLCALL lifecycle_watch(void *unused, SDL_Event *e)
     (void)unused;
     if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND && !app_background) {
         app_background = 1;
+#ifndef __SWITCH__  /* the console's window stays ours: the swapchain stays too (app_background_wait) */
         if (surface) gs_gpu_surface_reset(&gs, NULL);
+#endif
         surface_dropped = 1;
     } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
         app_background = 0;
@@ -305,6 +319,16 @@ static bool SDLCALL lifecycle_watch(void *unused, SDL_Event *e)
 static void app_background_wait(void)
 {
     hle_log("gs: in the background; the game waits\n");
+#ifdef __SWITCH__
+    /* No picture follows and what was queued runs out, so the GPU is idle before the wait. The
+       default window and its swapchain outlive the home menu and sleep: nothing to make again. */
+    if (graphics_deferred()) graphics_wait();
+    while (app_background && !window_closed) SDL_Delay(20);
+    surface_dropped = 0;
+    gs_pump_messages();
+    hle_log("gs: back in the foreground\n");
+    return;
+#endif
     gs_gpu_surface_reset(&gs, NULL);
     target_ready = 0;
     while (app_background && !window_closed) SDL_Delay(20);
@@ -541,6 +565,9 @@ void gs_window_event(unsigned type)
    the game ends at the next gs_pump_messages. */
 void gs_window_close(void)
 {
+#ifdef __SWITCH__
+    { void nx_request_close(void); nx_request_close(); return; }  /* no event queue here: nx_host.c */
+#endif
     if (sdl_window) {
         SDL_Event e;
         SDL_zero(e);

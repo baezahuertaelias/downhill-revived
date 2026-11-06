@@ -127,6 +127,13 @@ it unchanged (finding 088, CL3).
   60 is reachable there at 1x. A low-end Unisoc T612 phone (Realme, finding 126) does 36-40
   fields/s at 1x and 14 at 2x and cannot hold 60. Gamepad or keyboard only (no touch). Online uses the same
   Rust client as Windows (`dhd_net`, below; not yet tried on the phone).
+- Nintendo Switch (finding 127, not released): `build_host64.py --target switch-arm64` makes a homebrew
+  NRO, `build/switch/downhill-revived.nro`: the same wasm2c core and shared host, built with devkitA64's
+  GCC, with `port/nx` in place of Rust and SDL3 (a deko3d renderer in C, an SDL shim on libnx). Title,
+  menus and a race draw on the console; about 60 fields/s in menus and about 33 on the title and in a
+  race (stock clocks, debug deko3d library). The exact renderer is a stub; online, Discord and texture
+  packs are left out. `port/tools/nx_fulltest.py` runs the whole test on the console unattended (not yet
+  run on the console itself).
 - Retired (finding 088): the 32-bit i686 build (`link.py`, `build_clean.py`, the x87/FP-trap
   runtime), the Direct3D 11 renderer, the C wgpu-native renderer and the browser's JS renderer.
   No D3D11 fallback.

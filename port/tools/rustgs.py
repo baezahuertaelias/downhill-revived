@@ -130,8 +130,9 @@ WASM = 'wasm32-unknown-unknown'
 ANDROID = 'aarch64-linux-android'  # build_host64.py --target android-arm64 (finding 091)
 LINUX = 'x86_64-unknown-linux-gnu'  # build_host64.py --target linux-x64 (here, or cross-built for WSL)
 MAC = 'aarch64-apple-darwin'      # build_host64.py --target macos-arm64, on a Mac
-TARGETS = (X64, WASM, ANDROID, LINUX, MAC)   # i686 is retired
-ARCHIVE_TARGETS = (ANDROID, LINUX, MAC)   # libdhd_render.a
+MAC_X64 = 'x86_64-apple-darwin'   # build_host64.py --target macos-x64, on an Intel Mac (reference traces; not released)
+TARGETS = (X64, WASM, ANDROID, LINUX, MAC, MAC_X64)   # i686 is retired
+ARCHIVE_TARGETS = (ANDROID, LINUX, MAC, MAC_X64)   # libdhd_render.a
 CHECK_TARGETS = TARGETS
 PROFILES = ('release', 'fixloop')
 FEATURES = ('test-hooks',)       # what a caller may add; native / web are rustgs's own
@@ -239,7 +240,7 @@ def c_tools(triple):
         # target dir; cc puts these flags last, so they win
         return {'CC_' + var: str(bin_dir / 'clang.exe'), 'AR_' + var: str(bin_dir / 'llvm-ar.exe'),
                 'CFLAGS_' + var: '-g0'}
-    if triple in (LINUX, MAC) and os.name != 'nt':
+    if triple in (LINUX, MAC, MAC_X64) and os.name != 'nt':
         # the machine's own compiler (cc finds it; Apple's through xcrun, with the SDK ring needs),
         # without debug info: ring asks for -g3, whose DWARF names the registry and the target dir
         return {'CFLAGS_' + var: '-g0'}
@@ -764,8 +765,8 @@ def build(triple, features=(), profile='release', no_cache=False, crate=RENDER_C
     """Builds (or fetches) the library; returns the report dict. Raises Refused or SystemExit."""
     features = list(parse_features(','.join(features)))
     check_features(features)
-    if triple == MAC and sys.platform != 'darwin':
-        refuse('--target %s builds on a Mac (ring compiles its C against the macOS SDK); `check` runs here' % MAC)
+    if triple in (MAC, MAC_X64) and sys.platform != 'darwin':
+        refuse('--target %s builds on a Mac (ring compiles its C against the macOS SDK); `check` runs here' % triple)
     if crate not in CRATES:
         refuse('--crate %s: one of %s' % (crate, ', '.join(CRATES)))
     if crate == SETTINGS_CRATE:

@@ -628,6 +628,20 @@ static NativeTexture *native_decode(Native *n, Gs *g, uint64_t tex0, unsigned w,
         }
     /* The text engine's font, made sharp for high resolutions (dhd.ini font, finding 058). */
     int sharp = indexed && n->replace_on && font_sharp_on() && font_sharp_match(tex0);
+#ifdef __SWITCH__
+    {   /* A fixed heap (dhd_render_nx.c), where the PC has its video memory: the textures unused the
+           longest go when it runs low. Their memory comes back once the GPU is past them. */
+        int dhdr_nx_heap_low(void);
+        for (uint64_t age = 1200; dhdr_nx_heap_low() && age >= 8; age /= 4)
+            for (unsigned i = 0; i < NATIVE_TEXTURES; i++) {
+                NativeTexture *t = &n->textures[i];
+                if (t != victim && t->texture && t->used + age < n->field) {
+                    native_texture_release(t);
+                    t->key = 0, t->pack = NULL, t->pack_checked = 0;
+                }
+            }
+    }
+#endif
     int made = native_texture_create(n, victim, pixels, w, h, sharp, key);
     free(pixels);
     if (!made) return NULL;

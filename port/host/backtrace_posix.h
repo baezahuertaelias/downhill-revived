@@ -5,7 +5,11 @@
    Async-signal-safe enough for a report on the way out (no malloc). */
 #ifndef DHD_BACKTRACE_POSIX_H
 #define DHD_BACKTRACE_POSIX_H
-#if defined(__ANDROID__) && __ANDROID_API__ < 33
+#if defined(__SWITCH__)
+/* no unwinder here: the crash handler (port/nx/src/host_nx.c) walks the frame pointers itself */
+static inline int backtrace(void **frames, int max) { (void)frames; (void)max; return 0; }
+static inline void backtrace_symbols_fd(void *const *frames, int n, int fd) { (void)frames; (void)n; (void)fd; }
+#elif defined(__ANDROID__) && __ANDROID_API__ < 33
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>

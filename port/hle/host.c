@@ -60,7 +60,10 @@
 #else
 /* POSIX crash/dump signals hand a ucontext_t: x86_64, or aarch64 (Android, finding 091; macOS,
    whose registers sit behind a pointer, with fp and lr right after x0-x28). CTX_X: x0 up. */
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(__x86_64__)
+#define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__rip)
+#define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__rsp)
+#elif defined(__APPLE__)
 #define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__pc)
 #define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__sp)
 #define CTX_X(c) ((const unsigned long long *)(c)->uc_mcontext->__ss.__x)
@@ -183,6 +186,12 @@ static void print_snapshot(const Snapshot *s)
     fprintf(stderr, "  pc %016llX sp %016llX lr %016llX x0 %016llX x1 %016llX x2 %016llX x19 %016llX x29 %016llX\n",
             (unsigned long long)CTX_IP(c), (unsigned long long)CTX_SP(c), x[30], x[0], x[1], x[2],
             x[19], x[29]);
+#elif defined(__APPLE__)
+    const __typeof__(c->uc_mcontext->__ss) *r = &c->uc_mcontext->__ss;
+    fprintf(stderr, "  rip %016llX rax %016llX rbx %016llX rcx %016llX rdx %016llX rsi %016llX rdi %016llX rsp %016llX\n",
+            (unsigned long long)r->__rip, (unsigned long long)r->__rax, (unsigned long long)r->__rbx,
+            (unsigned long long)r->__rcx, (unsigned long long)r->__rdx, (unsigned long long)r->__rsi,
+            (unsigned long long)r->__rdi, (unsigned long long)r->__rsp);
 #else
     const greg_t *r = c->uc_mcontext.gregs;
     fprintf(stderr, "  rip %016llX rax %016llX rbx %016llX rcx %016llX rdx %016llX rsi %016llX rdi %016llX rsp %016llX\n",
@@ -577,6 +586,9 @@ static int SDLCALL freeze_watch(void *unused)
 enum { NAMED_THREADS = 16 };
 #ifdef _WIN32
 static struct { const char *name; HANDLE handle; } named[NAMED_THREADS];
+#elif defined(__SWITCH__)
+#include <switch.h>
+static struct { const char *name; Handle handle; } named[NAMED_THREADS];
 #else
 static struct { const char *name; pthread_t handle; } named[NAMED_THREADS];
 #endif
@@ -589,6 +601,7 @@ void host_thread_name(const char *name)
     if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 64)) SetThreadDescription(GetCurrentThread(), wide);
 #elif defined(__APPLE__)
     pthread_setname_np(name);  /* the calling thread's own */
+#elif defined(__SWITCH__)
 #else
     /* Linux and Android: the main thread's name is the process's own (ps, top, pgrep, a desktop's
        system monitor), so that thread keeps "dhd" (a crash report then says thread dhd) */
@@ -602,6 +615,8 @@ void host_thread_name(const char *name)
 #ifdef _WIN32
     DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &named[at].handle, 0, FALSE,
                     DUPLICATE_SAME_ACCESS);
+#elif defined(__SWITCH__)
+    named[at].handle = threadGetCurHandle();
 #else
     named[at].handle = pthread_self();
 #endif
@@ -618,6 +633,11 @@ unsigned host_thread_cpu(const char **names, double *seconds, unsigned max)
         names[n] = named[i].name;
         seconds[n++] = (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
                         ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__SWITCH__)  /* the kernel's ticks on all cores, 19.2 MHz */
+        u64 ticks;
+        if (!named[i].name || R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, named[i].handle, TickCountInfo_Total))) continue;
+        names[n] = named[i].name;
+        seconds[n++] = (double)ticks / 19200000.0;
 #elif defined(__APPLE__)  /* no per-thread CPU clocks: Mach's thread times */
         thread_basic_info_data_t info;
         mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
@@ -666,6 +686,9 @@ double host_current_thread_cpu(void)
     if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
     return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
             ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__SWITCH__)
+    u64 ticks;
+    return R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, TickCountInfo_Total)) ? 0 : (double)ticks / 19200000.0;
 #else
     struct timespec t;
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t)) return 0;
@@ -680,6 +703,12 @@ double host_process_cpu(void)
     if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
     return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
             ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__SWITCH__)  /* the named threads', which are the ones that work */
+    const char *names[NAMED_THREADS];
+    double seconds[NAMED_THREADS], sum = 0;
+    unsigned count = host_thread_cpu(names, seconds, NAMED_THREADS);
+    for (unsigned i = 0; i < count; i++) sum += seconds[i];
+    return sum;
 #else
     struct timespec t;
     if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t)) return 0;
@@ -1019,6 +1048,13 @@ void host_settings_load(void)
         }
         at += n + (at[n] == ',');
     }
+#ifdef __SWITCH__
+    /* The wait before VBLANK, not just-in-time frames (dhd.ini's DHD_LATENCY = 1 brings them back):
+       once a picture takes over a field from its pad read, host_pacing_wait reads the moved grid
+       as a queue and holds each frame to half that time past a field, 33 fields/s on the title,
+       with the cores idle. The render thread then never sleeps with a picture. */
+    if (!getenv("DHD_LATENCY")) host_putenv_s("DHD_LATENCY", "0");
+#endif
     hle_log("settings:%s\n", *settings_seen ? settings_seen : " (none)");
 }
 
