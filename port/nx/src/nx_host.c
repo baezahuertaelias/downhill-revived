@@ -54,13 +54,13 @@ static int game_thread(void *start)
 /* ---- the end ----
    Any thread may end the game: exit() on the game's thread (the close at its next field, EXIT GAME)
    runs the game's atexit list and then last_exit_step, the first registered. Going back to the
-   Homebrew Menu would unmap the code under the threads still running, on the wrong thread too, so
-   the running game always ends the process: exit mode 1 is the system's own exit (libnx's
-   _appletExitProcess), which is also the answer the system waits for after an exit request. */
+   Homebrew Menu from exit() would unmap the code under the threads still running, on the wrong
+   thread too, so the system's own close request ends the process: exit mode 1 is the system's own
+   exit (libnx's _appletExitProcess), which is also the answer the system waits for after an exit request. */
 extern u32 __nx_applet_exit_mode;  /* libnx's */
 void gamepad_nx_hold(int hold);    /* gamepad_nx.c */
 static int game_started, back_to_menu;
-static volatile int leaving, main_parked, close_wanted;
+static volatile int leaving, main_parked, close_wanted, menu_wanted, menu_exit;
 
 static void flush_all(void)
 {
@@ -84,6 +84,17 @@ static void park(void)
 static void last_exit_step(void)
 {
     if (!claim_leaving()) park();  /* the main thread's force_leave has it */
+    if (menu_wanted && game_started && threadGetCurHandle() != main_thread) {
+        /* EXIT GAME: back to the Homebrew Menu (sphaira), not the end of the process. This is the last
+           exit step, on the game's thread, after the workers and the render thread have stopped
+           (host_end, finding 210). The process must leave from the main thread, as libnx's start code
+           expects: this thread ends here, and sdl_host_main returns from main. Exit mode stays 0,
+           which is the loader's way back to the menu. */
+        flush_all();
+        menu_exit = 1;
+        SDL_SetAtomicInt(&game_running, 0);
+        svcExitThread();
+    }
     if (game_started && !back_to_menu) {
         if (threadGetCurHandle() != main_thread)  /* it stops using hid before libnx closes it */
             for (int i = 0; i < 100 && !main_parked; i++) svcSleepThread(1000000);
@@ -102,8 +113,10 @@ static void force_leave(void)
     _Exit(0);
 }
 
-/* EXIT GAME (present.c), any thread; the system's exit request comes the same way. */
-void nx_request_close(void) { close_wanted = 1; }
+/* EXIT GAME (present.c), any thread: back to the Homebrew Menu. The system's exit request does not come
+   this way (it ends the process: the loop in sdl_host_main). force_leave still ends the process when
+   the game doesn't stop in CLOSE_SECONDS. */
+void nx_request_close(void) { menu_wanted = 1; close_wanted = 1; }
 
 static void close_pass(void)
 {
@@ -258,12 +271,12 @@ int sdl_host_main(int (*game)(void *), void *arg)
     SDL_Thread *thread = nx_thread_create(game_thread, "game", &start, GAME_STACK);
     if (!thread) return 1;
     while (SDL_GetAtomicInt(&game_running)) {
-        if (leaving) {  /* exit() on another thread, which waits for this before hid and fs close */
+        if (leaving && !menu_exit) {  /* exit() on another thread, which waits for this before hid and fs close */
             main_parked = 1;
             park();
         }
         run_request();
-        if (!appletMainLoop()) nx_request_close();  /* the system asks the program to close */
+        if (!appletMainLoop()) close_wanted = 1;  /* the system asks the program to close: the process ends */
         close_pass();
         focus_pass();
         second_pass();
@@ -273,6 +286,7 @@ int sdl_host_main(int (*game)(void *), void *arg)
     }
     int code = 0;
     SDL_WaitThread(thread, &code);
+    if (menu_exit) fprintf(stderr, "nx: back to the Homebrew Menu\n");
     return code;
 }
 

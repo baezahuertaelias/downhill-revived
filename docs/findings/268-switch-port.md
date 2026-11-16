@@ -194,3 +194,17 @@ At scale 1 even 460 MHz does not limit the race; at scale 2 even 768 MHz does. I
 
 Sphaira crashed three times just as it started an NRO (result 0, the same stack each time), before the
 game's first log line. Not explained yet; the test tool polls sphaira's FTP during those launches.
+
+## EXIT GAME returns to the Homebrew Menu (2026-11-16, not yet run on a console)
+
+EXIT GAME used to end the whole process, taking the Homebrew Menu (sphaira) with it. Now it ends
+the game's threads (host_end, finding 210); the game thread's last exit step (`last_exit_step`,
+`nx_host.c`) ends that thread, `sdl_host_main` returns from `main`, and the loader reloads the menu
+(exit mode 0). The system's own close request (Home, close the software) still ends the process, and
+the 2 s deadline (`force_leave`) still ends it if the game does not stop. Untested: it relies on
+`host_end` having stopped every other thread, which only a console run shows.
+
+`nx_shaders.py` was adapted to main's `native.wgsl`: the depth loads are patched where they now are
+(`grow_source`, `convert_depth0..3`), and the convert entry point keeps the Switch's float output
+for main's `u32` stores (`nx_unpack`). The shaders compile with naga and uam; the C does not yet build
+(the 0.8.9 build was stopped for memory).

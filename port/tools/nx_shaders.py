@@ -32,10 +32,12 @@ def wgsl():
     gs = ROOT / 'port/gs'
     text = 'enable dual_source_blending;\n' + (gs / 'native.wgsl').read_text() + (gs / 'native_dual.wgsl').read_text()
     text = text.replace('texture_depth_2d', 'texture_2d<f32>')
-    text, n = re.subn(r'(fn load_depth\(t: texture_2d<f32>, xy: vec2<i32>\) -> f32 \{.*?return textureLoad\(t, xy, 0\))(;)',
-                      r'\1.r\2', text, flags=re.S)
-    if n != 1:
-        sys.exit('nx_shaders: load_depth not found')
+    # a depth texture is read as a colour one (deko3d binds a depth image as a texture): its loads give
+    # the .r of the vec4 where the shader wants the depth. Main's native.wgsl loads them in the grow
+    # entry point and in load_convert_depth0..3 (the old load_depth helper is gone).
+    text, n = re.subn(r'(return textureLoad\((?:grow_source|convert_depth[0-3]), xy, 0\))(;)', r'\1.r\2', text)
+    if n != 5:
+        sys.exit('nx_shaders: expected 5 depth loads, found %d' % n)
     # uam loses a dynamic index into a vector's components (it reads .x): by select instead
     text += '''
 fn nx_pick(v: vec4<u32>, i: u32) -> u32 {
@@ -52,6 +54,9 @@ fn nx_div(a: u32, b: u32) -> u32 {
 fn nx_mod(a: u32, b: u32) -> u32 {
     if (b == 0u) { return 0u; }
     return a - nx_div(a, b) * b;
+}
+fn nx_unpack(w: u32) -> vec4<f32> {
+    return vec4<f32>(f32(w & 255u), f32(w >> 8u & 255u), f32(w >> 16u & 255u), f32(w >> 24u)) / 255.0;
 }
 // The inverse table as a 128 x 64 RGBA8 texture (dhd_render_nx.c): x in red, y in green.
 fn nx_inverse(i: u32) -> u32 {
@@ -88,12 +93,14 @@ fn native_convert(@builtin(global_invocation_id) tid: vec3<u32>) {
 fn native_convert(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let tid = vec2<u32>(position.xy);
 """),
-                     ("""textureStore(native_converted, tid.xy, load_rgba(convert_base, vec2<i32>(tid.xy)));
-        return;""", 'return load_rgba(convert_base, vec2<i32>(tid.xy));'),
-                     ("""textureStore(native_converted, tid.xy, vec4<f32>(f32(rgba & 255u), f32(rgba >> 8u & 255u),
-                                                     f32(rgba >> 16u & 255u), f32(rgba >> 24u)) / 255.0);""",
-                      """return vec4<f32>(f32(rgba & 255u), f32(rgba >> 8u & 255u),
-                     f32(rgba >> 16u & 255u), f32(rgba >> 24u)) / 255.0;""")):
+                     # main's base texture is u32 words and the stores are r32uint; deko3d's textures are
+                     # RGBA8, so the base is read as a colour, packed, and the result written as a colour
+                     ('var convert_base: texture_2d<u32>', 'var convert_base: texture_2d<f32>'),
+                     ('return textureLoad(convert_base, xy, 0).x;',
+                      'let b = vec4<u32>(round(textureLoad(convert_base, xy, 0) * 255.0));\n    return b.r | b.g << 8u | b.b << 16u | b.a << 24u;'),
+                     ("""textureStore(native_converted, tid.xy, vec4<u32>(load_convert_base(vec2<i32>(tid.xy)), 0u, 0u, 0u));
+        return;""", 'return nx_unpack(load_convert_base(vec2<i32>(tid.xy)));'),
+                     ('textureStore(native_converted, tid.xy, vec4<u32>(rgba, 0u, 0u, 0u));', 'return nx_unpack(rgba);')):
         if old not in text:
             sys.exit('nx_shaders: %s not found' % old)
         text = text.replace(old, new)
