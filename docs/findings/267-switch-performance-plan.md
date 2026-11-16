@@ -74,9 +74,48 @@ cores (to check on the console), so the game, `vu`, `gs`, render, sound and main
    instead of swinging between 47 and 54 with 60-70 ms spikes. The three longest fields in the
    branch's runs (6223, 6557, 6647) came from the scripted race, so check what they are first.
 
+## Investigation results (2026-11-16, read from the merged tree; nothing measured)
+
+**B. CPU and build flags.** Threads (`sdl_nx.c` `placements`): game 0x2C on core 0 only, vu 0x2C on
+core 1 only, native 0x2D and gs 0x2E on core 2 with all three cores allowed, `nx audio` 0x2A on
+core 2 only, movie 0x3B. So the layout step 2 asks for already exists in the branch; what is
+unknown is whether it helps (no per-thread waits are logged). The VU0 interpreter uses
+`<arm_neon.h>` with SIMDe's SSE mapping, the same file as Android, so NEON is in use for it; the
+emulated VU1 kernels on this target were not checked for NEON (the Switch flags are
+`-march=armv8-a+crc+crypto -mtune=cortex-a57`, no `-mcpu`, no LTO). PGO is gcc's, limited to
+`core_*.c` and `vu0_interp.c` (`build_host64.py`). Sound: the game's mixer writes into a 64 KiB
+ring through `SDL_PutAudioStreamData`; `nx audio` only drains it, so the mixing stays on the game
+thread, as the plan says.
+
+**Native VU is not active on the Switch, and the dhd.ini table is behind.** `dhd_render_nx.c` has
+no mesh hook (`gs_mesh_hook`, `gs_mesh_mode`, finding 249 and `gs_mesh.h`), so the translated mesh
+loops never run and VU1 stays emulated: that is the 17.6 ms `vu` thread. A mesh path in deko3d is
+therefore the largest CPU lever and belongs to step 3 first, not last. Also `settings_nx.c`'s table
+lacks `native_vu`, `shadows`, `lens_flare`, `particles`, the `touch_*` keys, `language`,
+`room_region` and `stick_dead_zone`, so Performance Mode cannot be set from dhd.ini on the console
+until they are added.
+
+**C. Renderer gap** (main's gains against `dhd_render_nx.c`, a copy of 0.7.6's Rust):
+
+| Change | Applies to deko3d | Where | Effort | Risk |
+|---|---|---|---|---|
+| Native VU mesh draws (249, 253, 264) | yes, the biggest: removes most `vu` thread time | Rust mesh path to port; `gs_mesh.h` and `vu1_mesh.inc` are shared C | high | high: new vertex format, near-bound clipping |
+| Fewer render passes (112) | yes | Rust-only | medium | medium |
+| Framebuffer cache (109) | partly: Vulkan-specific, deko3d has no render-pass objects | Rust-only | medium | medium |
+| Early-Z probe change (111) | yes, if the probe is used at all (the exact front end is a stub) | shared C and Rust | low | low |
+| Present from the display surface (247) | to check | `present.c` is shared; the image path is Rust-only | medium | medium |
+
+**D. Defaults and pacing.** Handheld detection is done once in `nx_host.c` (`appletGetOperationMode`
+forces `DHD_SCALE=1` for that run, dhd.ini untouched), so scale already follows the mode. The
+phone rule of finding 263 is Rust (`phone_defaults.rs`, `dhd_settings::phone`), which this target
+does not link, so a Switch rule goes in `settings_nx.c` after the table is brought up to date, and
+writes Performance Mode only to a dhd.ini that has none of `shadows`, `lens_flare`, `particles`.
+A 30 fields/s option exists as the game's `fps` setting (`fps.c`, default 60, `DHD_FPS`); whether
+30 paces evenly on this target needs a console run.
+
 ## Work split (subagents)
 
-Not started. Step 0 comes first and alone, because every other piece reads the merged tree. After
+Pieces A to D are done (A: the merge, B to D: the results above). Only E remains, and it needs a console. Step 0 came first and alone, because every other piece reads the merged tree. After
 it, steps 2 to 5's investigations are read-only and can run in parallel; changes follow one at a
 time, each measured on the console, which only a person with the hardware can do.
 
@@ -103,7 +142,8 @@ merge in a throwaway worktree. Nothing from it is used here.
   Switch PGO beside main's clang PGO), `native_core.inc` and `STATE.md` (no markers left).
   Run here: `check.py docs` OK. NOT run: `check.py quick` stops at a missing `asm/` (no ISO on
   this machine); the NRO cannot be built (no devkitPro). The merged Switch code is uncompiled.
-- [ ] step 1: baseline on the console
+- [x] 2026-11-16: investigations B, C, D written above
+- [ ] step 1: baseline on the console (needs a console)
 - [ ] steps 2 to 5
 
 ## Decisions
@@ -115,7 +155,9 @@ merge in a throwaway worktree. Nothing from it is used here.
 
 ## Surprises
 
-None yet.
+- Native VU was assumed to be a thing to measure on the Switch; it is not present there at all (the
+  renderer has no mesh hook). Step 3's first job is the mesh path.
+- The thread placement of step 2 was already in the contributor's branch.
 
 ## Result
 
