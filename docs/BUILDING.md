@@ -296,6 +296,44 @@ build/host64-<macos|linux>/dhd64 --elf PATH/SCUS_971.77` (it builds the launcher
 Off Windows the object cache is used only when `DHD_OBJCACHE_DIR` names a folder; rustgs's target
 dirs go to `DHD_CARGO_DIR`, else `~/.cache/dhd-cargo`.
 
+### Nintendo Switch
+
+A homebrew NRO for a modded console, not a release (finding 268). Built so far only on an Intel Mac;
+the steps below have not been tried on another machine.
+
+- [devkitPro](https://devkitpro.org/wiki/Getting_Started) packages: `switch-dev`, `deko3d`, `uam`,
+  `switch-tools`. `DEVKITPRO` names the install (default `/opt/devkitpro`).
+- For the core, on a Mac: MacPorts `llvm-23` and `wabt`, wasi-sdk 34 (`WASI_SYSROOT` names its
+  `share/wasi-sysroot`), SIMDe (`SIMDE_DIR`), and `WABT_DIR=/opt/local`.
+- [naga-cli](https://crates.io/crates/naga-cli) 29.0.3, with `NAGA` naming the binary (default
+  `~/DevCaches/naga/naga`).
+- `PATH`, in this order: wasi-sdk's `bin`, MacPorts' `libexec/llvm-23/bin`, MacPorts' `bin`, then the
+  rest. MacPorts' llvm-23 has no `clang`, so `clang` must be wasi-sdk's. That one compiles only for
+  wasm, and the data image is assembled for x86, so set `DHD_IMAGE_CC=/usr/bin/clang`.
+
+Then:
+
+    python3 port/tools/build_wasm.py
+    python3 port/tools/build_host64.py --target switch-arm64 build/wasm/dhd_core.wasm
+
+The output is `build/switch/downhill-revived.nro`. Copy your own disc image and the NRO to the SD card:
+
+    /switch/downhill-revived/downhill-revived.nro
+    /switch/downhill-revived/SCUS-97177.iso
+
+The game makes `dhd.ini` there on its first start, and `dhd.log` and the saves also go in that folder.
+Start the Homebrew Menu by holding R while starting a game: the album's applet mode has too little
+memory, and the game says so.
+
+To test on a console running the sphaira menu with its FTP server (port 5000) and nxlink receiver:
+
+    python3 port/tools/nx_fulltest.py --ip CONSOLE_IP
+
+The console's address can also come from `DHD_SWITCH_IP`. `--only BC` runs chosen phases, and `--dry-run`
+shows each phase's settings without touching the network. The report is
+`build/nx-test/<timestamp>/report.md`. This tool has not yet run on a real console; finding 268 lists
+what else is unverified.
+
 ### SDL3 (window, sound, controllers)
 
 `port/tools/sdl3.py`, which `package_release.py` runs, provides SDL3 as a static library, so

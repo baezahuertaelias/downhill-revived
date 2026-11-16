@@ -1,15 +1,24 @@
-/* fiber.c's switch for x86-64 System V (Linux): rbx, rbp, r12-r15 and MXCSR are callee-saved. */
+/* fiber.c's switch for x86-64 System V (Linux, Intel macOS): rbx, rbp, r12-r15 and MXCSR are callee-saved. */
 #include <stdint.h>
 #include <string.h>
 #include <xmmintrin.h>
 #include "fiber_switch.h"
+
+/* The symbols: ELF's, or Mach-O's (a leading underscore, no .type) */
+#ifdef __APPLE__
+#define ASM_FUNCTION(name) ".globl _" #name "\n_" #name ":\n"
+#define ASM_SYMBOL(name) "_" #name
+#else
+#define ASM_FUNCTION(name) ".globl " #name "\n.type " #name ",@function\n" #name ":\n"
+#define ASM_SYMBOL(name) #name
+#endif
 
 /* rdi=&save, rsi=resume. One 56-byte frame below the return address:
      [0] rbx  [8] rbp  [16] r12  [24] r13  [32] r14  [40] r15  [48] MXCSR
    A new fiber's frame returns into fiber_start with rbx holding fiber_entry's argument. */
 __asm__(
 ".text\n"
-".globl fiber_switch_asm\n.type fiber_switch_asm,@function\nfiber_switch_asm:\n"
+ASM_FUNCTION(fiber_switch_asm)
 "  sub $56,%rsp\n"
 "  mov %rbx,0(%rsp)\n"
 "  mov %rbp,8(%rsp)\n"
@@ -29,9 +38,9 @@ __asm__(
 "  ldmxcsr 48(%rsp)\n"
 "  add $56,%rsp\n"
 "  ret\n"
-".globl fiber_start\n.type fiber_start,@function\nfiber_start:\n"
+ASM_FUNCTION(fiber_start)
 "  mov %rbx,%rdi\n"
-"  call fiber_entry\n"
+"  call " ASM_SYMBOL(fiber_entry) "\n"
 "  ud2\n"
 );
 void fiber_start(void);

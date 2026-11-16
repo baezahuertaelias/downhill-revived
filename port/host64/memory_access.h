@@ -7,6 +7,10 @@
 #include <string.h>
 #include "wasm-rt.h"
 #include "memory_layout.h"
+/* gcc (the Switch's) has no __builtin_assume */
+#if !defined(__clang__)
+#define __builtin_assume(x) do { if (!(x)) __builtin_unreachable(); } while (0)
+#endif
 #if WASM_RT_USE_SEGUE || WABT_BIG_ENDIAN
 #error Host64 translation requires little-endian linear memory and Segue disabled
 #endif

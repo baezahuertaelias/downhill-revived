@@ -128,7 +128,7 @@ def generate(destination, early_flags=True):
             '   interpreted/AOT code can observe the frame. Keep expired times in',
             '   the caller instead of copying the ready arrays and empty queue.',
             '   The code-word guard and the assertions above bound this proof. */',
-            'Vu local;',
+            'Vu local __attribute__((uninitialized)); /* the fields below are all it reads; zeroing it all costs per clip */',
             'local.c = u->c; local.cycle = u->cycle; local.unit = 1;',
             'local.code_mask = u->code_mask; local.data_mask = u->data_mask;',
             'local.top = u->top; local.itop = u->itop; local.kick = u->kick; local.opaque = u->opaque;',

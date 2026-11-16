@@ -38,7 +38,8 @@ ALLOWED_LIBS_FILES = {'aarch64-linux-android': ROOT / 'port' / 'render' / 'nativ
                       'x86_64-unknown-linux-gnu': ROOT / 'port' / 'render' / 'native-static-libs-x86_64-unknown-linux-gnu.txt',
                       'aarch64-apple-darwin': ROOT / 'port' / 'render' / 'native-static-libs-aarch64-apple-darwin.txt',
                       'aarch64-apple-ios': ROOT / 'port' / 'render' / 'native-static-libs-aarch64-apple-ios.txt',
-                      'aarch64-apple-ios-sim': ROOT / 'port' / 'render' / 'native-static-libs-aarch64-apple-ios.txt'}
+                      'aarch64-apple-ios-sim': ROOT / 'port' / 'render' / 'native-static-libs-aarch64-apple-ios.txt',
+                      'x86_64-apple-darwin': ROOT / 'port' / 'render' / 'native-static-libs-x86_64-apple-darwin.txt'}
 DYNAMIC_CRT = re.compile(rb'[/-]defaultlib:\s*"?msvcrt', re.I)
 SCN_CODE = 0x00000020
 SCN_EXECUTE = 0x20000000

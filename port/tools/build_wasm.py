@@ -438,7 +438,8 @@ def image_stage(wanted):
     aliases = {}
     for m in re.finditer(r'/alternatename:(\w+)=(\w+)', symbols_s):
         aliases[m.group(1)] = m.group(2)
-    p = run(['clang', '--target=i686-pc-windows-itanium', '-c', paths[0], '-o', paths[0] + '.o'])
+    # DHD_IMAGE_CC: a clang with the x86 target, where the one on PATH has only wasm's (wasi-sdk's)
+    p = run([os.environ.get('DHD_IMAGE_CC', 'clang'), '--target=i686-pc-windows-itanium', '-c', paths[0], '-o', paths[0] + '.o'])
     if p.returncode:
         sys.exit(p.stderr)
     image_obj = paths[0] + '.o'

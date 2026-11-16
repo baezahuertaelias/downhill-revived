@@ -8,6 +8,9 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__SWITCH__)
+#include <malloc.h>
+#include <switch.h>
 #else
 #define _GNU_SOURCE
 #include <sys/mman.h>
@@ -48,6 +51,16 @@ static char *stack_map(size_t size) {
     return p;
 }
 static void stack_unmap(char *p,size_t size) { (void)size; VirtualFree(p,0,MEM_RELEASE); }
+#elif defined(__SWITCH__)
+/* Heap memory, its lowest page made inaccessible: Horizon has no demand paging, but 8 MiB per EE
+   thread fits in title takeover's 3 GiB. */
+static size_t os_page(void) { return 0x1000; }
+static char *stack_map(size_t size) {
+    char *p=memalign(0x1000,size);
+    if (p && R_FAILED(svcSetMemoryPermission(p,page,Perm_None))) { free(p); p=NULL; }
+    return p;
+}
+static void stack_unmap(char *p,size_t size) { (void)size; svcSetMemoryPermission(p,page,Perm_Rw); free(p); }
 #else
 static size_t os_page(void) { return (size_t)sysconf(_SC_PAGESIZE); }
 static char *stack_map(size_t size) {

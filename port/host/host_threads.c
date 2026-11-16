@@ -25,6 +25,8 @@
 #include <time.h>
 #ifdef _WIN32
 #include <windows.h>
+#elif defined(__SWITCH__)
+#include <switch.h>
 #else
 #include <pthread.h>
 #include <unistd.h>
@@ -49,6 +51,8 @@ static struct {
     uint64_t ended_cycles;  /* the same in cycles (Windows) */
 #ifdef _WIN32
     HANDLE handle;          /* a duplicate, closed when the thread ends */
+#elif defined(__SWITCH__)
+    Handle handle;          /* the thread's own kernel handle (libnx) */
 #else
     pthread_t handle;
 #endif
@@ -63,6 +67,9 @@ double host_current_thread_cpu(void)
     if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
     return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
             ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__SWITCH__)  /* the kernel's ticks on all cores, 19.2 MHz */
+    u64 ticks;
+    return R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, CUR_THREAD_HANDLE, TickCountInfo_Total)) ? 0 : (double)ticks / 19200000.0;
 #else
     struct timespec t;
     if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t)) return 0;
@@ -110,6 +117,8 @@ void host_thread_name(const char *name)
     if (!strcmp(name, "game") || !strcmp(name, "vu") || !strcmp(name, "gs") || !strcmp(name, "native"))
         pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
 #endif
+#elif defined(__SWITCH__)
+    /* no names on Horizon */
 #else
     /* Linux and Android: the main thread's name is the process's own (ps, top, pgrep, a desktop's
        system monitor), so that thread keeps "dhd" (a crash report then says thread dhd) */
@@ -124,6 +133,8 @@ void host_thread_name(const char *name)
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &handle, 0, FALSE,
                          DUPLICATE_SAME_ACCESS))
         return;
+#elif defined(__SWITCH__)
+    Handle handle = threadGetCurHandle();
 #else
     pthread_t handle = pthread_self();
 #endif
@@ -164,6 +175,10 @@ unsigned host_thread_cpu(const char **names, double *seconds, unsigned max)
             if (!GetThreadTimes(named[i].handle, &created, &exited, &kernel, &user)) continue;
             now = (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
                    ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__SWITCH__)
+            u64 ticks;
+            if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, named[i].handle, TickCountInfo_Total))) continue;
+            now = (double)ticks / 19200000.0;
 #elif defined(__APPLE__)  /* no per-thread CPU clocks: Mach's thread times */
             thread_basic_info_data_t info;
             mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;

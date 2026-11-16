@@ -1,6 +1,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__SWITCH__)
+#include <unistd.h>
 #else
 #include "../host/backtrace_posix.h"  /* <execinfo.h>, or Android's own (API < 33) */
 #include <unistd.h>
@@ -32,6 +34,11 @@ void host64_trap(wasm_rt_trap_t code) {
         WriteFile(err,text,(DWORD)k,&written,NULL);
     }
     TerminateProcess(GetCurrentProcess(),0x7700u+(UINT)code);
+#elif defined(__SWITCH__)
+    fprintf(stderr,"host64 trap: %s (EE fiber %d, wasm depth %u)\n",
+            wasm_rt_strerror(code),host64_fiber_id(),wasm_rt_call_stack_depth);
+    fflush(stderr);
+    *(volatile int *)0=0;  /* the crash report names where */
 #else
     void *frames[48]; int n=backtrace(frames,48);
     dprintf(STDERR_FILENO,"host64 trap: %s (EE fiber %d, wasm depth %u)\n",

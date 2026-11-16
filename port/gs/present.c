@@ -49,6 +49,10 @@ static void graphics_failed(void);
    (this file is host code). */
 __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#elif defined(__SWITCH__)
+#include <switch.h>
+#define WINDOW_FLAGS 0
+#define FIXED_SCREEN 1  /* the console's screen */
 #elif defined(__ANDROID__)
 #define WINDOW_FLAGS 0
 #define FIXED_SCREEN 1  /* the whole screen, immersive (landscape: android_main.c's hint) */
@@ -90,6 +94,13 @@ static void window_target(void *unused)
     target.kind = GS_WINDOW_WIN32;
     target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
     target.b = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, NULL);
+#elif defined(__SWITCH__)
+    target.kind = GS_WINDOW_NX;
+    target.a = (uintptr_t)nwindowGetDefault();
+    {   /* dhd.ini's vsync = 0: presents never wait for a free image (the compositor keeps its 60 Hz: no tearing) */
+        const char *vsync = getenv("DHD_VSYNC");
+        nwindowSetSwapInterval(nwindowGetDefault(), vsync && !strcmp(vsync, "0") ? 0 : 1);
+    }
 #elif defined(__ANDROID__)
     target.kind = GS_WINDOW_ANDROID;
     target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
@@ -117,7 +128,7 @@ static void window_target(void *unused)
    make_window's hints; SDL_SetWindowIcon would give the title bar one 512-pixel picture scaled
    down) and the APK's. Elsewhere nothing else gives the window one (Linux) or it is the bundle's
    own picture (macOS): port/res/icon.png, embedded by build_host64.py. */
-#if defined(_WIN32) || defined(__ANDROID__)
+#if defined(_WIN32) || defined(__ANDROID__) || defined(__SWITCH__)
 static void window_icon(void) {}
 #else
 #include "dhd_icon.inc"  /* dhd_icon_png: port/res/icon.png's bytes */
@@ -332,7 +343,8 @@ static int wait_target(int tries)
     return 0;
 }
 
-/* ---- the app in the background (phones: SDL sends these events on Android and iOS only) ---- */
+/* ---- the app in the background (phones: SDL sends these events on Android and iOS only; the
+   Switch: nx_host.c's focus_pass sends them) ---- */
 static volatile int app_background; /* the app is in the background (lifecycle_watch): the game waits */
 static volatile int surface_dropped; /* lifecycle_watch dropped the surface: app_away_wait makes it again */
 
@@ -346,7 +358,9 @@ static bool SDLCALL lifecycle_watch(void *unused, SDL_Event *e)
     if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND && !app_background) {
         app_background = 1;
         gs_render_leave();   /* an absence: no new GPU work from the render thread (render_gate.h, finding 227) */
+#ifndef __SWITCH__  /* the console's window stays ours: the swapchain stays too (app_away_wait) */
         if (surface) gs_gpu_surface_reset(&gs, NULL);
+#endif
         surface_dropped = 1;
     } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
         app_background = 0;
@@ -406,6 +420,21 @@ static void app_away_wait(void)
        released only for the absence this wait went through: one that began while the surface was
        being made again (a quick second flip) keeps it, and the wait starts over. */
     unsigned absence = gs_render_generation();
+#ifdef __SWITCH__
+    /* The default window and its swapchain outlive the home menu and sleep: nothing to make again.
+       What was queued runs out first, so the GPU is idle for the wait. */
+    if (graphics_deferred()) graphics_wait();
+    hle_log("gs: in the background; the game waits (the renderer held)\n");
+    while (app_background && !window_closed) SDL_Delay(20);
+    surface_dropped = 0;
+    gs_pump_messages();
+    SDL_SetAtomicInt(&away_waiting, 0);
+    gs_render_release(absence);
+    host_app_away(0);
+    hle_log("gs: back in the foreground after %.1f s\n", host_wall_seconds() - since);
+    waiting = 0;
+    return;
+#endif
     gs_gpu_surface_reset(&gs, NULL);
     target_ready = 0;
     hle_log("gs: in the background; the game waits (the renderer held, no surface)%s%s\n", away_where ? ", from " : "",
@@ -678,6 +707,9 @@ void gs_window_event(unsigned type)
    stop first, then the process leaves; finding 210). */
 void gs_window_close(void)
 {
+#ifdef __SWITCH__
+    { void nx_request_close(void); nx_request_close(); return; }  /* no event queue here: nx_host.c */
+#endif
 #if !(defined(__APPLE__) && TARGET_OS_IPHONE)
     if (sdl_window) {
         SDL_Event e;

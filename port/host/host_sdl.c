@@ -23,6 +23,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __SWITCH__
+#include <unistd.h>
+#endif
 
 /* ---- environment, errors and the program ---- */
 const char *host_getenv(const char *name) { return getenv(name); }
@@ -254,6 +257,9 @@ void host_file_close(HostFile h)
 {
     FILE *f = file_of(h);
     if (f) {
+#ifdef __SWITCH__
+        if (f != DISCARD && !fflush(f)) fsync(fileno(f));  /* fsdev's close alone promises the card nothing */
+#endif
         if (f != DISCARD) fclose(f);
         SDL_LockSpinlock(&slot_lock);
         file_slot[h] = NULL;
@@ -285,6 +291,11 @@ size_t host_file_write(HostFile h, const void *src, size_t size)
 int host_file_flush(HostFile h)
 {
     FILE *f = file_of(h);
+#ifdef __SWITCH__
+    /* The memory card's writes (mc.c): on the SD card when the game's save says done, as a sleep or
+       a battery running out may be the next thing to happen. */
+    if (f && f != DISCARD) return fflush(f) ? -1 : fsync(fileno(f));
+#endif
     return !f ? -1 : f == DISCARD ? 0 : fflush(f);
 }
 

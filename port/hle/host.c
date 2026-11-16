@@ -107,7 +107,10 @@ static void pipeline_crash_note(void)
 #else
 /* POSIX crash/dump signals hand a ucontext_t: x86_64, or aarch64 (Android, finding 091; macOS,
    whose registers sit behind a pointer, with fp and lr right after x0-x28). CTX_X: x0 up. */
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(__x86_64__)
+#define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__rip)
+#define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__rsp)
+#elif defined(__APPLE__)
 #define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__pc)
 #define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__sp)
 #define CTX_X(c) ((const unsigned long long *)(c)->uc_mcontext->__ss.__x)
@@ -230,6 +233,12 @@ static void print_snapshot(const Snapshot *s)
     fprintf(stderr, "  pc %016llX sp %016llX lr %016llX x0 %016llX x1 %016llX x2 %016llX x19 %016llX x29 %016llX\n",
             (unsigned long long)CTX_IP(c), (unsigned long long)CTX_SP(c), x[30], x[0], x[1], x[2],
             x[19], x[29]);
+#elif defined(__APPLE__)
+    const __typeof__(c->uc_mcontext->__ss) *r = &c->uc_mcontext->__ss;
+    fprintf(stderr, "  rip %016llX rax %016llX rbx %016llX rcx %016llX rdx %016llX rsi %016llX rdi %016llX rsp %016llX\n",
+            (unsigned long long)r->__rip, (unsigned long long)r->__rax, (unsigned long long)r->__rbx,
+            (unsigned long long)r->__rcx, (unsigned long long)r->__rdx, (unsigned long long)r->__rsi,
+            (unsigned long long)r->__rdi, (unsigned long long)r->__rsp);
 #else
     const greg_t *r = c->uc_mcontext.gregs;
     fprintf(stderr, "  rip %016llX rax %016llX rbx %016llX rcx %016llX rdx %016llX rsi %016llX rdi %016llX rsp %016llX\n",
@@ -704,6 +713,12 @@ double host_process_cpu(void)
     if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
     return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
             ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__SWITCH__)  /* the named threads', which are the ones that work */
+    const char *names[16];
+    double seconds[16], sum = 0;
+    unsigned count = host_thread_cpu(names, seconds, 16);
+    for (unsigned i = 0; i < count; i++) sum += seconds[i];
+    return sum;
 #else
     struct timespec t;
     if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t)) return 0;
@@ -1152,6 +1167,13 @@ void host_settings_load(void)
         }
         at += n + (at[n] == ',');
     }
+#ifdef __SWITCH__
+    /* The wait before VBLANK, not just-in-time frames (dhd.ini's DHD_LATENCY = 1 brings them back):
+       once a picture takes over a field from its pad read, host_pacing_wait reads the moved grid
+       as a queue and holds each frame to half that time past a field, 33 fields/s on the title,
+       with the cores idle. The render thread then never sleeps with a picture. */
+    if (!getenv("DHD_LATENCY")) host_putenv_s("DHD_LATENCY", "0");
+#endif
     hle_log("settings:%s\n", *settings_seen ? settings_seen : " (none)");
     gs_mesh_setting_read();   /* Native VU for the VU thread (vu1_mesh.inc), before its first run */
     /* The install id for the online hello (finding 161; port/net/net.c): made once and kept in
