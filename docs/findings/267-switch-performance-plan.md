@@ -143,6 +143,9 @@ merge in a throwaway worktree. Nothing from it is used here.
   Run here: `check.py docs` OK. NOT run: `check.py quick` stops at a missing `asm/` (no ISO on
   this machine); the NRO cannot be built (no devkitPro). The merged Switch code is uncompiled.
 - [x] 2026-11-16: investigations B, C, D written above
+- [x] 2026-11-16: step 4, code part: `settings_nx.c` has main's missing keys (native_vu stays off until
+  the mesh path exists); a new dhd.ini starts with shadows, lens flare and particles off. Neither is
+  compiled or measured; a docked scale 2 default is not set, as it is not yet shown to hold 60.
 - [ ] step 1: baseline on the console (needs a console)
 - [ ] steps 2 to 5
 

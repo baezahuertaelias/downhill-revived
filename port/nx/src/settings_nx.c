@@ -22,6 +22,12 @@ static const Setting settings[] = {
     {"unlock_all", "DHD_UNLOCK_ALL", "0", 0}, {"memory_card", "DHD_MEMCARD", "", 0}, {"sound_latency_ms", "DHD_SND_LATENCY_MS", "", 0},
     {"server", "DHD_NET_SERVER", "wss://dhd.skuza.app", 1}, {"name", "DHD_NET_NAME", "", 0}, {"rider", "DHD_NET_RIDER", "", 0},
     {"auto_update", "", "ask", 0}, {"update_url", "DHD_UPDATE_URL", "", 0}, {"discord", "DHD_DISCORD", "on", 0}, {"game_options", "", "", 0},
+    /* what main's table has gained since 0.7.6 (table.rs): the optional effects (finding 183, Performance
+       Mode turns them off), the stick's dead zone, the room's region, the launcher's language.
+       native_vu is off here: dhd_render_nx.c has no mesh draws yet (finding 267). */
+    {"shadows", "DHD_SHADOWS", "1", 0}, {"lens_flare", "DHD_LENS_FLARE", "1", 0}, {"particles", "DHD_PARTICLES", "1", 0},
+    {"native_vu", "DHD_NATIVE_VU1", "off", 0}, {"stick_dead_zone", "DHD_STICK_DEAD_ZONE", "game", 0},
+    {"room_region", "DHD_NET_ROOM_REGION", "auto", 0}, {"language", "", "", 0},
 };
 enum { COUNT = sizeof settings / sizeof *settings };
 
@@ -36,7 +42,7 @@ static const Setting *find(const char *key)
    on words (atoi("on") is 0, so "vibration = on" would have been off). Keeps value otherwise. */
 static const char *canonical(const Setting *s, const char *value)
 {
-    static const char *const switches[] = {"widescreen", "skip_movies", "vibration", "textures", "font", "vsync", "perf_counter", "unlock_all", "discord"};
+    static const char *const switches[] = {"widescreen", "skip_movies", "vibration", "textures", "font", "vsync", "perf_counter", "unlock_all", "discord", "shadows", "lens_flare", "particles"};
     static const char *const off_words[] = {"0", "off", "false", "no"}, *const on_words[] = {"1", "on", "true", "yes"};
     char v[64];
     while (*value == ' ' || *value == '\t') value++;
