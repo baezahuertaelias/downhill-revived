@@ -304,6 +304,7 @@ the steps below have not been tried on another machine.
 
 - [devkitPro](https://devkitpro.org/wiki/Getting_Started) packages: `switch-dev`, `deko3d`, `uam`,
   `switch-tools`. `DEVKITPRO` names the install (default `/opt/devkitpro`).
+  The `devkitpro/devkita64` Docker image has all four (its `DEVKITPRO` is `/opt/devkitpro`), enough to compile the units on any OS.
 - For the core, on a Mac: MacPorts `llvm-23` and `wabt`, wasi-sdk 34 (`WASI_SYSROOT` names its
   `share/wasi-sysroot`), SIMDe (`SIMDE_DIR`), and `WABT_DIR=/opt/local`.
 - [naga-cli](https://crates.io/crates/naga-cli) 29.0.3, with `NAGA` naming the binary (default

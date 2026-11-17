@@ -6,9 +6,10 @@
 #include "../../net/ws.h"
 #include <stdio.h>
 
-int dhd_disc_check(const char *iso, const char *cache, uint8_t digest[32], char *note, size_t size)
+int dhd_disc_check(const char *iso, const char *cache, uint8_t digest[32], char *note, size_t size,
+                   const int *stop, uint32_t pause_us)
 {
-    (void)iso; (void)cache; (void)digest;
+    (void)iso; (void)cache; (void)digest; (void)stop; (void)pause_us;
     snprintf(note, size, "online is not in the Switch build yet");
     return -1;
 }

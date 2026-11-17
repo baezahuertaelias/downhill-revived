@@ -333,7 +333,7 @@ bool SDL_EnumerateDirectory(const char *path, SDL_EnumerateDirectoryCallback fn,
 
 /* ---- sound: a thread pulls the game's samples and queues them on audout ---- */
 enum { AUDIO_RATE = 48000, AUDIO_FRAMES = 1024, AUDIO_BYTES = AUDIO_FRAMES * 4, AUDIO_BUFFERS = 3, AUDIO_RING = 1 << 16 };
-struct SDL_AudioStream { SDL_AudioStreamCallback fn; void *user; volatile int started; };
+struct SDL_AudioStream { SDL_AudioStreamCallback fn; void *user; volatile int started, paused, muted, clear, closing; };
 static SDL_AudioStream audio_stream;
 static uint8_t audio_ring[AUDIO_RING];
 static volatile uint32_t ring_in, ring_out;
@@ -363,24 +363,35 @@ static int audio_thread(void *arg)
         memset(buffers[i].buffer, 0, buffers[i].buffer_size);
         audoutAppendAudioOutBuffer(&buffers[i]);
     }
-    for (;;) {
+    while (!s->closing) {
         AudioOutBuffer *done = NULL;
         u32 count = 0;
         if (R_FAILED(audoutWaitPlayFinish(&done, &count, UINT64_MAX)) || !done) continue;
         for (u32 n = 0; n < count; n++) {
             AudioOutBuffer *b = done + n;
-            s->fn(s->user, s, AUDIO_BYTES, AUDIO_BYTES);
             uint8_t *out = b->buffer;
+            if (s->clear) { ring_out = ring_in; s->clear = 0; }   /* here, the ring's only reader */
+            if (s->paused) {
+                memset(out, 0, AUDIO_BYTES);
+                armDCacheFlush(out, AUDIO_BYTES);
+                audoutAppendAudioOutBuffer(b);
+                continue;
+            }
+            s->fn(s->user, s, AUDIO_BYTES, AUDIO_BYTES);
             uint32_t at = ring_out, have = ring_in - at, take = have < AUDIO_BYTES ? have : AUDIO_BYTES;
             uint32_t start = at & (AUDIO_RING - 1), first = take < AUDIO_RING - start ? take : AUDIO_RING - start;
             memcpy(out, audio_ring + start, first);
             memcpy(out + first, audio_ring, take - first);
             memset(out + take, 0, AUDIO_BYTES - take);
+            if (s->muted) memset(out, 0, AUDIO_BYTES);
             ring_out = at + take;
             armDCacheFlush(out, AUDIO_BYTES);
             audoutAppendAudioOutBuffer(b);
         }
     }
+    audoutStopAudioOut();
+    audoutExit();
+    s->started = 0;
     return 0;
 }
 SDL_AudioStream *SDL_OpenAudioDeviceStream(SDL_AudioDeviceID id, const SDL_AudioSpec *spec, SDL_AudioStreamCallback fn, void *user)
@@ -394,11 +405,22 @@ SDL_AudioStream *SDL_OpenAudioDeviceStream(SDL_AudioDeviceID id, const SDL_Audio
 }
 bool SDL_ResumeAudioStreamDevice(SDL_AudioStream *s)
 {
+    s->paused = 0;
     if (!s->started) {
         s->started = 1;
         SDL_DetachThread(SDL_CreateThread(audio_thread, "nx audio", s));
     }
     return true;
+}
+bool SDL_PauseAudioStreamDevice(SDL_AudioStream *s) { s->paused = 1; return true; }
+bool SDL_ClearAudioStream(SDL_AudioStream *s) { s->clear = 1; return true; }
+bool SDL_SetAudioStreamGain(SDL_AudioStream *s, float gain) { s->muted = gain <= 0.0f; return true; }
+void SDL_DestroyAudioStream(SDL_AudioStream *s)
+{
+    if (!s->started) return;
+    s->closing = 1;   /* the thread ends at the next finished buffer, a few milliseconds */
+    for (int waited = 0; s->started && waited < 500; waited++) svcSleepThread(1000000ll);
+    s->closing = 0, s->paused = 0, s->muted = 0, s->clear = 0;
 }
 SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *s) { (void)s; return 1; }
 bool SDL_GetAudioDeviceFormat(SDL_AudioDeviceID id, SDL_AudioSpec *spec, int *frames)
@@ -443,7 +465,10 @@ bool SDL_GetDisplayBounds(SDL_DisplayID d, SDL_Rect *r)
     return true;
 }
 bool SDL_GetDisplayUsableBounds(SDL_DisplayID d, SDL_Rect *r) { return SDL_GetDisplayBounds(d, r); }
-SDL_WindowFlags SDL_GetWindowFlags(SDL_Window *w) { (void)w; return SDL_WINDOW_FULLSCREEN; }
+SDL_WindowFlags SDL_GetWindowFlags(SDL_Window *w) { (void)w; return SDL_WINDOW_FULLSCREEN | SDL_WINDOW_INPUT_FOCUS; }
+const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID d) { return SDL_GetDesktopDisplayMode(d); }
+SDL_Window *SDL_GetWindowFromID(Uint32 id) { return id == 1 ? &the_window : NULL; }
+float SDL_GetWindowDisplayScale(SDL_Window *w) { (void)w; return 1.0f; }
 Uint32 SDL_GetWindowID(SDL_Window *w) { (void)w; return 1; }
 float SDL_GetWindowPixelDensity(SDL_Window *w) { (void)w; return 1.0f; }
 SDL_PropertiesID SDL_GetWindowProperties(SDL_Window *w) { (void)w; return 1; }

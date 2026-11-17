@@ -134,7 +134,8 @@ ANDROID_UNITS = ['port/host/android_main.c', 'port/host/android_perf.c', 'port/h
 ANDROID_EXPORTS = '{\n  global: SDL_main; Java_app_downhillrevived_Native_*; Java_app_downhillrevived_DiscImage_*;\n  local: *;\n};\n'
 # The Switch: port/nx in place of what stands on the OS (the rest is the shared host, over port/nx's SDL calls)
 SWITCH_UNITS = {'port/host/host_win32.c': 'port/nx/src/host_nx.c', 'port/host/sdl_host.c': 'port/nx/src/nx_host.c',
-                'port/hle/gamepad.c': 'port/nx/src/gamepad_nx.c'}
+                'port/hle/gamepad.c': 'port/nx/src/gamepad_nx.c',
+                'port/host/touch_host.c': 'port/nx/src/touch_nx.c'}
 SWITCH_EXTRA = ['port/nx/src/sdl_nx.c', 'port/nx/src/settings_nx.c', 'port/nx/src/stubs_nx.c', 'port/nx/src/exact_stub.c', 'port/nx/src/dhd_render_nx.c']
 
 

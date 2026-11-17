@@ -1450,7 +1450,15 @@ void dhdr_surface_destroy(DhdrSurface *s)
     free(s);
 }
 uint32_t dhdr_surface_usage(const DhdrSurface *s) { (void)s; return 0; }
-void dhdr_surface_counter(DhdrSurface *s, int enabled, int ping, double seconds) { (void)s; (void)enabled; (void)ping; (void)seconds; }
+void dhdr_surface_counter(DhdrSurface *s, int enabled, int server_ms, int race_ms, int riders_ms, double seconds)
+{
+    (void)s; (void)enabled; (void)server_ms; (void)race_ms; (void)riders_ms; (void)seconds;
+}
+/* The touch overlay (finding 141) is not drawn on the Switch yet. */
+void dhdr_surface_touch(DhdrSurface *s, const float *items, uint32_t count, float width_mm, float height_mm)
+{
+    (void)s; (void)items; (void)count; (void)width_mm; (void)height_mm;
+}
 void dhdr_surface_present(DhdrSurface *s)
 {
     if (s->acquired < 0) return;

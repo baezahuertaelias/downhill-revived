@@ -27,6 +27,7 @@ typedef struct { int value; } SDL_AtomicInt;
 typedef int SDL_SpinLock;
 static inline int SDL_GetAtomicInt(SDL_AtomicInt *a) { return __atomic_load_n(&a->value, __ATOMIC_SEQ_CST); }
 static inline int SDL_SetAtomicInt(SDL_AtomicInt *a, int v) { return __atomic_exchange_n(&a->value, v, __ATOMIC_SEQ_CST); }
+static inline int SDL_AddAtomicInt(SDL_AtomicInt *a, int v) { return __atomic_fetch_add(&a->value, v, __ATOMIC_SEQ_CST); }
 static inline bool SDL_CompareAndSwapAtomicInt(SDL_AtomicInt *a, int old, int v)
 { return __atomic_compare_exchange_n(&a->value, &old, v, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST); }
 #define SDL_MemoryBarrierAcquire() __atomic_thread_fence(__ATOMIC_ACQUIRE)
@@ -93,6 +94,19 @@ typedef struct { int year, month, day, hour, minute, second, nanosecond, day_of_
 bool SDL_TimeToDateTime(SDL_Time t, SDL_DateTime *dt, bool local);
 bool SDL_GetCurrentTime(SDL_Time *t);
 
+/* one-time initialisation guard (SDL3's SDL_InitState): 0 not started, 1 one thread is at it, 2 done */
+typedef struct { SDL_AtomicInt status; } SDL_InitState;
+static inline bool SDL_ShouldInit(SDL_InitState *s)
+{
+    int expect = 0;
+    if (__atomic_compare_exchange_n(&s->status.value, &expect, 1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) return true;
+    while (__atomic_load_n(&s->status.value, __ATOMIC_SEQ_CST) == 1) __asm__ volatile("isb");
+    return false;
+}
+static inline void SDL_SetInitialized(SDL_InitState *s, bool done) { __atomic_store_n(&s->status.value, done ? 2 : 0, __ATOMIC_SEQ_CST); }
+#include <math.h>
+#define SDL_floorf floorf
+
 /* the system */
 typedef Uint32 SDL_InitFlags;
 #define SDL_INIT_AUDIO 0x10u
@@ -147,6 +161,10 @@ typedef void (*SDL_AudioStreamCallback)(void *user, SDL_AudioStream *s, int addi
 #define SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK 0xFFFFFFFFu
 SDL_AudioStream *SDL_OpenAudioDeviceStream(SDL_AudioDeviceID id, const SDL_AudioSpec *spec, SDL_AudioStreamCallback fn, void *user);
 bool SDL_ResumeAudioStreamDevice(SDL_AudioStream *s);
+bool SDL_PauseAudioStreamDevice(SDL_AudioStream *s);  /* silence; the game's callback is not asked */
+bool SDL_ClearAudioStream(SDL_AudioStream *s);        /* drops what is queued */
+bool SDL_SetAudioStreamGain(SDL_AudioStream *s, float gain);  /* only 0 (mute) and 1 are told apart */
+void SDL_DestroyAudioStream(SDL_AudioStream *s);
 bool SDL_PutAudioStreamData(SDL_AudioStream *s, const void *data, int bytes);
 int SDL_GetAudioStreamQueued(SDL_AudioStream *s);
 SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *s);
@@ -166,11 +184,16 @@ typedef struct SDL_IOStream SDL_IOStream;
 #define SDL_WINDOW_BORDERLESS 0x10ull
 #define SDL_WINDOW_RESIZABLE 0x20ull
 #define SDL_WINDOW_HIDDEN 8ull
+#define SDL_WINDOW_OCCLUDED 0x1000ull
+#define SDL_WINDOW_INPUT_FOCUS 0x200ull
 #define SDL_WINDOW_HIGH_PIXEL_DENSITY 0x2000ull
 SDL_Window *SDL_CreateWindow(const char *title, int w, int h, SDL_WindowFlags f);
 SDL_DisplayID SDL_GetPrimaryDisplay(void);
 SDL_DisplayID SDL_GetDisplayForWindow(SDL_Window *w);
 const SDL_DisplayMode *SDL_GetDesktopDisplayMode(SDL_DisplayID d);
+const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID d);
+SDL_Window *SDL_GetWindowFromID(Uint32 id);
+float SDL_GetWindowDisplayScale(SDL_Window *w);
 SDL_DisplayMode **SDL_GetFullscreenDisplayModes(SDL_DisplayID d, int *count);
 bool SDL_GetDisplayBounds(SDL_DisplayID d, SDL_Rect *r);
 bool SDL_GetDisplayUsableBounds(SDL_DisplayID d, SDL_Rect *r);
@@ -196,6 +219,7 @@ static inline bool SDL_TextInputActive(SDL_Window *w) { (void)w; return false; }
 enum { SDL_EVENT_QUIT = 0x100, SDL_EVENT_WILL_ENTER_BACKGROUND = 0x103, SDL_EVENT_DID_ENTER_FOREGROUND = 0x106,
        SDL_EVENT_WINDOW_RESIZED = 0x206, SDL_EVENT_WINDOW_MOUSE_LEAVE = 0x20D, SDL_EVENT_WINDOW_CLOSE_REQUESTED = 0x210,
        SDL_EVENT_WINDOW_FIRST = 0x202, SDL_EVENT_WINDOW_LAST = 0x21F, SDL_EVENT_TEXT_INPUT = 0x303,
+       SDL_EVENT_FINGER_DOWN = 0x700, SDL_EVENT_FINGER_UP = 0x701, SDL_EVENT_FINGER_MOTION = 0x702, SDL_EVENT_FINGER_CANCELED = 0x703,
        SDL_EVENT_MOUSE_MOTION = 0x400, SDL_EVENT_MOUSE_BUTTON_DOWN = 0x401, SDL_EVENT_MOUSE_BUTTON_UP = 0x402, SDL_EVENT_MOUSE_WHEEL = 0x403 };
 enum { SDL_BUTTON_LEFT = 1, SDL_BUTTON_MIDDLE = 2, SDL_BUTTON_RIGHT = 3, SDL_MOUSEWHEEL_FLIPPED = 1 };
 typedef union SDL_Event {
@@ -204,6 +228,7 @@ typedef union SDL_Event {
     struct { Uint32 type; Uint32 windowID; Uint8 button; bool down; float x, y; } button;
     struct { Uint32 type; Uint32 windowID; float y, mouse_y, mouse_x; int direction; float x; } wheel;
     struct { Uint32 type; Uint32 windowID; } window;
+    struct { Uint32 type; Uint32 reserved; Uint64 timestamp; Uint64 touchID, fingerID; float x, y, dx, dy, pressure; Uint32 windowID; } tfinger;
     Uint8 padding[64];
 } SDL_Event;
 typedef bool (*SDL_EventFilter)(void *user, SDL_Event *e);
