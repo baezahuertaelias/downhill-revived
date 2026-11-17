@@ -2,7 +2,7 @@
 
 Status: in progress
 
-Branch `perf/switch-270` from `main` 00c0be8c (release 0.8.9), planned 2026-11-16, not started.
+Branch `perf/switch-270` from `main` bbe4acc5 (release 0.8.10), planned 2026-11-16, step 0 done, the rest waits for a console.
 This file is the lane's plan while it runs and its finding when it merges. Someone who has only
 this file and the git log must be able to pick the lane up.
 
@@ -133,7 +133,7 @@ merge in a throwaway worktree. Nothing from it is used here.
 ## Progress
 
 - [x] 2026-11-16: plan written (this file)
-- [x] 2026-11-16: step 0 merged on branch `switch/rebase-0.8.9` (worktree `.claude/worktrees/agent-a08dc94462a426a91`,
+- [x] 2026-11-16: step 0 merged on branch `perf/switch-270` (first `switch/rebase-0.8.9`, on 0.8.9; worktree `.claude/worktrees/agent-a08dc94462a426a91`,
   `git merge`, the contributor's commit kept). The branch's finding became 272. Conflicts resolved:
   `host.c` (main's `host_threads.c` now carries the Switch's thread handles and CPU ticks; the SDL
   shim gained `SDL_GetTLS`/`SDL_SetTLS`), `present.c` (the Switch keeps its swapchain in the
@@ -146,6 +146,7 @@ merge in a throwaway worktree. Nothing from it is used here.
 - [x] 2026-11-16: step 4, code part: `settings_nx.c` has main's missing keys (native_vu stays off until
   the mesh path exists); a new dhd.ini starts with shadows, lens flare and particles off. Neither is
   compiled or measured; a docked scale 2 default is not set, as it is not yet shown to hold 60.
+- [x] 2026-11-17: main's 0.8.10 merged in (`0287436c`); the Switch findings renumbered to 270 (plan) and 272 (port), because 267 and 268 went to the iOS A12 and touch left/right findings. `check.py docs` OK; `quick` fails here only on a missing `llvm-nm` and a wasi-sdk path for another OS. The branch is pushed to the contributor's fork, not to the main repository.
 - [ ] step 1: baseline on the console (needs a console)
 - [ ] steps 2 to 5
 
