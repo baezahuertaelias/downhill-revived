@@ -1,8 +1,8 @@
-# 267: Switch speed: bring the port up to main, then cut CPU work
+# 270: Switch speed: bring the port up to main, then cut CPU work
 
 Status: in progress
 
-Branch `perf/switch-267` from `main` 00c0be8c (release 0.8.9), planned 2026-11-16, not started.
+Branch `perf/switch-270` from `main` 00c0be8c (release 0.8.9), planned 2026-11-16, not started.
 This file is the lane's plan while it runs and its finding when it merges. Someone who has only
 this file and the git log must be able to pick the lane up.
 
@@ -134,7 +134,7 @@ merge in a throwaway worktree. Nothing from it is used here.
 
 - [x] 2026-11-16: plan written (this file)
 - [x] 2026-11-16: step 0 merged on branch `switch/rebase-0.8.9` (worktree `.claude/worktrees/agent-a08dc94462a426a91`,
-  `git merge`, the contributor's commit kept). The branch's finding became 268. Conflicts resolved:
+  `git merge`, the contributor's commit kept). The branch's finding became 272. Conflicts resolved:
   `host.c` (main's `host_threads.c` now carries the Switch's thread handles and CPU ticks; the SDL
   shim gained `SDL_GetTLS`/`SDL_SetTLS`), `present.c` (the Switch keeps its swapchain in the
   background but takes main's render hold, `gs_render_leave`/`gs_render_release`),

@@ -1,4 +1,4 @@
-# 268: The Nintendo Switch port (homebrew NRO)
+# 272: The Nintendo Switch port (homebrew NRO)
 
 Status: in progress
 

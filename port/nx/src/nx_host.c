@@ -359,7 +359,7 @@ int main(int argc, char **argv)
     static const struct { const char *key, *value; } first_run[] = {
         {"iso", NX_DISC}, {"scale", "1"}, {"window", "fullscreen"}, {"skip_movies", "1"}, {"auto_update", "off"},
         /* Performance Mode as finding 263 gives weak phones: shadows, lens flare and particles off. Only a new
-           dhd.ini gets it (finding 267; its gain is not yet measured on a console). */
+           dhd.ini gets it (finding 270; its gain is not yet measured on a console). */
         {"shadows", "0"}, {"lens_flare", "0"}, {"particles", "0"},
     };
     char disc[512];

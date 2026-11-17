@@ -106,6 +106,9 @@ enum { MENU_LEGEND_BUTTONS = 8 };
 typedef struct { int left, glyph_right, right, from, to; uint16_t button; } MenuLegendRange;
 int menu_legend_ranges(const char *text, int length, const int *prefix, MenuLegendRange *out, int max);
 uint16_t menu_legend_hit(const MenuLegendRange *ranges, int n, int x);
+/* A tap at x beside a line whose words span [left, right): Left left of them, Right right of them, 0 on
+   them (menu_pads.c, finding 268). left == right: the line's two halves. */
+uint16_t menu_side_button(int x, int left, int right);
 
 /* ---- drawing, for a page that lays itself out (in its draw) ----
    In the popup's view, x across 0..640 and y down 0..224 as the rows are (menu_draw_size),
@@ -123,6 +126,12 @@ MenuStyle menu_game_style(int which);  /* the same without a page (a menu drawn 
 int menu_popup_up(void);               /* a popup is up (the game's or ours) */
 const char *menu_game_text(int id);    /* the game's text of an id ("" none) */
 MenuStyle menu_style(MenuStyle s, int percent, int r, int g, int b);  /* sized; colour r < 0: kept */
+/* The font's glyphs are white (0xFF) at alpha 0x40 in its texture, and the GS multiplies both by
+   the style's colour and alpha (0x80 = 1.0): at the game's alpha 0x80 a glyph is drawn at half
+   cover, its colour twice the style's. Over the game's lit menus that is their soft look; over a
+   dark page it halves every colour (finding 271). A solid style (alpha 0xFF) covers fully: its
+   colour then shows as given on a 0..0x80 scale (0x80 = full). */
+MenuStyle menu_solid(MenuStyle s);
 void menu_draw_size(int *width, int *height);  /* the popup view's size */
 void menu_draw_begin(void);            /* each frame, before the first box */
 void menu_draw_box(int x, int y, int w, int h, int level);  /* level 90: the popups' own */
@@ -133,7 +142,15 @@ enum { MENU_PICTURE_W = 256, MENU_PICTURE_H = 160 };
 uint16_t *menu_picture_new(void);
 void menu_draw_picture(int x, int y, int w, int h, const uint16_t *picture);  /* bilinear, one sprite */
 void menu_draw_bar(int x, int y, int w, int h);  /* the cursor's bar */
+/* A triangle strip of n (3 or 4) points in one flat colour (0-255), each x, y in 1/16 of the
+   view's pixels from its top left: a slanted shape with clean edges at every resolution scale. */
+void menu_draw_strip(const int *xy16, int n, int r, int g, int b);
 void menu_draw_text(int align, int x, int y, const char *text, const MenuStyle *s);
+/* The font's glyphs carry a dark edge (black in its texture) round a white body: dark text on a
+   light box ran into one blob with it (lane 272). Ink text leaves the edge out: LIGHT adds the
+   style's colour to what is under the body, DARK takes it away (0x80 each: white, or black). */
+enum { MENU_INK_LIGHT, MENU_INK_DARK };
+void menu_draw_text_ink(int align, int x, int y, const char *text, const MenuStyle *s, int ink);
 int menu_text_width(const char *text, const MenuStyle *s);
 void menu_play(const char *sound);     /* a front-end sound by name: "S_SELECT", "S_BACK"... */
 

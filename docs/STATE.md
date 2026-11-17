@@ -52,7 +52,9 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
   its unsigned IPA), from the Windows build's wasm2c parts; the shared touch controls and settings
   (Android's rows), the shared launcher as the app's entry (finding 227); every online mode, as Android
   (finding 237; the port by Gustavo Ribeiro, finding 224). Its guest memory is reserved in two
-  parts at the process's start, so it fits the address space of a device with 3 GB (finding 258).
+  parts, each at its own host address, so it fits the address space of a device with 3 GB
+  (findings 258, 267); the code is built for the A12 and the IPA audit refuses any instruction
+  above it (finding 267).
 - **Launcher:** `port/launcher` (Tauri; settings, rider name, updates, disc choice; finding 093;
   native window buttons on macOS, finding 150). Its page (`port/launcher/ui`) is the one launcher
   UI of every platform: Android shows it in a WebView (`LauncherActivity`, the app's entry) through
@@ -206,6 +208,9 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
   (`port/hle/puppet_sync.h`, finding 202). The puppet bench (`port/tools/puppet_bench.py`) measures how they look through a
   bad link. Hits are events; each game times its own finish.
   Track pickups are shared events (finding 144); a player who leaves becomes an AI rider.
+- A member in the room while a race runs can WATCH it (SFU rooms, not a scored arena round):
+  every rider is a puppet, finding 122's camera from the countdown, no rider of its own, back to
+  the room with the results (finding 269).
 - Server: `online/server/` (Cloudflare Workers + Durable Objects) at `wss://dhd.skuza.app`, the
   game's default (dhd.ini `server =` or `DHD_NET_SERVER` override it). Rooms of up to 10
   (finding 123) that live across races (findings 118, 119), 25 tracks with Salt City MX and TD
