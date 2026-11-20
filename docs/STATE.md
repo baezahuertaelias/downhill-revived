@@ -55,12 +55,14 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
   parts, each at its own host address, so it fits the address space of a device with 3 GB
   (findings 258, 267); the code is built for the A12 and the IPA audit refuses any instruction
   above it (finding 267).
-- **Nintendo Switch (homebrew, not released):** `build_host64.py --target switch-arm64` makes an NRO
+- **Nintendo Switch (homebrew, experimental prereleases on the fork only, `v0.8.10-switch.1`
+  first; what a full release still needs: `docs/BUILDING.md`, "Switch prereleases"):**
+  `build_host64.py --target switch-arm64` makes an NRO
   for a modded console (devkitA64 and libnx, a deko3d renderer in C, `port/nx`; findings 272, 270).
   Title, menus and a race run on the console at about 45-53 fields/s; EXIT GAME returns to the
   Homebrew Menu. Its draw shaders are a pinned copy of 0.7.6's (uam miscompiles main's); button rebinding
-  is `controls.rs`'s rules in C (`settings_nx.c`, not yet tried on a console); no online, texture
-  packs or Native VU there yet.
+  is `controls.rs`'s rules in C (`settings_nx.c`, tried by hand on a console); `fps = 30` gives a
+  steady 30. Native VU's mesh path draws right but is off by default; no online or texture packs.
 - **Launcher:** `port/launcher` (Tauri; settings, rider name, updates, disc choice; finding 093;
   native window buttons on macOS, finding 150). Its page (`port/launcher/ui`) is the one launcher
   UI of every platform: Android shows it in a WebView (`LauncherActivity`, the app's entry) through

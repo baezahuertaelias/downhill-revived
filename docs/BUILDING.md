@@ -300,8 +300,8 @@ dirs go to `DHD_CARGO_DIR`, else `~/.cache/dhd-cargo`.
 ### Nintendo Switch
 
 A homebrew NRO for a modded console (finding 272), published only as experimental prereleases on
-the fork's Releases page. Built so far only on an Intel Mac;
-the steps below have not been tried on another machine.
+the fork's Releases page ("Switch prereleases" under Releases below). Built on an Intel Mac and in
+a Linux Docker image with devkitPro, wasi-sdk, WABT and SIMDe; the Mac steps follow.
 
 - [devkitPro](https://devkitpro.org/wiki/Getting_Started) packages: `switch-dev`, `deko3d`, `uam`,
   `switch-tools`. `DEVKITPRO` names the install (default `/opt/devkitpro`).
@@ -334,8 +334,8 @@ To test on a console running the sphaira menu with its FTP server (port 5000) an
 
 The console's address can also come from `DHD_SWITCH_IP`. `--only BC` runs chosen phases, and `--dry-run`
 shows each phase's settings without touching the network. The report is
-`build/nx-test/<timestamp>/report.md`. This tool has not yet run on a real console; finding 272 lists
-what else is unverified.
+`build/nx-test/<timestamp>/report.md`. Phases A-C pass on a console since 2026-11-20 (finding 270);
+finding 272 lists what else is unverified.
 
 ### SDL3 (window, sound, controllers)
 
@@ -509,3 +509,46 @@ Since 0.7.0 the mac and linux zips are `-mac-experimental.zip` and `-linux-exper
 Ubuntu 22.04 and runs on glibc 2.35 and later, which `package_release.py` checks).
 
 Before the version commit, run the doc-gardening checklist (`docs/RELEASE-CHECKLIST.md`).
+
+### Switch prereleases (the fork only)
+
+The Switch build is published only on the fork, as GitHub prereleases; upstream releases stay as
+above. `package_release.py` does not know the Switch: no zip, no `latest.json` entry, no updater, so
+players replace the NRO by hand. `port/include/version.h` keeps upstream's version; the tag is
+`v<upstream version>-switch.N` (first: `v0.8.10-switch.1`, 2026-11-20), so it never clashes with
+upstream's `v<version>` tags that the fork also carries.
+
+Steps, in order:
+
+1. Build the NRO from the commit to tag (the Docker build or the Mac steps above).
+2. Run `nx_fulltest.py --only ABC` with that NRO on a console: phases A-C pass, the race ends and
+   EXIT GAME returns to the Homebrew Menu.
+3. Next to the NRO, `sha256sum downhill-revived.nro > SHA256SUMS`.
+4. Push the commit, then `gh release create v<version>-switch.N -R <fork> --target <full commit
+   id> --prerelease --notes-file <notes> downhill-revived.nro SHA256SUMS`. Name the fork with `-R`:
+   `gh`'s default repository may be upstream. `--target` refuses a short commit id.
+5. The notes say how to install (README, "Playing on the Switch"), what works, the measured speed
+   with its clocks, and what is missing.
+
+#### Pending before a Switch release that is not a prerelease
+
+"Ready to play" (README): a steady 60 fields a second, or a smooth 30 option, no error on exit, and
+button rebinding. Done: the 30 option (`fps = 30`), the exit, rebinding. Open (finding 270):
+
+- **A steady 60.** Docked at 1785/768/1600 MHz a race runs at about 46-54 fields a second and the
+  menus at about 45. The work, in order:
+  - Native VU's mesh path: main's draw stages (`NX_DRAWS=main`) are still broken on the console
+    (the second uam fault, `f2f round` and the branch around the texel load). Then `native_vu` on
+    by default on the Switch, then the renderer gains one at a time (findings 112, 109, 247, 111).
+  - Profile-guided build, threads and cores (the game thread takes about 17-21 ms a field), LTO and
+    `-mcpu=cortex-a57`. Keep a change only for about 3 % or more over the race.
+  - The sound underruns (600-1500 a run).
+- **Docked default scale 2**, only once a run holds 60.
+- **The error after closing the Homebrew Menu.** Find out whether sphaira alone, closed with +,
+  also shows "The software was closed because an error occurred" (reported by others; if so, it is
+  not the game's).
+- **A Switch compile in CI.** Every merge of upstream has broken the Switch build without anyone
+  seeing it (finding 270, Surprises); until CI builds it, each upstream release needs a merge, a
+  Docker compile and a console run before a Switch tag.
+- **Release tooling.** Optional: a `--platform switch` in `package_release.py` (NRO, `SHA256SUMS`,
+  a `latest.json` entry) if the NRO should update itself; today it does not.
