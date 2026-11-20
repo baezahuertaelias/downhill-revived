@@ -5,7 +5,9 @@
 #include "host_api.h"
 #include "host_os.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <stdarg.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -124,33 +126,57 @@ alignas(16) u8 __nx_exception_stack[0x8000];
 u64 __nx_exception_stack_size = sizeof __nx_exception_stack;
 u32 __nx_exception_ignoredebug = 1;
 
+/* The report goes to dhd.log and to crash.txt beside it: on the way out stderr may be nxlink's stream,
+   gone after socketExit. Then the exception goes back to the kernel unhandled, so Atmosphère writes its
+   crash report and the system shows its error with a code. An svcExitProcess here ended the process
+   behind the applet manager's back: "The software was closed because an error occurred", no code to
+   read and no report on the card (finding 270). */
+static int crash_file = -1;
+static void crash_line(const char *format, ...)
+{
+    char line[256];
+    va_list args;
+    va_start(args, format);
+    int n = vsnprintf(line, sizeof line, format, args);
+    va_end(args);
+    if (n < 0) return;
+    if ((size_t)n >= sizeof line) n = sizeof line - 1;
+    fputs(line, stderr);
+    if (crash_file >= 0) write(crash_file, line, (size_t)n);
+}
+
 void __libnx_exception_handler(ThreadExceptionDump *d)
 {
-    /* The stack above is one: a second fault gives the first's report a moment, then ends the process. */
+    /* The stack above is one: a second fault gives the first's report a moment, then goes to the kernel. */
     static int entered;
     if (__atomic_exchange_n(&entered, 1, __ATOMIC_SEQ_CST)) {
         svcSleepThread(3000000000ll);
-        svcExitProcess();
+        svcReturnFromException(KERNELRESULT(UnhandledUserInterrupt));
     }
+    crash_file = open(NX_FOLDER "crash.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
     extern char __start__[];
     uintptr_t code = (uintptr_t)__start__;
     uint64_t far = d->far.x;
-    fprintf(stderr, "crash: kind 0x%x at 0x%" PRIx64 "%s", d->error_desc, far,
-            guest_base && far >= guest_base && far - guest_base < 0x200000000ull ? " (guest " : "");
-    if (guest_base && far >= guest_base && far - guest_base < 0x200000000ull) fprintf(stderr, "0x%" PRIx64 ")", far - guest_base);
-    fprintf(stderr, "\n  pc +0x%" PRIx64 " lr +0x%" PRIx64 " sp 0x%" PRIx64 " (aarch64-none-elf-addr2line -e dhd.elf)\n",
-            d->pc.x - code, d->lr.x - code, d->sp.x);
+    int in_guest = guest_base && far >= guest_base && far - guest_base < 0x200000000ull;
+    crash_line("crash: kind 0x%x at 0x%" PRIx64, d->error_desc, far);
+    if (in_guest) crash_line(" (guest 0x%" PRIx64 ")", far - guest_base);
+    crash_line("\n  pc +0x%" PRIx64 " lr +0x%" PRIx64 " sp 0x%" PRIx64 " (aarch64-none-elf-addr2line -e dhd.elf)\n", d->pc.x - code,
+               d->lr.x - code, d->sp.x);
     uint64_t *frame = (uint64_t *)d->fp.x;
     for (int i = 0; i < 24 && frame && !((uintptr_t)frame & 7); i++) {
         MemoryInfo info;
         u32 page;
         svcQueryMemory(&info, &page, (uintptr_t)frame);
         if (!(info.perm & Perm_R)) break;
-        fprintf(stderr, "  from +0x%" PRIx64 "\n", frame[1] - code);
+        crash_line("  from +0x%" PRIx64 "\n", frame[1] - code);
         frame = (uint64_t *)frame[0];
+    }
+    if (crash_file >= 0) {
+        fsync(crash_file);
+        close(crash_file);
     }
     host_log_drain();
     fflush(stderr);
     fsync(fileno(stderr));
-    svcExitProcess();
+    svcReturnFromException(KERNELRESULT(UnhandledUserInterrupt));
 }

@@ -147,7 +147,7 @@ enum { ANY_CORE = 7 };
    these two also get what the game and vu leave free. Sound stays first on its core. */
 static const Placement placements[] = {
     {"game", 0x2C, 0, 1 << 0}, {"vu", 0x2C, 1, 1 << 1}, {"native", 0x2D, 2, ANY_CORE}, {"gs", 0x2E, 2, ANY_CORE},
-    {"nx audio", 0x2A, 2, 1 << 2}, {"movie", 0x3B, 2, ANY_CORE},
+    {"nx audio", 0x2A, 2, 1 << 2}, {"movie", 0x3B, 2, ANY_CORE}, {"nx sampler", 0x29, 2, 1 << 2},
 };
 
 /* ---- DHD_NX_SAMPLE=first-last (a test tool): what each busy thread is doing, by the clock ----
@@ -168,16 +168,18 @@ static void sampler_register(const char *name, Handle handle)
         if (!strcmp(name, sampled_names[i])) sampled[i] = handle;
 }
 
-static void sampler_run(void *arg)
+/* A shim thread (above the threads it pauses, on the core with the least to lose), so EXIT GAME ends it
+   at its delay like the others (nx_threads_end). */
+static int sampler_run(void *arg)
 {
     const char *window = arg;
     unsigned long long first = 0, last = 0;
-    if (sscanf(window, "%llu-%llu", &first, &last) != 2) return;
+    if (sscanf(window, "%llu-%llu", &first, &last) != 2) return 0;
     Sample *samples = malloc(SAMPLE_MAX * sizeof *samples);
-    if (!samples) return;
+    if (!samples) return 0;
     u32 count = 0;
     u64 anchor = (u64)(uintptr_t)thread_entry;
-    while (*(volatile uint64_t *)&kernel_vsync_count < first) svcSleepThread(20000000);
+    while (*(volatile uint64_t *)&kernel_vsync_count < first) SDL_Delay(20);
     u64 start = armGetSystemTick();
     for (;;) {
         u64 field = *(volatile uint64_t *)&kernel_vsync_count;
@@ -191,7 +193,7 @@ static void sampler_run(void *arg)
                 samples[count++] = (Sample){(u32)((armGetSystemTick() - start) / 192), (u32)field, (s32)(c.pc.x - anchor),
                                             (s32)(c.lr - anchor), i};
         }
-        svcSleepThread(1000000);
+        SDL_Delay(1);
     }
     FILE *f = fopen("sdmc:/switch/downhill-revived/samples.bin", "wb");
     if (f) {
@@ -204,18 +206,17 @@ static void sampler_run(void *arg)
     }
     fprintf(stderr, "nx sampler: %u samples\n", (unsigned)count);
     free(samples);
+    return 0;
 }
 
 /* dhd.ini's lines arrive after the start, so nx_host.c asks once a second. */
 void nx_sampler_poll(void)
 {
     static int started;
-    static Thread thread;
     const char *window = started ? NULL : getenv("DHD_NX_SAMPLE");
     if (!window || !*window) return;
     started = 1;
-    /* above the threads it pauses; on the core with the least to lose */
-    if (R_SUCCEEDED(threadCreate(&thread, sampler_run, (void *)window, NULL, 0x10000, 0x29, 2))) threadStart(&thread);
+    SDL_DetachThread(nx_thread_create(sampler_run, "nx sampler", (void *)window, 0x10000));
 }
 
 /* Thread-local slots with destructors (SDL_SetTLS): host_threads.c ends a named thread's entry
@@ -388,7 +389,7 @@ bool SDL_EnumerateDirectory(const char *path, SDL_EnumerateDirectoryCallback fn,
 
 /* ---- sound: a thread pulls the game's samples and queues them on audout ---- */
 enum { AUDIO_RATE = 48000, AUDIO_FRAMES = 1024, AUDIO_BYTES = AUDIO_FRAMES * 4, AUDIO_BUFFERS = 3, AUDIO_RING = 1 << 16 };
-struct SDL_AudioStream { SDL_AudioStreamCallback fn; void *user; volatile int started, paused, muted, clear, closing; };
+struct SDL_AudioStream { SDL_AudioStreamCallback fn; void *user; volatile int open, started, paused, muted, clear, closing; };
 static SDL_AudioStream audio_stream;
 static uint8_t audio_ring[AUDIO_RING];
 static volatile uint32_t ring_in, ring_out;
@@ -418,10 +419,11 @@ static int audio_thread(void *arg)
         memset(buffers[i].buffer, 0, buffers[i].buffer_size);
         audoutAppendAudioOutBuffer(&buffers[i]);
     }
-    while (!s->closing) {
+    while (!s->closing && !threads_ending) {
         AudioOutBuffer *done = NULL;
         u32 count = 0;
-        if (R_FAILED(audoutWaitPlayFinish(&done, &count, UINT64_MAX)) || !done) continue;
+        /* bounded: stopped out of focus, audout finishes nothing, and the close must still be seen */
+        if (R_FAILED(audoutWaitPlayFinish(&done, &count, 100000000)) || !done) continue;
         for (u32 n = 0; n < count; n++) {
             AudioOutBuffer *b = done + n;
             uint8_t *out = b->buffer;
@@ -446,6 +448,8 @@ static int audio_thread(void *arg)
     }
     audoutStopAudioOut();
     audoutExit();
+    for (int i = 0; i < AUDIO_BUFFERS; i++) free(buffers[i].buffer);  /* audout holds them no more */
+    s->open = 0;
     s->started = 0;
     return 0;
 }
@@ -454,8 +458,9 @@ SDL_AudioStream *SDL_OpenAudioDeviceStream(SDL_AudioDeviceID id, const SDL_Audio
     (void)id;
     if (spec->freq != AUDIO_RATE || spec->channels != 2) { errno = EINVAL; return NULL; }
     if (R_FAILED(audoutInitialize())) { errno = EIO; return NULL; }
-    if (R_FAILED(audoutStartAudioOut())) { errno = EIO; return NULL; }
+    if (R_FAILED(audoutStartAudioOut())) { audoutExit(); errno = EIO; return NULL; }
     audio_stream.fn = fn, audio_stream.user = user;
+    audio_stream.open = 1;
     return &audio_stream;
 }
 bool SDL_ResumeAudioStreamDevice(SDL_AudioStream *s)
@@ -486,6 +491,11 @@ SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *s) { (void)s; return
 int nx_threads_end(void)
 {
     SDL_DestroyAudioStream(&audio_stream);
+    if (audio_stream.open && !audio_stream.started) {  /* opened, never resumed: no thread closes it */
+        audoutStopAudioOut();
+        audoutExit();
+        audio_stream.open = 0;
+    }
     threads_ending = 1;
     u64 deadline = armGetSystemTick() + 2 * armGetSystemTickFreq();
     int all = 1;
@@ -500,6 +510,7 @@ int nx_threads_end(void)
             continue;
         }
         *at = t->next;
+        fprintf(stderr, "nx: thread %s ended\n", t->name ? t->name : "?");
         close_thread(t);
     }
     mutexUnlock(&threads_lock);
