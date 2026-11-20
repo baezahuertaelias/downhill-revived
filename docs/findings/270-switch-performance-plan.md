@@ -286,6 +286,14 @@ merge in a throwaway worktree. Nothing from it is used here.
     HUD; back faces culled as wgpu's), 12 loops drawn natively, the race 46.6 fields/s against 46.0
     with it off (+1.3 %, under the 3 % rule alone; the renderer gains build on it). Still off by
     default; `NX_DRAWS=main` (the uam stack workaround) not yet run.
+  - `NX_DRAWS=main` (main's draw stages with the 0x800-byte stack for nesting over 8): still broken
+    on the console, the menus in missing and miscoloured blocks and stripes, the race almost all
+    black but the HUD (its 59.7 fields/s counts nothing). So the stack size is not the whole fault: the
+    second suspect stays, `fb12874d`'s `f2f round` instructions and the branch around the texel load
+    (its stages nest only 5 and were broken too). The pinned 0.7.6 copy stays.
+  - Merged `main` (`1e7765e4`, every lane above): phases A-C pass, the menus' window 45.7 fields/s
+    (worst field 50 ms: the bench window now free of the test captures, `fd1eddd1`), the race 52.5,
+    no error lines, back to sphaira with `exit_steps.txt` to libnx's exit.
   - Surprise: build_wasm.py's core cache keys on `git ls-files`, which finds nothing in the Docker
     build volume (no checkout there), so every core build there is a cache hit: a change to the core
     (`port/hle`) needs `DHD_MODULE_CACHE=0` in that volume.
