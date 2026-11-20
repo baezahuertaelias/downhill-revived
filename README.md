@@ -33,8 +33,8 @@ You need a modded console with Atmosphère and a Homebrew Menu (hbmenu or sphair
 dump of the USA disc (SCUS-97177).
 
 1. Download `downhill-revived.nro` from this fork's
-   [Releases](https://github.com/marmota94/downhill-revived/releases) page (experimental
-   prereleases), or build it yourself ([docs/BUILDING.md](docs/BUILDING.md#nintendo-switch)).
+   [Releases](https://github.com/marmota94/downhill-revived/releases/latest) page, or build it
+   yourself ([docs/BUILDING.md](docs/BUILDING.md#nintendo-switch)).
 2. Copy two files to the SD card, into one folder:
 
        /switch/downhill-revived/downhill-revived.nro   the game

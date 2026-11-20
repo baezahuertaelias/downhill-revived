@@ -299,8 +299,8 @@ dirs go to `DHD_CARGO_DIR`, else `~/.cache/dhd-cargo`.
 
 ### Nintendo Switch
 
-A homebrew NRO for a modded console (finding 272), published only as experimental prereleases on
-the fork's Releases page ("Switch prereleases" under Releases below). Built on an Intel Mac and in
+A homebrew NRO for a modded console (finding 272), published only on the fork's Releases page
+("Switch releases" under Releases below). Built on an Intel Mac and in
 a Linux Docker image with devkitPro, wasi-sdk, WABT and SIMDe; the Mac steps follow.
 
 - [devkitPro](https://devkitpro.org/wiki/Getting_Started) packages: `switch-dev`, `deko3d`, `uam`,
@@ -510,12 +510,13 @@ Ubuntu 22.04 and runs on glibc 2.35 and later, which `package_release.py` checks
 
 Before the version commit, run the doc-gardening checklist (`docs/RELEASE-CHECKLIST.md`).
 
-### Switch prereleases (the fork only)
+### Switch releases (the fork only)
 
-The Switch build is published only on the fork, as GitHub prereleases; upstream releases stay as
-above. `package_release.py` does not know the Switch: no zip, no `latest.json` entry, no updater, so
+The Switch build is published only on the fork; upstream releases stay as above. The first,
+`v0.8.10-switch.1`, is a full release (not a prerelease) with its known gaps in its notes: no
+steady 60 yet, `fps = 30` as the steady option. `package_release.py` does not know the Switch: no zip, no `latest.json` entry, no updater, so
 players replace the NRO by hand. `port/include/version.h` keeps upstream's version; the tag is
-`v<upstream version>-switch.N` (first: `v0.8.10-switch.1`, 2026-11-20), so it never clashes with
+`v<upstream version>-switch.N` (first: 2026-11-20), so it never clashes with
 upstream's `v<version>` tags that the fork also carries.
 
 Steps, in order:
@@ -525,15 +526,17 @@ Steps, in order:
    EXIT GAME returns to the Homebrew Menu.
 3. Next to the NRO, `sha256sum downhill-revived.nro > SHA256SUMS`.
 4. Push the commit, then `gh release create v<version>-switch.N -R <fork> --target <full commit
-   id> --prerelease --notes-file <notes> downhill-revived.nro SHA256SUMS`. Name the fork with `-R`:
+   id> --latest --notes-file <notes> downhill-revived.nro SHA256SUMS` (`--prerelease` instead of
+   `--latest` for a test build). Name the fork with `-R`:
    `gh`'s default repository may be upstream. `--target` refuses a short commit id.
 5. The notes say how to install (README, "Playing on the Switch"), what works, the measured speed
-   with its clocks, and what is missing.
+   with its clocks, and what is missing (the open work below).
 
-#### Pending before a Switch release that is not a prerelease
+#### Open work for the Switch releases
 
 "Ready to play" (README): a steady 60 fields a second, or a smooth 30 option, no error on exit, and
-button rebinding. Done: the 30 option (`fps = 30`), the exit, rebinding. Open (finding 270):
+button rebinding. Done: the 30 option (`fps = 30`), the exit, rebinding. Open (finding 270), each
+one worth a new `-switch.N` release when it lands:
 
 - **A steady 60.** Docked at 1785/768/1600 MHz a race runs at about 46-54 fields a second and the
   menus at about 45. The work, in order:

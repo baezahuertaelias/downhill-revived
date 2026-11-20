@@ -31,8 +31,8 @@ Acceptance, each number measured on a named console with the clocks written down
   spread (the rule of findings 247 and 249).
 
 Out of scope: gameplay, the picture's content, online, Discord and texture packs on the Switch
-(left out of the first port), a full release of the Switch build (experimental prereleases are
-published on the fork; what a full release still needs: `docs/BUILDING.md`, "Switch prereleases").
+(left out of the first port). Switch releases are published on the fork (`docs/BUILDING.md`,
+"Switch releases"), the first, `v0.8.10-switch.1`, before this lane's goal of 60 is met.
 
 ## Where the port stands (finding 127 on the branch)
 
@@ -295,12 +295,13 @@ merge in a throwaway worktree. Nothing from it is used here.
   - Merged `main` (`1e7765e4`, every lane above): phases A-C pass, the menus' window 45.7 fields/s
     (worst field 50 ms: the bench window now free of the test captures, `fd1eddd1`), the race 52.5,
     no error lines, back to sphaira with `exit_steps.txt` to libnx's exit.
-- [x] 2026-11-20: first experimental prerelease on the fork, `v0.8.10-switch.1` (`a2dbbcec`, the
-  merged main's NRO above). The steps and what a full release still needs are in `docs/BUILDING.md`,
-  "Switch prereleases".
   - Surprise: build_wasm.py's core cache keys on `git ls-files`, which finds nothing in the Docker
     build volume (no checkout there), so every core build there is a cache hit: a change to the core
     (`port/hle`) needs `DHD_MODULE_CACHE=0` in that volume.
+- [x] 2026-11-20: first Switch release on the fork, `v0.8.10-switch.1` (`a2dbbcec`, the merged
+  main's NRO above): published as a prerelease, then made a full release the same day at the
+  owner's choice, with the known gaps (no steady 60) in its notes. The steps and the open work are
+  in `docs/BUILDING.md`, "Switch releases".
 
 ## Decisions
 

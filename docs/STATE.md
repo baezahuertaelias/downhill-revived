@@ -55,8 +55,8 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
   parts, each at its own host address, so it fits the address space of a device with 3 GB
   (findings 258, 267); the code is built for the A12 and the IPA audit refuses any instruction
   above it (finding 267).
-- **Nintendo Switch (homebrew, experimental prereleases on the fork only, `v0.8.10-switch.1`
-  first; what a full release still needs: `docs/BUILDING.md`, "Switch prereleases"):**
+- **Nintendo Switch (homebrew, released on the fork only, `v0.8.10-switch.1` first; the steps and
+  the open work: `docs/BUILDING.md`, "Switch releases"):**
   `build_host64.py --target switch-arm64` makes an NRO
   for a modded console (devkitA64 and libnx, a deko3d renderer in C, `port/nx`; findings 272, 270).
   Title, menus and a race run on the console at about 45-53 fields/s; EXIT GAME returns to the
