@@ -14,6 +14,7 @@ What stock uam (1.1.0) gets wrong is worked around here, each with a check that 
   powers of two and nx_div's half-offset form, exact for these small values, for the rest.
 - a dynamic index into a vector's components reads .x (nx_pick).
 - its dual-issue scheduling corrupts warp-sized blocks of pixels (no_dual_issue).
+- it gives a graphics stage no off-chip call/return stack, whatever its branches' nesting (with_crs).
 native_convert runs as a pixel shader into a render target, the path everything else already proves:
 the one compute shader that wrote an image (native_scanout, now a blit) came out in broken blocks."""
 import os, re, struct, subprocess, sys, tempfile
@@ -22,7 +23,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 KIT = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
 NAGA = os.environ.get('NAGA') or str(Path.home() / 'DevCaches/naga/naga')
-ENTRIES = (('native_vertex', 'vert'), ('native_pixel', 'frag'), ('native_pixel_dual', 'frag'),
+ENTRIES = (('native_vertex', 'vert'), ('native_mesh_vertex', 'vert'), ('native_pixel', 'frag'), ('native_pixel_dual', 'frag'),
            ('fullscreen_vertex', 'vert'), ('native_blit', 'frag'), ('native_upload_alpha', 'frag'),
            ('native_grow_depth', 'frag'), ('native_convert', 'frag'), ('present_pixel', 'frag'))
 DRAW_ENTRIES = ('native_vertex', 'native_pixel', 'native_pixel_dual')
@@ -186,6 +187,81 @@ def no_dual_issue(dksh, raw, entry):
     return bytes(out), pairs
 
 
+def branch_depth(raw):
+    """The deepest nesting of SSY, PBK and PCNT (each pushes a reconvergence entry on the warp's
+    call/return stack, popped by SYNC, BRK or CONT) over every path through the Maxwell code raw:
+    32-byte groups of a schedule word and three instructions; a branch target is a signed 24-bit
+    offset (bits 20-43) from the next instruction (uam aims at groups); the guard predicate is
+    bits 16-19 (7: always)."""
+    code = {}
+    for group in range(0, len(raw), 32):
+        for k in range(1, 4):
+            code[group + 8 * k] = int.from_bytes(raw[group + 8 * k:group + 8 * k + 8], 'little')
+    order = sorted(code)
+    following = dict(zip(order, order[1:] + [None]))
+
+    def target(at, word):
+        offset = word >> 20 & 0xFFFFFF
+        to = following[at] + (offset - (1 << 24) if offset >> 23 else offset)
+        return to + 8 if to % 32 == 0 else to       # a group's start: its schedule word, then code
+
+    push, pop = (0xE29, 0xE2A, 0xE2B), (0xF0F, 0xE34, 0xE35)    # ssy pbk pcnt / sync brk cont
+    seen, work, deepest = {}, [(order[0], ())], 0
+    while work:
+        at, stack = work.pop()
+        if at is None or at not in code or seen.get(at, -1) >= len(stack):
+            continue
+        seen[at] = len(stack)
+        deepest = max(deepest, len(stack))
+        word = code[at]
+        op, always = word >> 52, (word >> 16 & 0xF) == 7
+        if op in push:
+            work.append((following[at], stack + (target(at, word),)))
+        elif op in pop and stack:
+            work.append((stack[-1], stack[:-1]))
+            if not always:
+                work.append((following[at], stack))
+        elif op == 0xE24:                                           # bra
+            work.append((target(at, word), stack))
+            if not always:
+                work.append((following[at], stack))
+        elif op != 0xE30 or not always:                             # exit
+            work.append((following[at], stack))
+    return deepest
+
+
+# The queue's scratch memory per warp (dkQueueMakerDefaults in dhd_render_nx.c), which holds a
+# stage's local memory and its off-chip call/return stack.
+PER_WARP_SCRATCH = 0x800
+
+
+def with_crs(dksh, raw, entry):
+    """Stock uam writes a call/return stack size of 0 into every graphics stage's header ("TODO:
+    Proper logic"; compute gets 0x800). The on-chip stack holds 16 entries, two a nesting level (a
+    reconvergence point and a divergent branch's other side), and what doesn't fit goes to that
+    off-chip stack: with none, a warp nested deeper than 8 loses its reconvergence state and its
+    pixels come out wrong in blocks (finding 270). Mesa's nvc0_program.c has the size (commented
+    out): ((depth * 2 + 47) / 48) * 0x200 bytes a warp when depth * 2 > 16. Here a deep stage gets
+    all of the warp's scratch that its local memory leaves (0x200 multiples, the header's unit)."""
+    magic, _, control, _, programs, _ = struct.unpack_from('<6I', dksh)
+    at = dksh.find(raw)
+    if magic != 0x48534B44 or at != control + 128:
+        return dksh, 0
+    depth = branch_depth(raw)
+    if depth * 2 <= 16:
+        return dksh, depth
+    sph = at - 0x50                          # the 0x50-byte shader program header ends at the code
+    local = struct.unpack_from('<I', dksh, sph + 4)[0] & 0xFFFFFF
+    crs = (PER_WARP_SCRATCH - local * 32) & ~0x1FF
+    if crs < (depth * 2 + 47) // 48 * 0x200:
+        sys.exit('nx_shaders: %s nests %d deep: no room for its call/return stack' % (entry, depth))
+    out = bytearray(dksh)
+    word3 = struct.unpack_from('<I', out, sph + 12)[0]
+    struct.pack_into('<I', out, sph + 12, word3 & ~0xFFFFFF | crs)
+    struct.pack_into('<I', out, programs + 20, local * 32 + crs)    # DkshProgramHeader.per_warp_scratch_sz
+    return bytes(out), depth
+
+
 def build(work, source, entry, stage):
     glsl = work / ('%s.%s' % (entry, stage))
     r = subprocess.run([NAGA, str(source), str(glsl), '--entry-point', entry, '--profile', 'core460', '--keep-coordinate-space'],
@@ -203,11 +279,12 @@ def build(work, source, entry, stage):
         print('uam %s: %s' % (entry, messages))
     if DIVISION_WARNING in messages:
         sys.exit('nx_shaders: %s divides by a non-constant, which uam turns into an inexact float: rewrite it in wgsl()' % entry)
-    data = dksh.read_bytes()
+    data, code = dksh.read_bytes(), raw.read_bytes()
+    data, depth = with_crs(data, code, entry)
     pairs = 0
     if not os.environ.get('NX_DUAL_ISSUE'):
-        data, pairs = no_dual_issue(data, raw.read_bytes(), entry)
-    return data, pairs
+        data, pairs = no_dual_issue(data, code, entry)
+    return data, pairs, depth
 
 
 def main():
@@ -218,11 +295,13 @@ def main():
         (work / 'draws.wgsl').write_text(draws_wgsl())
         (work / 'zread.wgsl').write_text(probe())
         lines = ['/* port/tools/nx_shaders.py: DKSH of port/gs/native.wgsl, port/nx/native_draws.wgsl and zread.rs\'s probe. */']
-        for name, source, stage in [(e, work / ('draws.wgsl' if e in DRAW_ENTRIES else 'native.wgsl'), s) for e, s in ENTRIES] + \
+        # NX_DRAWS=main: the draw stages from main's native.wgsl, for a console run (finding 270)
+        draws = 'native.wgsl' if os.environ.get('NX_DRAWS') == 'main' else 'draws.wgsl'
+        for name, source, stage in [(e, work / (draws if e in DRAW_ENTRIES else 'native.wgsl'), s) for e, s in ENTRIES] + \
                                    [('zread', work / 'zread.wgsl', 'comp')]:
-            data, pairs = build(work, source, name, stage)
+            data, pairs, depth = build(work, source, name, stage)
             lines.append('static const unsigned char dksh_%s[] __attribute__((aligned(256))) = {%s};' % (name, ','.join(map(str, data))))
-            print('%s.%s: %d bytes, %d dual-issue pairs undone' % (name, stage, len(data), pairs))
+            print('%s.%s: %d bytes, %d dual-issue pairs undone, branches nested %d deep' % (name, stage, len(data), pairs, depth))
         out.write_text('\n'.join(lines) + '\n')
 
 

@@ -27,7 +27,7 @@ static const Setting settings[] = {
     {"auto_update", "", "ask", 0}, {"update_url", "DHD_UPDATE_URL", "", 0}, {"discord", "DHD_DISCORD", "on", 0}, {"game_options", "", "", 0},
     /* what main's table has gained since 0.7.6 (table.rs): the optional effects (finding 183, Performance
        Mode turns them off), the stick's dead zone, the room's region, the launcher's language.
-       native_vu is off here: dhd_render_nx.c has no mesh draws yet (finding 270). */
+       native_vu is off here until a console run shows dhd_render_nx.c's mesh draws right (finding 270). */
     {"shadows", "DHD_SHADOWS", "1", 0}, {"lens_flare", "DHD_LENS_FLARE", "1", 0}, {"particles", "DHD_PARTICLES", "1", 0},
     {"native_vu", "DHD_NATIVE_VU1", "off", 0}, {"stick_dead_zone", "DHD_STICK_DEAD_ZONE", "game", 0},
     {"room_region", "DHD_NET_ROOM_REGION", "auto", 0}, {"language", "", "", 0},
