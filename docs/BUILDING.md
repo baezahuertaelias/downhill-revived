@@ -529,7 +529,7 @@ Steps, in order:
    id> --latest --notes-file <notes> downhill-revived.nro SHA256SUMS` (`--prerelease` instead of
    `--latest` for a test build). Name the fork with `-R`:
    `gh`'s default repository may be upstream. `--target` refuses a short commit id.
-5. The notes say how to install (README, "Playing on the Switch"), what works, the measured speed
+5. The notes say how to install (README, "How to play on the Switch"), what works, the measured speed
    with its clocks, and what is missing (the open work below).
 
 #### Open work for the Switch releases
