@@ -130,9 +130,13 @@ static void last_exit_step(void)
         return;
     }
     if (!claim_leaving()) park();  /* the main thread's force_leave has it */
+    /* menu_exit before anything slow: without it the main loop parks for good on leaving, and an exit
+       step's write to the card takes tens of milliseconds */
+    int to_menu = menu_wanted && game_started && threadGetCurHandle() != main_thread;
+    if (to_menu) menu_exit = 1;
     nx_exit_step("the game's exit() reached its last step (%s thread, back to the menu %s)",
                  threadGetCurHandle() == main_thread ? "main" : "game", menu_wanted ? "asked" : "not asked");
-    if (menu_wanted && game_started && threadGetCurHandle() != main_thread) {
+    if (to_menu) {
         /* EXIT GAME: back to the Homebrew Menu (sphaira), not the end of the process. This is the last
            exit step, on the game's thread, after the workers and the render thread have stopped
            (host_end, finding 210). The process must leave from the main thread, as libnx's start code
@@ -141,7 +145,6 @@ static void last_exit_step(void)
            marks the thread ended, without which threadClose keeps its 64 MiB stack mapped and the
            loader stops with InvalidCurrentMemory (finding 270). */
         flush_all();
-        menu_exit = 1;
         SDL_SetAtomicInt(&game_running, 0);
         threadExit();
     }
