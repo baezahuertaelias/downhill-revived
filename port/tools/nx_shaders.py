@@ -25,6 +25,7 @@ NAGA = os.environ.get('NAGA') or str(Path.home() / 'DevCaches/naga/naga')
 ENTRIES = (('native_vertex', 'vert'), ('native_pixel', 'frag'), ('native_pixel_dual', 'frag'),
            ('fullscreen_vertex', 'vert'), ('native_blit', 'frag'), ('native_upload_alpha', 'frag'),
            ('native_grow_depth', 'frag'), ('native_convert', 'frag'), ('present_pixel', 'frag'))
+DRAW_ENTRIES = ('native_vertex', 'native_pixel', 'native_pixel_dual')
 DIVISION_WARNING = 'non-constant integer division'
 
 
@@ -38,6 +39,45 @@ def wgsl():
     text, n = re.subn(r'(return textureLoad\((?:grow_source|convert_depth[0-3]), xy, 0\))(;)', r'\1.r\2', text)
     if n != 5:
         sys.exit('nx_shaders: expected 5 depth loads, found %d' % n)
+    # the conversion's: its result as a colour, its table a texture
+    text += '''
+fn nx_unpack(w: u32) -> vec4<f32> {
+    return vec4<f32>(f32(w & 255u), f32(w >> 8u & 255u), f32(w >> 16u & 255u), f32(w >> 24u)) / 255.0;
+}
+// The inverse table as a 128 x 64 RGBA8 texture (dhd_render_nx.c): x in red, y in green.
+fn nx_inverse(i: u32) -> u32 {
+    let c = vec2<u32>(round(textureLoad(native_inverse, vec2<i32>(i32(i & 127u), i32(i >> 7u)), 0).rg * 255.0));
+    return c.x | c.y << 8u;
+}
+'''
+    return patched(text, CONVERT_PATCHES + TEXEL_PATCHES)
+
+
+def draws_wgsl():
+    """The draw stages' WGSL: port/nx/native_draws.wgsl, 0.7.6's native.wgsl and native_dual.wgsl
+    (finding 270: uam turns main's newer draw stages into blocks of wrong texels)."""
+    text = 'enable dual_source_blending;\n' + (ROOT / 'port/nx/native_draws.wgsl').read_text()
+    text = text.replace('texture_depth_2d', 'texture_2d<f32>')
+    text, n = re.subn(r'(fn load_depth\(t: texture_2d<f32>, xy: vec2<i32>\) -> f32 \{.*?return textureLoad\(t, xy, 0\))(;)',
+                      r'\1.r\2', text, flags=re.S)
+    if n != 1:
+        sys.exit('nx_shaders: load_depth not found')
+    # its conversion is 0.7.6's (CONVERT_PATCHES fit main's); naga checks every entry point, and the
+    # Switch builds the conversion from main's (wgsl())
+    at = text.find('fn native_convert(')
+    if at < 0:
+        sys.exit('nx_shaders: native_convert not found in native_draws.wgsl')
+    start, depth, i = text.rfind('\n@', 0, at) + 1, 0, text.index('{', at)
+    while True:
+        depth += {'{': 1, '}': -1}.get(text[i], 0)
+        i += 1
+        if not depth:
+            break
+    return patched(text[:start] + text[i:], TEXEL_PATCHES)
+
+
+def patched(text, patches):
+    """text with the uam workarounds' helpers appended and each patch applied (all must apply)."""
     # uam loses a dynamic index into a vector's components (it reads .x): by select instead
     text += '''
 fn nx_pick(v: vec4<u32>, i: u32) -> u32 {
@@ -55,56 +95,52 @@ fn nx_mod(a: u32, b: u32) -> u32 {
     if (b == 0u) { return 0u; }
     return a - nx_div(a, b) * b;
 }
-fn nx_unpack(w: u32) -> vec4<f32> {
-    return vec4<f32>(f32(w & 255u), f32(w >> 8u & 255u), f32(w >> 16u & 255u), f32(w >> 24u)) / 255.0;
-}
-// The inverse table as a 128 x 64 RGBA8 texture (dhd_render_nx.c): x in red, y in green.
-fn nx_inverse(i: u32) -> u32 {
-    let c = vec2<u32>(round(textureLoad(native_inverse, vec2<i32>(i32(i & 127u), i32(i >> 7u)), 0).rg * 255.0));
-    return c.x | c.y << 8u;
-}
 '''
-    for old, new in (('convert.pages[page >> 4u][(page >> 2u) & 3u]', 'nx_pick(convert.pages[page >> 4u], (page >> 2u) & 3u)'),
-                     ('convert.palette[value >> 2u][value & 3u]', 'nx_pick(convert.palette[value >> 2u], value & 3u)'),
-                     # scales: small, not always powers of two
-                     ('let step = S / E;', 'let step = nx_div(S, E);'),
-                     ('floor(vec2<f32>(c) / f32(E))', 'floor((vec2<f32>(c) + 0.5) / f32(E))'),
-                     # pages: 64 or 128 wide, 32, 64 or 128 tall
-                     ('let px = x % pw;', 'let px = x & (pw - 1u);'),
-                     ('let py = y % ph;', 'let py = y & (ph - 1u);'),
-                     ('((y / ph) * (bw * 64u / pw) + x / pw)',
+
+    for old, new in patches:
+        if old not in text:
+            sys.exit('nx_shaders: %s not found' % old)
+        text = text.replace(old, new)
+    return text
+
+
+# the texel lookup's scales: small, not always powers of two
+TEXEL_PATCHES = (('let step = S / E;', 'let step = nx_div(S, E);'),
+                 ('floor(vec2<f32>(c) / f32(E))', 'floor((vec2<f32>(c) + 0.5) / f32(E))'))
+CONVERT_PATCHES = (('convert.pages[page >> 4u][(page >> 2u) & 3u]', 'nx_pick(convert.pages[page >> 4u], (page >> 2u) & 3u)'),
+                   ('convert.palette[value >> 2u][value & 3u]', 'nx_pick(convert.palette[value >> 2u], value & 3u)'),
+                   # pages: 64 or 128 wide, 32, 64 or 128 tall
+                   ('let px = x % pw;', 'let px = x & (pw - 1u);'),
+                   ('let py = y % ph;', 'let py = y & (ph - 1u);'),
+                   ('((y / ph) * (bw * 64u / pw) + x / pw)',
                       '((y >> firstTrailingBit(ph)) * ((bw * 64u) >> firstTrailingBit(pw)) + (x >> firstTrailingBit(pw)))'),
-                     # a surface's width in pages: anything
-                     ('let origin = vec2<u32>((rel % bw) * 64u, (rel / bw) * 64u);',
+                   # a surface's width in pages: anything
+                   ('let origin = vec2<u32>((rel % bw) * 64u, (rel / bw) * 64u);',
                       'let origin = vec2<u32>(nx_mod(rel, bw) * 64u, nx_div(rel, bw) * 64u);'),
-                     ('i32(((rel % bw) * 64u + (at & 255u)) * scale + scale / 2u)',
+                   ('i32(((rel % bw) * 64u + (at & 255u)) * scale + scale / 2u)',
                       'i32((nx_mod(rel, bw) * 64u + (at & 255u)) * scale + scale / 2u)'),
-                     ('i32(((rel / bw) * 32u + (at >> 8u)) * scale + scale / 2u)',
+                   ('i32(((rel / bw) * 32u + (at >> 8u)) * scale + scale / 2u)',
                       'i32((nx_div(rel, bw) * 32u + (at >> 8u)) * scale + scale / 2u)'),
-                     # the conversion as a pixel shader, its table a texture
-                     ('var<storage, read> native_inverse: array<u32>', 'var native_inverse: texture_2d<f32>'),
-                     ('native_inverse[half]', 'nx_inverse(half)'),
-                     ('native_inverse[half + 1u]', 'nx_inverse(half + 1u)'),
-                     ('native_inverse[select(0u, 2048u, s.z == 1u) + (word & 2047u)]', 'nx_inverse(select(0u, 2048u, s.z == 1u) + (word & 2047u))'),
-                     ("""@compute @workgroup_size(8, 8, 1)
+                   # the conversion as a pixel shader, its table a texture
+                   ('var<storage, read> native_inverse: array<u32>', 'var native_inverse: texture_2d<f32>'),
+                   ('native_inverse[half]', 'nx_inverse(half)'),
+                   ('native_inverse[half + 1u]', 'nx_inverse(half + 1u)'),
+                   ('native_inverse[select(0u, 2048u, s.z == 1u) + (word & 2047u)]', 'nx_inverse(select(0u, 2048u, s.z == 1u) + (word & 2047u))'),
+                   ("""@compute @workgroup_size(8, 8, 1)
 fn native_convert(@builtin(global_invocation_id) tid: vec3<u32>) {
     if (tid.x >= convert.size.x || tid.y >= convert.size.y) { return; }
 """, """@fragment
 fn native_convert(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let tid = vec2<u32>(position.xy);
 """),
-                     # main's base texture is u32 words and the stores are r32uint; deko3d's textures are
-                     # RGBA8, so the base is read as a colour, packed, and the result written as a colour
-                     ('var convert_base: texture_2d<u32>', 'var convert_base: texture_2d<f32>'),
-                     ('return textureLoad(convert_base, xy, 0).x;',
+                   # main's base texture is u32 words and the stores are r32uint; deko3d's textures are
+                   # RGBA8, so the base is read as a colour, packed, and the result written as a colour
+                   ('var convert_base: texture_2d<u32>', 'var convert_base: texture_2d<f32>'),
+                   ('return textureLoad(convert_base, xy, 0).x;',
                       'let b = vec4<u32>(round(textureLoad(convert_base, xy, 0) * 255.0));\n    return b.r | b.g << 8u | b.b << 16u | b.a << 24u;'),
-                     ("""textureStore(native_converted, tid.xy, vec4<u32>(load_convert_base(vec2<i32>(tid.xy)), 0u, 0u, 0u));
+                   ("""textureStore(native_converted, tid.xy, vec4<u32>(load_convert_base(vec2<i32>(tid.xy)), 0u, 0u, 0u));
         return;""", 'return nx_unpack(load_convert_base(vec2<i32>(tid.xy)));'),
-                     ('textureStore(native_converted, tid.xy, vec4<u32>(rgba, 0u, 0u, 0u));', 'return nx_unpack(rgba);')):
-        if old not in text:
-            sys.exit('nx_shaders: %s not found' % old)
-        text = text.replace(old, new)
-    return text
+                   ('textureStore(native_converted, tid.xy, vec4<u32>(rgba, 0u, 0u, 0u));', 'return nx_unpack(rgba);'))
 
 
 def probe():
@@ -179,9 +215,11 @@ def main():
     with tempfile.TemporaryDirectory() as t:
         work = Path(t)
         (work / 'native.wgsl').write_text(wgsl())
+        (work / 'draws.wgsl').write_text(draws_wgsl())
         (work / 'zread.wgsl').write_text(probe())
-        lines = ['/* port/tools/nx_shaders.py: DKSH of port/gs/native.wgsl and zread.rs\'s probe. */']
-        for name, source, stage in [(e, work / 'native.wgsl', s) for e, s in ENTRIES] + [('zread', work / 'zread.wgsl', 'comp')]:
+        lines = ['/* port/tools/nx_shaders.py: DKSH of port/gs/native.wgsl, port/nx/native_draws.wgsl and zread.rs\'s probe. */']
+        for name, source, stage in [(e, work / ('draws.wgsl' if e in DRAW_ENTRIES else 'native.wgsl'), s) for e, s in ENTRIES] + \
+                                   [('zread', work / 'zread.wgsl', 'comp')]:
             data, pairs = build(work, source, name, stage)
             lines.append('static const unsigned char dksh_%s[] __attribute__((aligned(256))) = {%s};' % (name, ','.join(map(str, data))))
             print('%s.%s: %d bytes, %d dual-issue pairs undone' % (name, stage, len(data), pairs))

@@ -72,7 +72,8 @@ static void nx_logf(const char *format, ...)
 static DkDevice device;
 static DkQueue queue;
 static DkCmdBuf cmd;
-static DkMemBlock code_block, heap_block, descriptor_block, zread_block;
+static DkMemBlock code_block, heap_block, descriptor_block, zread_block, capture_block;
+static DhdrSurface *screen;  /* the live surface, for nx_render_release */
 static DkImageDescriptor *image_descriptors;
 static DkSamplerDescriptor *sampler_descriptors;
 static DkGpuAddr image_set, sampler_set;
@@ -201,11 +202,15 @@ typedef struct {
     DkImageFormat format;
 } Image;
 
+/* A descriptor written since the GPU last dropped its cached ones (descriptors_sync). */
+static int descriptors_dirty;
+
 /* Lock held; one is free. */
 static int descriptor_new(const DkImageView *view)
 {
     int at = free_descriptors[--free_descriptor_count];
     dkImageDescriptorInitialize(&image_descriptors[at], view, false, false);
+    __atomic_store_n(&descriptors_dirty, 1, __ATOMIC_RELEASE);
     return at;
 }
 
@@ -476,6 +481,20 @@ const char *dhdr_adapter_name(void) { return adapter; }
 uint32_t dhdr_device_features(void) { return ready > 0 ? DHDR_FEAT_DUAL_SOURCE | DHDR_FEAT_RENDER_PIPELINES : 0; }
 const char *dhdr_version(void) { return "dhd_render nx 1.0 deko3d"; }
 uint32_t dhdr_device_max_texture(void) { return ready > 0 ? 16384 : 0; }
+/* No GPU timestamps here yet: the timeline and perf_log read nothing (they need 4 values). */
+uint32_t dhdr_perf_read(uint64_t *out, uint32_t count) { (void)out; (void)count; return 0; }
+/* What main's renderer gained since 0.7.6 and this one has not yet (finding 270): deko3d reports
+   no device loss here; no VU1 mesh draws (native_vu stays off), so C keeps the emulated VU; no
+   pipeline list to prebuild; no surface read back (Poster Maker's frame: nothing to read). */
+int dhdr_device_lost(void) { return 0; }
+int dhdr_native_meshes(void) { return 0; }
+void dhdr_native_pipeline_list(const char *path) { (void)path; }
+int dhdr_native_surface_read_begin(DhdrNative *n, uint32_t index, const uint32_t rect[4], uint32_t size[2])
+{
+    (void)n; (void)index; (void)rect; (void)size;
+    return 0;
+}
+int dhdr_native_surface_read_finish(DhdrNative *n, uint32_t *pixels) { (void)n; (void)pixels; return 0; }
 
 /* ---- textures: reference counted, made on any thread, uploaded on the render thread ---- */
 struct DhdrTexture {
@@ -680,9 +699,19 @@ int dhdr_native_surface(DhdrNative *n, uint32_t index, uint32_t scale, uint32_t 
 }
 
 /* ---- passes ---- */
+/* Before work that samples images: the GPU caches image descriptors, and a slot freed and given to a
+   new image (descriptor_new) still reads as the old one until they are invalidated (finding 270: the
+   menus' textures came out as pieces of other images). */
+static void descriptors_sync(void)
+{
+    if (!__atomic_exchange_n(&descriptors_dirty, 0, __ATOMIC_ACQ_REL)) return;
+    dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Descriptors);
+}
+
 static void flush_draw(DhdrNative *n)
 {
     if (!n->pending_count) return;
+    descriptors_sync();
     if (n->indexed) dkCmdBufDrawIndexed(cmd, DkPrimitive_Triangles, (uint32_t)n->pending_count, 1, (uint32_t)n->pending_first, 0, 0);
     else dkCmdBufDraw(cmd, DkPrimitive_Triangles, (uint32_t)n->pending_count, 1, (uint32_t)n->pending_first, 0);
     n->pending_count = 0;
@@ -764,6 +793,7 @@ static void rect_pass(DhdrNative *n, const DkImageView *target, const uint32_t s
     dkCmdBufSetViewports(cmd, 0, &viewport, 1);
     DkScissor scissor = {x, y, w, h};
     dkCmdBufSetScissors(cmd, 0, &scissor, 1);
+    descriptors_sync();
     dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
     n->writes = n->sampled = 1;
     if (strict_barriers) surfaces_sync(n);
@@ -949,6 +979,7 @@ static void surfaces_prepare(DhdrNative *n)
                 dkCmdBufSetViewports(cmd, 0, &viewport, 1);
                 DkScissor scissor = {0, 0, g->size[0], g->size[1]};
                 dkCmdBufSetScissors(cmd, 0, &scissor, 1);
+                descriptors_sync();
                 dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
                 n->writes = n->sampled = 1;
                 n->rect_pixel = NULL;
@@ -1021,6 +1052,7 @@ static const Image *convert_run(DhdrNative *n, const DhdrPicture *p, int i)
     dkCmdBufSetViewports(cmd, 0, &viewport, 1);
     DkScissor scissor = {0, 0, w, h};
     dkCmdBufSetScissors(cmd, 0, &scissor, 1);
+    descriptors_sync();
     dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
     n->writes = n->sampled = 1;
     if (strict_barriers) surfaces_sync(n);
@@ -1115,6 +1147,52 @@ static const Surface *surface_of(const DhdrPicture *p, DhdrNative *n, int index,
     return &n->surfaces[index];
 }
 
+/* DHD_NX_DRAWS=N (a test tool, finding 270): picture N's surfaces and commands, each command with
+   what became of it, into draws_N.csv beside dhd.log. */
+static FILE *draws_trace;
+static void trace_command(const DhdrCommand *k, uint32_t i, const char *what)
+{
+    if (!draws_trace) return;
+    const DhdrNativeConstants *c = &k->constants;
+    fprintf(draws_trace, "cmd,%u,%u,%d,%d,%d,%d,%d,%d,%d,%#x,%u,%u,%d,%d,%u,%u,%u,%u,%u,%u,%d,%d,%d,%d,%u,%u,%#x,%#x,%u,%d,%d,%d,%d,%d,%d,%s\n",
+            i, k->kind, k->target, k->depth, k->texture_surface, k->convert, k->texture != NULL, k->replacement != NULL,
+            k->source, c->flags, c->tex_size[0], c->tex_size[1], c->tex_offset[0], c->tex_offset[1], c->wrap[0], c->wrap[1],
+            c->region[0], c->region[1], c->region[2], c->region[3], k->scissor[0], k->scissor[1], k->scissor[2], k->scissor[3],
+            k->first, k->count, k->blend_key, k->color_mask, k->depth_key, k->x, k->y, k->w, k->h, k->sx, k->sy, what);
+}
+
+static void trace_begin(const DhdrPicture *p)
+{
+    static int wanted = -2;
+    if (wanted == -2) {
+        const char *v = getenv("DHD_NX_DRAWS");
+        wanted = v && *v ? atoi(v) : -1;
+    }
+    if (wanted < 0 || nx_pictures != (uint64_t)wanted) return;
+    char path[128];
+    snprintf(path, sizeof path, "sdmc:/switch/downhill-revived/draws_%d.csv", wanted);
+    if (!(draws_trace = fopen(path, "w"))) return;
+    fprintf(draws_trace, "picture,%llu,commands,%u,converts,%u,surfaces,%u,display_surface,%d,display,%u,%u,%u,%u,%u,%u,%u,%u,scale,%u\n",
+            (unsigned long long)nx_pictures, p->command_count, p->convert_count, p->surface_count, p->display_surface,
+            p->display[0], p->display[1], p->display[2], p->display[3], p->display[4], p->display[5], p->display[6], p->display[7], p->scale);
+    fputs("surface,index,page,bw,wide,depth,zpsm,scale,w,h,extent_w,extent_h\n", draws_trace);
+    for (uint32_t s = 0; s < p->surface_count; s++) {
+        const DhdrSurfaceInfo *f = &p->surfaces[s];
+        fprintf(draws_trace, "surface,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u\n", s, f->page, f->bw, f->wide, f->depth, f->zpsm,
+                f->scale, f->size[0], f->size[1], f->extent[0], f->extent[1]);
+    }
+    fputs("cmd,i,kind,target,depth,texture_surface,convert,texture,replacement,source,flags,tex_w,tex_h,tex_x,tex_y,wrap_u,wrap_v,"
+          "region0,region1,region2,region3,sc_l,sc_t,sc_r,sc_b,first,count,blend_key,color_mask,depth_key,x,y,w,h,sx,sy,what\n", draws_trace);
+}
+
+static void trace_end(void)
+{
+    if (!draws_trace) return;
+    fclose(draws_trace);
+    draws_trace = NULL;
+    nx_logf("nx draws: picture %llu traced", (unsigned long long)nx_pictures);
+}
+
 static void render(DhdrNative *n, const DhdrPicture *p)
 {
     int last_convert = -1;
@@ -1122,24 +1200,26 @@ static void render(DhdrNative *n, const DhdrPicture *p)
     uint64_t versions[SURFACES] = {0};
     uint64_t stamps[CONVERTS][4];
     const Image *conversions[CONVERTS] = {0};
+    trace_begin(p);
     for (uint32_t i = 0; i < p->command_count; i++) {
         const DhdrCommand *k = &p->commands[i];
+#define SKIP(why) { trace_command(k, i, why); continue; }
         if (k->kind == DHDR_CMD_ALPHA_UPLOAD || k->kind == DHDR_CMD_IMPORT || k->kind == DHDR_CMD_COPY) {
             last_convert = -1;
             const DhdrSurfaceInfo *info;
-            if (k->kind == DHDR_CMD_IMPORT && (!surface_of(p, n, k->target, &info) || info->depth)) continue;
-            if (k->kind == DHDR_CMD_COPY && (!surface_of(p, n, k->source, &info) || !surface_of(p, n, k->target, &info))) continue;
+            if (k->kind == DHDR_CMD_IMPORT && (!surface_of(p, n, k->target, &info) || info->depth)) SKIP("skip: import target");
+            if (k->kind == DHDR_CMD_COPY && (!surface_of(p, n, k->source, &info) || !surface_of(p, n, k->target, &info))) SKIP("skip: copy surfaces");
             if (k->target >= 0 && k->target < SURFACES) versions[k->target]++;
             pass_end(n);
             if (k->kind == DHDR_CMD_ALPHA_UPLOAD) surface_alpha_upload(n, k);
             else if (k->kind == DHDR_CMD_IMPORT) surface_import(n, k);
             else surface_copy(n, k);
-            continue;
+            SKIP("done");
         }
-        if (!k->count) continue;
+        if (!k->count) SKIP("skip: no vertices");
         const DhdrSurfaceInfo *target_info = NULL, *depth_info = NULL;
         const Surface *target = surface_of(p, n, k->target, &target_info);
-        if (!target || target_info->depth) continue;
+        if (!target || target_info->depth) SKIP("skip: target");
         const Surface *depth = k->depth >= 0 && k->depth_key & 8 ? surface_of(p, n, k->depth, &depth_info) : NULL;
         if (depth && (!depth_info->depth || depth_info->size[0] != target_info->size[0] || depth_info->size[1] != target_info->size[1])) depth = NULL;
 
@@ -1179,7 +1259,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
             else if ((uint32_t)k->texture_surface < p->surface_count) big_s = p->surfaces[k->texture_surface].scale;
             if (k->texture_surface == k->target) {
                 pass_end(n);
-                if (!sample_target(n, k->texture_surface, &k->constants)) continue;
+                if (!sample_target(n, k->texture_surface, &k->constants)) SKIP("skip: sample target");
                 source = &n->scratch;
                 reads_surface = 1;
             } else if (k->texture_surface < SURFACES && n->surfaces[k->texture_surface].exists && !n->surfaces[k->texture_surface].depth) {
@@ -1206,7 +1286,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
                 }
                 last_convert = ci;
             }
-            if (!converted) continue;
+            if (!converted) SKIP("skip: conversion");
             source = converted;
             reads_surface = 1;
         }
@@ -1222,7 +1302,15 @@ static void render(DhdrNative *n, const DhdrPicture *p)
         if (n->target != k->target || n->depth != depth_index) {
             pass_end(n);
             if (n->sampled) surfaces_sync(n);   /* it may write what a draw is still reading */
+            /* finding 270: ZCULL keeps coarse Z per tile for the bound Z image and is dropped only when
+               the bound address changes; a Z surface written or read elsewhere since (another pass,
+               a copy, a probe) left it stale, and stale tiles reject whole blocks of a scene */
+            flush_draw(n);
             dkCmdBufBindRenderTarget(cmd, &n->surfaces[k->target].image.view, depth ? &n->surfaces[k->depth].image.view : NULL);
+            if (depth || n->zcull_stale) {
+                dkCmdBufBarrier(cmd, DkBarrier_None, DkInvalidateFlags_Zcull);
+                n->zcull_stale = 0;
+            }
             n->target = k->target, n->depth = depth_index;
             n->viewport_valid = n->scissor_valid = 0;
         }
@@ -1236,7 +1324,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
         if (top < 0) top = 0;
         if (right > (int)tw) right = (int)tw;
         if (bottom > (int)th) bottom = (int)th;
-        if (right <= left || bottom <= top) continue;
+        if (right <= left || bottom <= top) SKIP("skip: scissor");
 
         uint32_t blend_key = k->blend_key, mask = k->color_mask, dk = k->depth_key;
         uint32_t src = blend_key >> 1 & 31, dst = blend_key >> 6 & 31;
@@ -1249,7 +1337,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
         DkGpuAddr uniform = n->constants_addr;
         if (!n->constants_valid || memcmp(&n->constants_last, &constants, sizeof constants)) {
             uniform = constants_of(&constants, sizeof constants);
-            if (uniform == DK_GPU_ADDR_INVALID) continue;
+            if (uniform == DK_GPU_ADDR_INVALID) SKIP("skip: uniform arena full");
             n->constants_last = constants, n->constants_addr = uniform, n->constants_valid = 1;
         }
         uint32_t handle = dkMakeTextureHandle((uint32_t)source->sampled, sampler);
@@ -1296,8 +1384,11 @@ static void render(DhdrNative *n, const DhdrPicture *p)
         n->drawn.draws++;
         if (k->target >= 0 && k->target < SURFACES) versions[k->target]++;
         if (depth && k->depth < SURFACES) versions[k->depth]++;
+        trace_command(k, i, source == &dummy && k->constants.flags & 1 ? "drawn: textured, no source" : "drawn");
+#undef SKIP
     }
     pass_end(n);
+    trace_end();
 }
 
 static int picture(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices, uint32_t index_count, DhdrPictureResult *out)
@@ -1376,6 +1467,16 @@ static int picture(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices,
                     if (w > s->size[0] - sx) w = s->size[0] - sx;
                     if (source_h > s->size[1] - sy) source_h = s->size[1] - sy;
                     if (h > source_h << shift) h = source_h << shift;
+                    /* finding 270: a surface smaller than the picture leaves the display's other
+                       pixels as the last picture had them (native.wgsl reads them black) */
+                    static uint32_t told_w, told_h, told_surface = ~0u;
+                    if ((w < d[5] || h < d[6]) && (told_w != w || told_h != h || told_surface != (uint32_t)p->display_surface)) {
+                        told_w = w, told_h = h, told_surface = (uint32_t)p->display_surface;
+                        nx_logf("nx scanout: surface %d (%u x %u, bw %u, extent %u x %u) gives %u x %u of %u x %u from (%u, %u)",
+                                p->display_surface, s->size[0], s->size[1], p->surfaces[p->display_surface].bw,
+                                p->surfaces[p->display_surface].extent[0], p->surfaces[p->display_surface].extent[1],
+                                w, h, d[5], d[6], sx, sy);
+                    }
                     DkImageRect from, to;
                     copy_rect(&from, sx, sy, w, source_h);
                     copy_rect(&to, 0, 0, w, h);
@@ -1439,6 +1540,7 @@ DhdrSurface *dhdr_surface_create(const DhdrWindow *w, uint32_t present_flags)
     dkSwapchainMakerDefaults(&sm, device, (void *)(uintptr_t)w->a, s->list, SWAP_IMAGES);
     s->swapchain = dkSwapchainCreate(&sm);
     s->acquired = -1;
+    screen = s;
     return s;
 }
 void dhdr_surface_destroy(DhdrSurface *s)
@@ -1447,7 +1549,29 @@ void dhdr_surface_destroy(DhdrSurface *s)
     dkQueueWaitIdle(queue);
     dkSwapchainDestroy(s->swapchain);
     dkMemBlockDestroy(s->block);
+    if (screen == s) screen = NULL;
     free(s);
+}
+
+/* EXIT GAME's way back to the Homebrew Menu (nx_host.c), after the render thread has stopped: every
+   block goes back to the heap as it was (its attributes and GPU mapping undone), which the loader
+   needs before it reloads the menu (finding 270). */
+void nx_render_release(void)
+{
+    if (ready <= 0) return;
+    dkQueueWaitIdle(queue);
+    dhdr_surface_destroy(screen);
+    dkCmdBufDestroy(cmd);
+    dkQueueDestroy(queue);
+    for (int i = 0; i < FRAMES; i++) {
+        dkMemBlockDestroy(frames[i].arena);
+        dkMemBlockDestroy(frames[i].commands);
+    }
+    DkMemBlock blocks[] = {code_block, heap_block, descriptor_block, zread_block, capture_block};
+    for (size_t i = 0; i < sizeof blocks / sizeof *blocks; i++)
+        if (blocks[i]) dkMemBlockDestroy(blocks[i]);
+    dkDeviceDestroy(device);
+    ready = 0;
 }
 uint32_t dhdr_surface_usage(const DhdrSurface *s) { (void)s; return 0; }
 void dhdr_surface_counter(DhdrSurface *s, int enabled, int server_ms, int race_ms, int riders_ms, double seconds)
@@ -1519,12 +1643,11 @@ static void fps_overlay(DkCmdBuf cmd, int screen_h)
 /* DHD_NX_CAPTURE=1 (a test tool): images as BMP files beside dhd.log, at a few pictures. */
 static void capture_image(const Image *t, const char *name, uint64_t picture)
 {
-    static DkMemBlock block;
     enum { CAPTURE_SIZE = 32 << 20 };
     uint32_t bytes = t->w * t->h * 4;
     if (bytes > CAPTURE_SIZE) return;
-    if (!block) block = block_make(CAPTURE_SIZE, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
-    DkCopyBuf to = {dkMemBlockGetGpuAddr(block), t->w * 4, t->h};
+    if (!capture_block) capture_block = block_make(CAPTURE_SIZE, DkMemBlockFlags_CpuUncached | DkMemBlockFlags_GpuCached);
+    DkCopyBuf to = {dkMemBlockGetGpuAddr(capture_block), t->w * 4, t->h};
     DkImageRect rect;
     copy_rect(&rect, 0, 0, t->w, t->h);
     dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_Image);
@@ -1541,7 +1664,7 @@ static void capture_image(const Image *t, const char *name, uint64_t picture)
     header[0] = total;
     fwrite("BM", 1, 2, f);
     fwrite(header, 4, 13, f);
-    const uint8_t *from = dkMemBlockGetCpuAddr(block);
+    const uint8_t *from = dkMemBlockGetCpuAddr(capture_block);
     uint8_t *row = malloc(t->w * 4);
     for (uint32_t y = t->h; y--;) {
         for (uint32_t x = 0; x < t->w; x++) {
@@ -1619,6 +1742,7 @@ int dhdr_native_present(DhdrNative *n, DhdrSurface *s, const DhdrPresentRect *r)
         dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, 2);
         dkCmdBufBindUniformBuffer(cmd, DkStage_Fragment, 0, uniform, 16);
         dkCmdBufBindTexture(cmd, DkStage_Fragment, 0, dkMakeTextureHandle((uint32_t)n->display.sampled, n->present_sampler));
+        descriptors_sync();
         dkCmdBufDraw(cmd, DkPrimitive_Triangles, 3, 1, 0, 0);
         n->sampled = 1;
     }
@@ -1656,6 +1780,7 @@ int dhdr_native_zread_start(DhdrNative *n, uint32_t index, const uint32_t rect[4
     dkCmdBufBindUniformBuffer(cmd, DkStage_Compute, 0, uniform, sizeof params);
     dkCmdBufBindStorageBuffer(cmd, DkStage_Compute, 0, dkMemBlockGetGpuAddr(zread_block) + (DkGpuAddr)slot * ZREAD_BYTES, ZREAD_BYTES);
     dkCmdBufBindTexture(cmd, DkStage_Compute, 0, dkMakeTextureHandle((uint32_t)s->image.sampled, SAMPLER_NEAREST));
+    descriptors_sync();
     dkCmdBufDispatchCompute(cmd, (w + 7) / 8, (h + 7) / 8, 1);
     dkCmdBufBarrier(cmd, DkBarrier_Full, DkInvalidateFlags_L2Cache);   /* compute: the one that waits for it */
     nx_t_record_ns += now_ns() - record;
