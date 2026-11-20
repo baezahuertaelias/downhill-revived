@@ -8,7 +8,7 @@ support; everything Switch-specific lives here (`port/nx/`, the Switch build in
 `port/tools/build_host64.py`, the console test `port/tools/nx_fulltest.py`). The plan of record is
 [finding 270](docs/findings/270-switch-performance-plan.md); the port itself is finding 272.
 
-## Switch status (experimental, no release yet)
+## Switch status (experimental)
 
 Works on the console: the title, the menus and a whole race, the game's memory card saves, button
 rebinding (REVIVED SETTINGS > Controls), and EXIT GAME back to the Homebrew Menu (each step logged
@@ -29,18 +29,25 @@ Not on the Switch, and not planned for now: online play and texture packs.
 
 ## Playing on the Switch
 
-You need a modded console with Atmosphère and a Homebrew Menu (hbmenu or sphaira). Build the NRO
-yourself ([docs/BUILDING.md](docs/BUILDING.md#nintendo-switch)), then copy two files to the SD
-card, into one folder:
+You need a modded console with Atmosphère and a Homebrew Menu (hbmenu or sphaira), and your own
+dump of the USA disc (SCUS-97177).
 
-    /switch/downhill-revived/downhill-revived.nro   the game, build/switch/downhill-revived.nro
-    /switch/downhill-revived/SCUS-97177.iso         your own dump of the USA disc, named exactly so
+1. Download `downhill-revived.nro` from this fork's
+   [Releases](https://github.com/marmota94/downhill-revived/releases) page (experimental
+   prereleases), or build it yourself ([docs/BUILDING.md](docs/BUILDING.md#nintendo-switch)).
+2. Copy two files to the SD card, into one folder:
 
-Copy them with the card in a PC, or over the network with sphaira's FTP server (port 5000), e.g.
-`curl -T SCUS-97177.iso ftp://CONSOLE_IP:5000/switch/downhill-revived/`. Then start the Homebrew
-Menu by holding R while starting a game (from the album it has too little memory, and the game
-says so) and pick Downhill Revived. The first start makes `dhd.ini` in that folder (scale 1,
-shadows, lens flare and particles off); `dhd.log` and the saves go there too.
+       /switch/downhill-revived/downhill-revived.nro   the game
+       /switch/downhill-revived/SCUS-97177.iso         your own dump of the USA disc, named exactly so
+
+   Copy them with the card in a PC, or over the network with sphaira's FTP server (port 5000),
+   e.g. `curl -T SCUS-97177.iso ftp://CONSOLE_IP:5000/switch/downhill-revived/`.
+3. Start the Homebrew Menu by holding R while starting a game (from the album it has too little
+   memory, and the game says so) and pick Downhill Revived.
+
+The first start makes `dhd.ini` in that folder (scale 1, shadows, lens flare and particles off);
+`dhd.log` and the saves go there too. For a steady 30 instead of an uneven 46-54, set `fps = 30`
+in `dhd.ini`.
 
 After a crash, look in `/atmosphere/crash_reports/`, `/atmosphere/fatal_reports/` and
 `/switch/downhill-revived/dhd.log`.

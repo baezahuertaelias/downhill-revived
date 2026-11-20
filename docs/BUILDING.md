@@ -299,7 +299,8 @@ dirs go to `DHD_CARGO_DIR`, else `~/.cache/dhd-cargo`.
 
 ### Nintendo Switch
 
-A homebrew NRO for a modded console, not a release (finding 272). Built so far only on an Intel Mac;
+A homebrew NRO for a modded console (finding 272), published only as experimental prereleases on
+the fork's Releases page. Built so far only on an Intel Mac;
 the steps below have not been tried on another machine.
 
 - [devkitPro](https://devkitpro.org/wiki/Getting_Started) packages: `switch-dev`, `deko3d`, `uam`,
