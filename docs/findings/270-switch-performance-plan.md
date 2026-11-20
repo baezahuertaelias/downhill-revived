@@ -204,6 +204,14 @@ merge in a throwaway worktree. Nothing from it is used here.
   left as code memory had stopped hbl the same way (`nx_threads_end`, `nx_guest_memory_release`).
   Open: after this run the player saw "The software was closed because an error occurred" (the error
   applet, no crash report, no erpt on the card); when it appeared and its code are not known.
+- [x] 2026-11-20 (`switch/controls`): button rebinding. `settings_nx.c` now has `controls.rs`'s rules in C
+  (`dhd_controls_layouts`, `dhd_controls_edit`: the same dhd.ini lines `keyboard`, `pad1` to `pad4`, the
+  same swaps, refusals and words on the CONTROLS page), in place of the defaults and "Not on the Switch
+  yet". A host build of the file (Linux gcc, `-Wall -Wextra -Werror`, UBSan) passed a test of
+  `tests/controls.rs`'s cases (scratch, not kept); the NRO builds. NOT done: a console run of the page.
+  Controllers report `PAD_KIND_NONE`, so the page names buttons with Xbox's words: right for A and B
+  (`gamepad_nx.c` gives A as south, B as east), swapped for X and Y (Y is west, which Xbox calls X).
+  No pad kind's words fit that mapping; open.
 - [ ] step 1: baseline on the console
 - [ ] steps 2 to 5
 

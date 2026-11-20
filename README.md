@@ -62,8 +62,8 @@ Copy them with the card in a PC, or over the network with sphaira's FTP server (
 `curl -T SCUS-97177.iso ftp://CONSOLE_IP:5000/switch/downhill-revived/`. Then start the Homebrew
 Menu by holding R while starting a game (from the album it has too little memory, and the game
 says so) and pick Downhill Revived. The first start makes `dhd.ini` in that folder (scale 1,
-shadows, lens flare and particles off); `dhd.log` and the saves go there too. Online play, texture
-packs and rebinding buttons are not on the Switch yet.
+shadows, lens flare and particles off); `dhd.log` and the saves go there too. Online play and texture
+packs are not on the Switch yet.
 
 ## Legal notice
 

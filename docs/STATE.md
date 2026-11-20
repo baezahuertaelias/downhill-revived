@@ -58,8 +58,9 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
 - **Nintendo Switch (homebrew, not released):** `build_host64.py --target switch-arm64` makes an NRO
   for a modded console (devkitA64 and libnx, a deko3d renderer in C, `port/nx`; findings 272, 270).
   Title, menus and a race run on the console at about 45-53 fields/s; EXIT GAME returns to the
-  Homebrew Menu. Its draw shaders are a pinned copy of 0.7.6's (uam miscompiles main's); no online,
-  texture packs, button rebinding or Native VU there yet.
+  Homebrew Menu. Its draw shaders are a pinned copy of 0.7.6's (uam miscompiles main's); button rebinding
+  is `controls.rs`'s rules in C (`settings_nx.c`, not yet tried on a console); no online, texture
+  packs or Native VU there yet.
 - **Launcher:** `port/launcher` (Tauri; settings, rider name, updates, disc choice; finding 093;
   native window buttons on macOS, finding 150). Its page (`port/launcher/ui`) is the one launcher
   UI of every platform: Android shows it in a WebView (`LauncherActivity`, the app's entry) through
