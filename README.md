@@ -10,20 +10,20 @@ support; everything Switch-specific lives here (`port/nx/`, the Switch build in
 
 ## Switch status (experimental, no release yet)
 
-Works on the console: the title, the menus and a whole race, the game's memory card saves, and
-EXIT GAME back to the Homebrew Menu. Docked at 1785/768/1600 MHz a race runs at about 47-54
-fields a second and the menus at about 45; the target is 60.
+Works on the console: the title, the menus and a whole race, the game's memory card saves, button
+rebinding (REVIVED SETTINGS > Controls), and EXIT GAME back to the Homebrew Menu (each step logged
+to `exit_steps.txt`). Docked at 1785/768/1600 MHz a race runs at about 46-54 fields a second and
+the menus at about 45; the target is 60. Until then `fps = 30` in `dhd.ini` gives a steady,
+even 30 (two vblanks a picture).
 
 "Ready to play" means a steady 60 fields a second (or a smooth 30 option), no error on exit, and
-button rebinding. Being worked on, each on its own branch:
+button rebinding. The 30 option, the exit and rebinding are done; 60 is still open:
 
-| Branch | Work | State |
-|---|---|---|
-| `switch/exit-error` | the error some runs show after EXIT GAME; each exit step logged to `exit_steps.txt` | built, console run pending |
-| `switch/pacing` | an even 30 fields a second (`fps = 30`): two vblanks a picture | built, console run pending |
-| `switch/controls` | button rebinding on the CONTROLS page | built, console run pending |
-| `switch/baseline` | clean measurements, profile-guided build, threads and cores | in progress |
-| `switch/mesh-path` | Native VU's mesh draws in deko3d, the biggest speed step | started |
+| Work | State |
+|---|---|
+| Native VU's mesh draws in deko3d (`native_vu = on`) | drawn right on the console, +1 %; off by default |
+| Clean measurements, profile-guided build, threads and cores | in progress |
+| The renderer's gains on top of the mesh path | not started |
 
 Not on the Switch, and not planned for now: online play and texture packs.
 
@@ -40,8 +40,7 @@ Copy them with the card in a PC, or over the network with sphaira's FTP server (
 `curl -T SCUS-97177.iso ftp://CONSOLE_IP:5000/switch/downhill-revived/`. Then start the Homebrew
 Menu by holding R while starting a game (from the album it has too little memory, and the game
 says so) and pick Downhill Revived. The first start makes `dhd.ini` in that folder (scale 1,
-shadows, lens flare and particles off); `dhd.log` and the saves go there too. Rebinding buttons is
-not on the Switch yet.
+shadows, lens flare and particles off); `dhd.log` and the saves go there too.
 
 After a crash, look in `/atmosphere/crash_reports/`, `/atmosphere/fatal_reports/` and
 `/switch/downhill-revived/dhd.log`.

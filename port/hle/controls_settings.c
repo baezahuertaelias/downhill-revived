@@ -73,7 +73,7 @@ static const char *input_word(int code)
     } else {
         for (int i = 0; i < CONTROL_PAD_INPUTS; i++)
             if (control_pad_inputs[i].id == code)
-                return control_pad_inputs[i].label[kind == PAD_KIND_PLAYSTATION ? 1 : kind == PAD_KIND_NINTENDO ? 2 : 0];
+                return pad_input_word(code, control_pad_inputs[i].label, kind);
     }
     return "?";
 }

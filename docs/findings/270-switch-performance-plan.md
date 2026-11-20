@@ -221,6 +221,14 @@ merge in a throwaway worktree. Nothing from it is used here.
   gets the loader's priority back (the menu runs on it next). Open: the error's code and moment.
   Also open: whether sphaira alone, closed the same way, shows it. Users report that message when
   closing sphaira itself with + (GBAtemp, nton issue 12).
+- [x] 2026-11-20 (`switch/controls`): button rebinding. `settings_nx.c` now has `controls.rs`'s rules in C
+  (`dhd_controls_layouts`, `dhd_controls_edit`: the same dhd.ini lines `keyboard`, `pad1` to `pad4`, the
+  same swaps, refusals and words on the CONTROLS page), in place of the defaults and "Not on the Switch
+  yet". A host build of the file (Linux gcc, `-Wall -Wextra -Werror`, UBSan) passed a test of
+  `tests/controls.rs`'s cases (scratch, not kept); the NRO builds. NOT done: a console run of the page.
+  Controllers report `PAD_KIND_NONE`, so the page names buttons with Xbox's words: right for A and B
+  (`gamepad_nx.c` gives A as south, B as east), swapped for X and Y (Y is west, which Xbox calls X).
+  No pad kind's words fit that mapping; open.
 - [ ] step 1: baseline on the console
 - [ ] steps 2 to 5
 - [ ] 2026-11-20, step 5 (`switch/pacing`, built, not yet run on the console): at `fps = 30` the
@@ -232,6 +240,26 @@ merge in a throwaway worktree. Nothing from it is used here.
   game clock is unchanged (finding 139: no fixed step). To check on the console with `DHD_FPS=30`:
   the `nx present: swap interval` lines in dhd.log, fields/s near 30 with p99 and max field times
   near 33 ms, the countdown at real speed, and the race's feel against `fps = 60`.
+- [x] 2026-11-20, console runs (docked, 1785/768/1600 MHz), all merged into `main`:
+  - `switch/pacing`, race at `fps = 30`: 30.000 fields/s over 6000-7000, p50 33.33 ms, p99 33.57 ms,
+    max 38.9 ms (60-70 ms spikes before). Step 5 done.
+  - `switch/exit-error`: its first run froze after "exit() reached its last step". The game's
+    thread took the exit (`leaving`) and set `menu_exit` only after the exit step's write to the card
+    (about 60 ms); the main loop parks for good on `leaving` without `menu_exit` and saw the gap. Main
+    had the same gap, shorter (`flush_all`'s commit of sdmc alone): the same freeze after the pacing
+    run's race. `menu_exit` is now set right after the claim. Then phases B and C both came back to
+    sphaira: `exit_steps.txt` to libnx's exit in 221 ms, heap 0 regions the loader can't read over,
+    no crash report. The error applet's message was not seen again; sphaira closed alone is untested.
+  - `switch/controls`: by hand on the console, the page's names (now A B Y X as printed: the pages
+    get `PAD_KIND_SWITCH`, `hle.h`'s `pad_input_word`), a swap, a refusal, Swap Sticks, the layout
+    kept over a restart and Reset all as expected; no `controls:` problem lines in dhd.log.
+  - `switch/mesh-path`, `native_vu = on`: the race's picture right (rider, terrain, trees, cliff,
+    HUD; back faces culled as wgpu's), 12 loops drawn natively, the race 46.6 fields/s against 46.0
+    with it off (+1.3 %, under the 3 % rule alone; the renderer gains build on it). Still off by
+    default; `NX_DRAWS=main` (the uam stack workaround) not yet run.
+  - Surprise: build_wasm.py's core cache keys on `git ls-files`, which finds nothing in the Docker
+    build volume (no checkout there), so every core build there is a cache hit: a change to the core
+    (`port/hle`) needs `DHD_MODULE_CACHE=0` in that volume.
 
 ## Decisions
 

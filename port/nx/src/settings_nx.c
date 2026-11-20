@@ -2,6 +2,7 @@
    can't run. The same table of keys and player defaults; the choices' labels stay in
    port/hle/settings_table.h, which the game core reads. */
 #include "dhd_settings.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -249,28 +250,354 @@ int dhd_settings_install_id(const char *path, char *out, size_t size)
     return 1;
 }
 
-/* The bindings (controls.rs's rules) aren't in C yet: every device plays with its default layout,
-   and the CONTROLS page can't change one (finding 270). */
-void dhd_controls_layouts(const char *const values[DHD_CONTROLS_DEVICES], DhdControlsLayout out[DHD_CONTROLS_DEVICES],
-                          DhdSettingsUnknown problem)
+/* ---- the bindings: port/render/settings/src/controls.rs's rules in C (finding 157; on the Switch,
+   finding 270). The same dhd.ini lines, layouts and CONTROLS page words; keep it in step with
+   controls.rs (its tests say what each rule does). ---- */
+
+typedef struct { const char *p; size_t n; } Span;  /* a piece of a line, not NUL-terminated */
+
+static int span_is(Span s, const char *word) { return strlen(word) == s.n && !memcmp(s.p, word, s.n); }
+
+/* The next piece of *rest up to one of seps (empty pieces count, as Rust's split); 0 at the end.
+   seps NULL: split at white space, skipping empty pieces, as Rust's split_whitespace. */
+static int next_piece(Span *rest, const char *seps, Span *out)
 {
-    for (int d = 0; d < DHD_CONTROLS_DEVICES; d++) {
-        memcpy(&out[d], &control_defaults[d], sizeof out[d]);
-        if (problem && values[d] && *values[d]) {
-            char line[160];
-            snprintf(line, sizeof line, "%s: bindings aren't read on the Switch yet, the defaults play", control_devices[d].key);
-            problem(line);
+    if (!seps) {
+        while (rest->n && isspace((unsigned char)*rest->p)) rest->p++, rest->n--;
+        if (!rest->n) return 0;
+        size_t n = 0;
+        while (n < rest->n && !isspace((unsigned char)rest->p[n])) n++;
+        *out = (Span){rest->p, n};
+        rest->p += n, rest->n -= n;
+        return 1;
+    }
+    if (!rest->p) return 0;
+    size_t n = 0;
+    while (n < rest->n && !strchr(seps, rest->p[n])) n++;
+    *out = (Span){rest->p, n};
+    if (n < rest->n) rest->p += n + 1, rest->n -= n + 1;
+    else rest->p = NULL, rest->n = 0;
+    return 1;
+}
+
+static int is_pad(int device) { return device != CONTROL_KEYBOARD; }
+
+static int target_named(Span name)
+{
+    for (int t = 0; t < CONTROL_TARGETS; t++)
+        if (span_is(name, control_targets[t].name)) return t;
+    return -1;
+}
+
+/* Whether target can be bound on device (a controller's sticks are its own). */
+static int bindable(int device, int target)
+{
+    return target >= 0 && target < CONTROL_TARGETS && (!is_pad(device) || target < CONTROL_BUTTONS);
+}
+
+/* The input code a layout of device keeps for the dhd.ini name (vk or id); 0 none. */
+static int input_named(int device, Span name)
+{
+    if (is_pad(device)) {
+        for (int i = 0; i < CONTROL_PAD_INPUTS; i++)
+            if (span_is(name, control_pad_inputs[i].name)) return control_pad_inputs[i].id;
+    } else {
+        for (int i = 0; i < CONTROL_KEYS; i++)
+            if (span_is(name, control_keys[i].name)) return control_keys[i].vk;
+    }
+    return 0;
+}
+
+/* A code's dhd.ini name (label 0) or the pages' word for it (label 1; a controller's by its kind,
+   PAD_KIND_*: 1 PlayStation, 3 Nintendo, 4 the Switch's own pads, else Xbox's words); "?" for none. */
+static const char *input_word(int device, int code, int label, int kind)
+{
+    if (is_pad(device)) {
+        /* the Switch's: gamepad_nx.c's face codes are A south, B east, Y west, X north (hle.h's
+           pad_input_word) */
+        static const char *const switch_face[] = {"A", "B", "Y", "X"};
+        if (label && kind == 4 && code >= 1 && code <= 4) return switch_face[code - 1];
+        for (int i = 0; i < CONTROL_PAD_INPUTS; i++)
+            if (control_pad_inputs[i].id == code)
+                return !label ? control_pad_inputs[i].name : control_pad_inputs[i].label[kind == 1 ? 1 : kind == 3 || kind == 4 ? 2 : 0];
+    } else {
+        for (int i = 0; i < CONTROL_KEYS; i++)
+            if (control_keys[i].vk == code) return label ? control_keys[i].label : control_keys[i].name;
+    }
+    return "?";
+}
+
+static int has(const uint8_t slots[CONTROL_SLOTS], int code) { return slots[0] == code || slots[1] == code; }
+
+/* An alternate without a main becomes the main. */
+static void tidy(uint8_t slots[CONTROL_SLOTS])
+{
+    if (!slots[0]) slots[0] = slots[1], slots[1] = 0;
+}
+
+static const struct { uint8_t bit; const char *name; } invert_names[] = {
+    {CONTROL_INVERT_LX, "lx"}, {CONTROL_INVERT_LY, "ly"}, {CONTROL_INVERT_RX, "rx"}, {CONTROL_INVERT_RY, "ry"}};
+static const struct { uint8_t bit; const char *name; } swap_names[] = {{CONTROL_SWAP_L, "l1l2"}, {CONTROL_SWAP_R, "r1r2"}};
+
+/* A problem with device's line, "pad1: ..." */
+static void say(DhdSettingsUnknown problem, int device, const char *format, ...) __attribute__((format(printf, 3, 4)));
+static void say(DhdSettingsUnknown problem, int device, const char *format, ...)
+{
+    if (!problem) return;
+    char line[600];
+    int n = snprintf(line, sizeof line, "%s: ", control_devices[device].key);
+    va_list args;
+    va_start(args, format);
+    vsnprintf(line + n, sizeof line - (size_t)n, format, args);
+    va_end(args);
+    problem(line);
+}
+
+/* The layout a line of device gives (controls.rs's parse): an entry that can't be read is skipped,
+   with a line through problem, and its button keeps its default. */
+static void parse(int device, const char *text, ControlsLayout *l, DhdSettingsUnknown problem)
+{
+    int pad = is_pad(device), named[CONTROL_TARGETS] = {0};
+    *l = control_defaults[device];
+    Span rest = {text, strlen(text)}, entry, v;
+    while (next_piece(&rest, NULL, &entry)) {
+        const char *colon = memchr(entry.p, ':', entry.n);
+        if (!colon) {
+            say(problem, device, "\"%.*s\" is not button:input", (int)entry.n, entry.p);
+            continue;
         }
+        Span name = {entry.p, (size_t)(colon - entry.p)}, values = {colon + 1, entry.n - (size_t)(colon - entry.p) - 1};
+        int swap = -1;
+        for (int i = 0; pad && i < 2; i++)
+            if (span_is(name, swap_names[i].name)) swap = i;
+        if (pad && span_is(name, "sticks")) {
+            if (span_is(values, "swap")) l->swap_sticks = 1;
+            else if (span_is(values, "normal")) l->swap_sticks = 0;
+            else say(problem, device, "sticks:%.*s is not sticks:swap", (int)values.n, values.p);
+            continue;
+        }
+        if (swap >= 0) {
+            if (span_is(values, "swap")) l->swap_shoulders |= swap_names[swap].bit;
+            else if (span_is(values, "normal")) l->swap_shoulders &= (uint8_t)~swap_names[swap].bit;
+            else say(problem, device, "%s:%.*s is not %s:swap", swap_names[swap].name, (int)values.n, values.p, swap_names[swap].name);
+            continue;
+        }
+        if (pad && span_is(name, "invert")) {
+            l->invert = 0;
+            for (Span r = values; next_piece(&r, ",", &v);) {
+                if (!v.n || span_is(v, "none")) continue;
+                int found = 0;
+                for (int i = 0; i < 4 && !found; i++)
+                    if (span_is(v, invert_names[i].name)) l->invert |= invert_names[i].bit, found = 1;
+                if (!found) say(problem, device, "invert:%.*s is not lx, ly, rx or ry", (int)v.n, v.p);
+            }
+            continue;
+        }
+        int t = target_named(name);
+        if (!bindable(device, t)) {
+            say(problem, device, "%.*s is not a button %s", (int)name.n, name.p, pad ? "of a controller" : "of the keyboard");
+            continue;
+        }
+        if (named[t]) {
+            say(problem, device, "%.*s is named twice: the first one counts", (int)name.n, name.p);
+            continue;
+        }
+        uint8_t slots[CONTROL_SLOTS] = {0};
+        int n = 0, readable = 0;
+        for (Span r = values; next_piece(&r, ",", &v);) {
+            if (!v.n || span_is(v, "none") || span_is(v, "-")) continue;
+            readable = 1;
+            int code = input_named(device, v);
+            if (!code) {
+                say(problem, device, "%.*s: \"%.*s\" is not %s", (int)name.n, name.p, (int)v.n, v.p,
+                    pad ? "a controller's button" : "a key the game can use");
+                continue;
+            }
+            if (has(slots, code)) continue;
+            int other = -1;
+            for (int u = 0; u < CONTROL_TARGETS && other < 0; u++)
+                if (named[u] && has(l->input[u], code)) other = u;
+            if (other >= 0) {
+                say(problem, device, "%.*s: %.*s is %s's already", (int)name.n, name.p, (int)v.n, v.p, control_targets[other].label);
+                continue;
+            }
+            if (n == CONTROL_SLOTS) {
+                say(problem, device, "%.*s: two inputs at most, %.*s left out", (int)name.n, name.p, (int)v.n, v.p);
+                continue;
+            }
+            slots[n++] = (uint8_t)code;
+        }
+        /* `none` (or nothing) unbinds the button; a value the game can't read is skipped, so a
+           button with none it can read keeps its default (PLAYING.md, "Controls"). */
+        if (!n && readable) continue;
+        memcpy(l->input[t], slots, sizeof slots);
+        named[t] = 1;
+    }
+    /* a default the line gave another button leaves the button the line doesn't name */
+    for (int t = 0; t < CONTROL_TARGETS; t++) {
+        if (named[t]) continue;
+        for (int s = 0; s < CONTROL_SLOTS; s++)
+            for (int u = 0; u < CONTROL_TARGETS && l->input[t][s]; u++)
+                if (named[u] && has(l->input[u], l->input[t][s])) l->input[t][s] = 0;
+        tidy(l->input[t]);
     }
 }
 
+/* Appends word to out (size bytes), a space before it unless out is empty. */
+static void add(char *out, size_t size, const char *word)
+{
+    size_t n = strlen(out);
+    if (n + 1 < size) snprintf(out + n, size - n, "%s%s", n ? " " : "", word);
+}
+
+/* The line for a layout of device (controls.rs's format): the buttons that differ from the
+   defaults, then a controller's stick and shoulder options; "" for the defaults. */
+static void format_layout(int device, const ControlsLayout *l, char *out, size_t size)
+{
+    char entry[64];
+    *out = 0;
+    for (int t = 0; t < CONTROL_TARGETS; t++) {
+        if (!memcmp(l->input[t], control_defaults[device].input[t], CONTROL_SLOTS)) continue;
+        int n = snprintf(entry, sizeof entry, "%s:", control_targets[t].name), any = 0;
+        for (int s = 0; s < CONTROL_SLOTS; s++)
+            if (l->input[t][s])
+                n += snprintf(entry + n, sizeof entry - (size_t)n, "%s%s", any++ ? "," : "", input_word(device, l->input[t][s], 0, 0));
+        if (!any) snprintf(entry + n, sizeof entry - (size_t)n, "none");
+        add(out, size, entry);
+    }
+    if (!is_pad(device)) return;
+    if (l->swap_sticks) add(out, size, "sticks:swap");
+    if (l->invert) {
+        int n = snprintf(entry, sizeof entry, "invert:"), any = 0;
+        for (int i = 0; i < 4; i++)
+            if (l->invert & invert_names[i].bit)
+                n += snprintf(entry + n, sizeof entry - (size_t)n, "%s%s", any++ ? "," : "", invert_names[i].name);
+        add(out, size, entry);
+    }
+    for (int i = 0; i < 2; i++)
+        if (l->swap_shoulders & swap_names[i].bit) {
+            snprintf(entry, sizeof entry, "%s:swap", swap_names[i].name);
+            add(out, size, entry);
+        }
+}
+
+/* The first essential target the layout has nothing on; -1 none. */
+static int missing(const ControlsLayout *l)
+{
+    for (int t = 0; t < CONTROL_TARGETS; t++)
+        if (control_targets[t].essential && !l->input[t][0]) return t;
+    return -1;
+}
+
+/* Every device's layout (controls.rs's Controls::from_values): a hand-made line that leaves an
+   essential button with nothing on its device puts that device alone back to its defaults. */
+static void from_values(const char *const values[DHD_CONTROLS_DEVICES], ControlsLayout out[CONTROL_DEVICES],
+                        DhdSettingsUnknown problem)
+{
+    for (int d = 0; d < CONTROL_DEVICES; d++) parse(d, values && values[d] ? values[d] : "", &out[d], problem);
+    for (int d = 0; d < CONTROL_DEVICES; d++) {
+        int t = missing(&out[d]);
+        if (t < 0) continue;
+        say(problem, d, "%s has no %s: %s is back to its defaults", control_targets[t].label, is_pad(d) ? "button" : "key",
+            control_devices[d].label);
+        out[d] = control_defaults[d];
+    }
+}
+
+void dhd_controls_layouts(const char *const values[DHD_CONTROLS_DEVICES], DhdControlsLayout out[DHD_CONTROLS_DEVICES],
+                          DhdSettingsUnknown problem)
+{
+    _Static_assert(sizeof(DhdControlsLayout) == sizeof(ControlsLayout), "a layout is 52 bytes");
+    ControlsLayout layouts[CONTROL_DEVICES];
+    from_values(values, layouts, problem);
+    if (out) memcpy(out, layouts, sizeof layouts);
+}
+
+/* controls.rs's Controls::edit through c.rs's dhd_controls_edit: the same answers and words. */
 int dhd_controls_edit(const char *const values[DHD_CONTROLS_DEVICES], int device, int edit, int target, int slot, int input,
                       int kind, char *value, size_t value_size, char *message, size_t message_size)
 {
-    (void)values; (void)device; (void)edit; (void)target; (void)slot; (void)input; (void)kind;
-    if (value && value_size) *value = 0;
-    if (message && message_size) snprintf(message, message_size, "Not on the Switch yet");
-    return CONTROL_REFUSED;
+    ControlsLayout now[CONTROL_DEVICES], next;
+    char said[160] = "";
+    if (device < 0 || device >= CONTROL_DEVICES || target < 0 || slot < 0 || edit < CONTROL_ASSIGN || edit > CONTROL_SWAP_SHOULDERS)
+        return CONTROL_UNCHANGED;
+    if (input < 0 || input > 255) input = 0;
+    from_values(values, now, NULL);
+    next = now[device];
+    ControlsLayout *l = &next;
+    int pad = is_pad(device), done = CONTROL_CHANGED;
+    switch (edit) {
+    case CONTROL_ASSIGN: {
+        if (!bindable(device, target) || slot >= CONTROL_SLOTS) {
+            char dev[32];
+            snprintf(dev, sizeof dev, "%s", control_devices[device].label);
+            for (char *c = dev; *c; c++) *c = (char)tolower((unsigned char)*c);
+            snprintf(said, sizeof said, "%s can't be set on the %s", target < CONTROL_TARGETS ? control_targets[target].label : "?", dev);
+            done = CONTROL_REFUSED;
+            break;
+        }
+        const char *word = input_word(device, input, 1, kind);
+        if (!strcmp(word, "?") || !input) {
+            snprintf(said, sizeof said, "%s", pad ? "That button can't be used" : "That key can't be used");
+            done = CONTROL_REFUSED;
+            break;
+        }
+        if (!l->input[target][0]) slot = 0;  /* an alternate without a main is the main */
+        int ht = -1, hs = -1;
+        for (int t = 0; t < CONTROL_TARGETS && ht < 0; t++)
+            for (int s = 0; s < CONTROL_SLOTS && ht < 0; s++)
+                if (l->input[t][s] == input) ht = t, hs = s;
+        if (ht == target && hs == slot) done = CONTROL_UNCHANGED;
+        else if (ht == target) {  /* the button's other slot: the two change places */
+            uint8_t first = l->input[ht][0];
+            l->input[ht][0] = l->input[ht][1], l->input[ht][1] = first;
+            tidy(l->input[ht]);
+        } else if (ht >= 0) {
+            uint8_t old = l->input[target][slot];
+            l->input[target][slot] = (uint8_t)input;
+            l->input[ht][hs] = old;
+            tidy(l->input[ht]);
+            if (old) snprintf(said, sizeof said, "Swapped %s and %s", control_targets[target].label, control_targets[ht].label);
+            else snprintf(said, sizeof said, "%s moved from %s to %s", word, control_targets[ht].label, control_targets[target].label);
+        } else l->input[target][slot] = (uint8_t)input;
+        break;
+    }
+    case CONTROL_CLEAR:
+        if (!bindable(device, target) || slot >= CONTROL_SLOTS || !l->input[target][slot]) done = CONTROL_UNCHANGED;
+        else {
+            l->input[target][slot] = 0;
+            tidy(l->input[target]);
+        }
+        break;
+    case CONTROL_RESET: *l = control_defaults[device]; break;
+    case CONTROL_SWAP_STICKS:
+        if (pad) l->swap_sticks = input != 0;
+        else done = CONTROL_UNCHANGED;
+        break;
+    default: {  /* CONTROL_INVERT, CONTROL_SWAP_SHOULDERS: target is the bit */
+        int bit = target > 255 ? 0 : target, known = 0;
+        if (edit == CONTROL_INVERT)
+            for (int i = 0; i < 4; i++) known |= invert_names[i].bit == bit;
+        else
+            for (int i = 0; i < 2; i++) known |= swap_names[i].bit == bit;
+        uint8_t *bits = edit == CONTROL_INVERT ? &l->invert : &l->swap_shoulders;
+        if (pad && known) *bits = input ? (uint8_t)(*bits | bit) : (uint8_t)(*bits & ~bit);
+        else done = CONTROL_UNCHANGED;
+        break;
+    }
+    }
+    if (done == CONTROL_CHANGED && !memcmp(&next, &now[device], sizeof next)) done = CONTROL_UNCHANGED;
+    if (done == CONTROL_CHANGED) {
+        int t = missing(&next);
+        if (t >= 0) {
+            snprintf(said, sizeof said, "%s needs %s", control_targets[t].label, pad ? "a button" : "a key");
+            done = CONTROL_REFUSED;
+        } else now[device] = next;
+    }
+    if (done == CONTROL_UNCHANGED) *said = 0;
+    if (value && value_size) format_layout(device, &now[device], value, value_size);
+    if (message && message_size) snprintf(message, message_size, "%s", said);
+    return done;
 }
 
 int dhd_settings_read(const char *path, const char *key, char *out, size_t size)

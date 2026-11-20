@@ -1349,12 +1349,25 @@ int host_service_controls_layout(int device, uint32_t out)
     return 1;
 }
 
+/* The words for player 1's to 4's buttons on the pages: its controller's PAD_KIND_*. On the Switch
+   always its own pads' words (pad_input_word): gamepad_nx.c's kind stays NONE for the button icons
+   (the PS2's symbols). */
+static int controls_kind(int player)
+{
+#ifdef __SWITCH__
+    (void)player;
+    return PAD_KIND_SWITCH;
+#else
+    return gamepad_kind(player - 1);
+#endif
+}
+
 /* Player 1's to 4's controller: its PAD_KIND_* plus 1, 0 none connected. */
 static int controls_pad_connected(int player)
 {
     GamepadRaw raw;
     if (player < 1 || player > 4 || !gamepad_start() || !gamepad_raw(player - 1, &raw)) return 0;
-    return gamepad_kind(player - 1) + 1;
+    return controls_kind(player) + 1;
 }
 
 /* The same for the pages' button names (SETTINGS' "Tabs" line, CONTROLS): on a touch screen a
@@ -1379,7 +1392,7 @@ int host_service_controls_change(int device, int edit, int target, int slot, int
     controls_follow();
     const char *values[CONTROL_DEVICES];
     for (int d = 0; d < CONTROL_DEVICES; d++) values[d] = controls_seen[d];
-    int kind = device == CONTROL_KEYBOARD ? PAD_KIND_NONE : gamepad_start() ? gamepad_kind(device - CONTROL_PAD1) : PAD_KIND_NONE;
+    int kind = device == CONTROL_KEYBOARD ? PAD_KIND_NONE : gamepad_start() ? controls_kind(device - CONTROL_PAD1 + 1) : PAD_KIND_NONE;
     int done = dhd_controls_edit(values, device, edit, target, slot, input, kind, value, sizeof value, said,
                                  size > 0 ? (size_t)size : 0);
     if (done == CONTROL_CHANGED) {
