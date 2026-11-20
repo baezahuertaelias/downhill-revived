@@ -155,7 +155,16 @@ int gamepad_place(const struct ControlsLayout *layout, int id);  /* id's place w
 int gamepad_input_id(const char *name);  /* a controls_table.h input's id by its dhd.ini name (0: none) */
 void gamepad_vibrate(int player, int light, int heavy);
 /* What a controller's buttons are labelled: for the button icons (port/gs/button_icons.c). */
-enum { PAD_KIND_NONE = 0, PAD_KIND_PLAYSTATION = 1, PAD_KIND_XBOX = 2, PAD_KIND_NINTENDO = 3 };
+enum { PAD_KIND_NONE = 0, PAD_KIND_PLAYSTATION = 1, PAD_KIND_XBOX = 2, PAD_KIND_NINTENDO = 3, PAD_KIND_SWITCH = 4 };
+/* The pages' word for controller input id (its controls_table.h labels) on a pad of that kind. The
+   Switch's own pads (PAD_KIND_SWITCH, for the pages only) have Nintendo's words, but gamepad_nx.c gives
+   their face buttons the codes A south, B east, Y west, X north, which no column's words fit. */
+static inline const char *pad_input_word(int id, const char *const label[3], int kind)
+{
+    static const char *const switch_face[] = {"A", "B", "Y", "X"};
+    if (kind == PAD_KIND_SWITCH && id >= 1 && id <= 4) return switch_face[id - 1];
+    return label[kind == PAD_KIND_PLAYSTATION ? 1 : kind == PAD_KIND_NINTENDO || kind == PAD_KIND_SWITCH ? 2 : 0];
+}
 int gamepad_kind_of(int type, int south_label);  /* PAD_KIND_* of an SDL_GamepadType and its bottom button's label */
 int gamepad_kind(int player);  /* that player's controller's PAD_KIND_* (NONE without one) */
 enum { PADDEV_ADDED = 1, PADDEV_REMOVED, PADDEV_REMAPPED };

@@ -309,13 +309,17 @@ static int input_named(int device, Span name)
 }
 
 /* A code's dhd.ini name (label 0) or the pages' word for it (label 1; a controller's by its kind,
-   PAD_KIND_*: 1 PlayStation, 3 Nintendo, else Xbox's words); "?" for none. */
+   PAD_KIND_*: 1 PlayStation, 3 Nintendo, 4 the Switch's own pads, else Xbox's words); "?" for none. */
 static const char *input_word(int device, int code, int label, int kind)
 {
     if (is_pad(device)) {
+        /* the Switch's: gamepad_nx.c's face codes are A south, B east, Y west, X north (hle.h's
+           pad_input_word) */
+        static const char *const switch_face[] = {"A", "B", "Y", "X"};
+        if (label && kind == 4 && code >= 1 && code <= 4) return switch_face[code - 1];
         for (int i = 0; i < CONTROL_PAD_INPUTS; i++)
             if (control_pad_inputs[i].id == code)
-                return !label ? control_pad_inputs[i].name : control_pad_inputs[i].label[kind == 1 ? 1 : kind == 3 ? 2 : 0];
+                return !label ? control_pad_inputs[i].name : control_pad_inputs[i].label[kind == 1 ? 1 : kind == 3 || kind == 4 ? 2 : 0];
     } else {
         for (int i = 0; i < CONTROL_KEYS; i++)
             if (control_keys[i].vk == code) return label ? control_keys[i].label : control_keys[i].name;

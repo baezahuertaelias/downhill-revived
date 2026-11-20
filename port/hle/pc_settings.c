@@ -558,7 +558,7 @@ static void page_draw(MenuPage *p)
             for (int k = 0; k < CONTROL_KEYS; k++) if (control_keys[k].vk == code) words[i] = control_keys[k].label;
         } else {
             for (int k = 0; k < CONTROL_PAD_INPUTS; k++) if (control_pad_inputs[k].id == code)
-                words[i] = control_pad_inputs[k].label[pad - 1 == PAD_KIND_PLAYSTATION ? 1 : pad - 1 == PAD_KIND_NINTENDO ? 2 : 0];
+                words[i] = pad_input_word(code, control_pad_inputs[k].label, pad - 1);
         }
     }
     /* A phone with touch controls and no pad has no A / D (nor L1 / R1) to press: what it can do
