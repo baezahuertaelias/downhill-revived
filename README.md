@@ -1,123 +1,73 @@
 # Downhill Revived for Nintendo Switch
 
-A homebrew port of Downhill Domination to the Nintendo Switch, built on
-[Downhill Revived](https://github.com/skuza-oss/downhill-revived).
+*Downhill Domination* (PlayStation 2, 2003) as homebrew for the Nintendo Switch: a fork of
+[Downhill Revived](https://github.com/skuza-oss/downhill-revived), the native PC port.
 
-This fork carries the Switch port of Downhill Revived 0.8.10. The upstream project has no Switch
-support; everything Switch-specific lives here (`port/nx/`, the Switch build in
-`port/tools/build_host64.py`, the console test `port/tools/nx_fulltest.py`). The plan of record is
-[finding 270](docs/findings/270-switch-performance-plan.md); the port itself is finding 272.
+**[Download](https://github.com/marmota94/downhill-revived/releases/latest)** (the
+`downhill-revived.nro` file)
 
-## Switch status (experimental)
+## How to play on the Switch
 
-Works on the console: the title, the menus and a whole race, the game's memory card saves, button
-rebinding (REVIVED SETTINGS > Controls), and EXIT GAME back to the Homebrew Menu (each step logged
-to `exit_steps.txt`). Docked at 1785/768/1600 MHz a race runs at about 46-54 fields a second and
-the menus at about 45; the target is 60. Until then `fps = 30` in `dhd.ini` gives a steady,
-even 30 (two vblanks a picture).
+You need:
 
-"Ready to play" means a steady 60 fields a second (or a smooth 30 option), no error on exit, and
-button rebinding. The 30 option, the exit and rebinding are done; 60 is still open:
+- a modded Switch with Atmosphère and a Homebrew Menu (hbmenu or sphaira);
+- your own dump of the USA disc, **SCUS-97177** (other regions and modified images don't work).
 
-| Work | State |
-|---|---|
-| Native VU's mesh draws in deko3d (`native_vu = on`) | drawn right on the console, +1 %; off by default |
-| Clean measurements, profile-guided build, threads and cores | in progress |
-| The renderer's gains on top of the mesh path | not started |
+Steps:
 
-Not on the Switch, and not planned for now: online play and texture packs.
+1. Download `downhill-revived.nro` from the
+   [latest release](https://github.com/marmota94/downhill-revived/releases/latest).
+2. Copy it and your disc image to the SD card, into this folder, with these exact names:
 
-## Playing on the Switch
+       /switch/downhill-revived/downhill-revived.nro
+       /switch/downhill-revived/SCUS-97177.iso
 
-You need a modded console with Atmosphère and a Homebrew Menu (hbmenu or sphaira), and your own
-dump of the USA disc (SCUS-97177).
+   Use the card in a PC, or sphaira's FTP server (port 5000):
+   `curl -T SCUS-97177.iso ftp://CONSOLE_IP:5000/switch/downhill-revived/`
+3. Hold **R** while starting any game to open the Homebrew Menu, then pick Downhill Revived. Don't
+   start it from the album: it has too little memory there, and the game says so.
 
-1. Download `downhill-revived.nro` from this fork's
-   [Releases](https://github.com/marmota94/downhill-revived/releases/latest) page, or build it
-   yourself ([docs/BUILDING.md](docs/BUILDING.md#nintendo-switch)).
-2. Copy two files to the SD card, into one folder:
+The first start makes `dhd.ini` in that folder; `dhd.log` and the saves go there too.
 
-       /switch/downhill-revived/downhill-revived.nro   the game
-       /switch/downhill-revived/SCUS-97177.iso         your own dump of the USA disc, named exactly so
+**Smoother play:** races run at about 46-54 fps, not yet a steady 60. For a steady, even 30, add
+`fps = 30` to `dhd.ini`.
 
-   Copy them with the card in a PC, or over the network with sphaira's FTP server (port 5000),
-   e.g. `curl -T SCUS-97177.iso ftp://CONSOLE_IP:5000/switch/downhill-revived/`.
-3. Start the Homebrew Menu by holding R while starting a game (from the album it has too little
-   memory, and the game says so) and pick Downhill Revived.
+**After a crash**, look in `/atmosphere/crash_reports/`, `/atmosphere/fatal_reports/` and
+`/switch/downhill-revived/dhd.log`, and attach them to an issue.
 
-The first start makes `dhd.ini` in that folder (scale 1, shadows, lens flare and particles off);
-`dhd.log` and the saves go there too. For a steady 30 instead of an uneven 46-54, set `fps = 30`
-in `dhd.ini`.
+## What works
 
-After a crash, look in `/atmosphere/crash_reports/`, `/atmosphere/fatal_reports/` and
-`/switch/downhill-revived/dhd.log`.
+- The title, the menus, whole races and the game's memory card saves.
+- Button rebinding: in the game, OPTIONS > REVIVED SETTINGS > Controls.
+- EXIT GAME returns to the Homebrew Menu.
 
-## The upstream project
+Not on the Switch: online play and texture packs.
 
-Downhill Revived is a native 64-bit Windows port of *Downhill Domination* (PlayStation 2, Incognito
-Entertainment / SCEA, 2003), with experimental builds for Macs with Apple silicon and for 64-bit
-Linux. It is built on a matching decompilation: C/C++ source that compiles back to the original
-game program byte for byte, built for the PC with the PS2 hardware replaced by native code.
+Speed, measured docked (CPU/GPU/memory at 1785/768/1600 MHz): races about 46-54 fps, menus about
+45. Work toward a steady 60 (the mesh renderer path, a profile-guided build, threads, the sound
+underruns) is tracked in [finding 270](docs/findings/270-switch-performance-plan.md) and in
+[docs/BUILDING.md](docs/BUILDING.md#switch-releases-the-fork-only).
 
-**[Download](https://github.com/skuza-oss/downhill-revived/releases/latest)** ·
-**[Discord](https://discord.gg/XrSeTyzfr2)** (news, help and races) ·
-**[Players' guide](docs/PLAYING.md)** (controls, online, texture packs, settings) ·
-**[Support on Ko-fi](https://ko-fi.com/skuza)**
+## Building it yourself
 
-## Features
+Building needs the original game executable from your own disc; nothing here builds without it.
+The Switch build (devkitPro with libnx and deko3d):
+[docs/BUILDING.md](docs/BUILDING.md#nintendo-switch). Everything Switch-specific is in `port/nx/`,
+the `switch-arm64` target of `port/tools/build_host64.py` and the console test
+`port/tools/nx_fulltest.py`; the port itself is finding 272. How to help:
+[docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
-- A launcher with the settings, updates, release notes and the public online races.
-- A native renderer (Direct3D 12, Vulkan or Metal), 60 fps or more (up to 240) with even frame
-  pacing, 1x to 8x resolution, Hor+ widescreen at any shape, windowed, borderless or fullscreen.
-- Online races for 2 to 10 players (experimental), public or private with a code; after your
-  finish you watch the others ride to the line.
-- REVIVED SETTINGS in the game's own OPTIONS menu, a sharp font, Unlock All, the movies, memory
-  card saves, PCSX2 texture packs, mouse in the menus, Discord Rich Presence.
-- Controllers (Xbox, DualSense, DualShock 4, Switch Pro, 8BitDo and most others) and full
-  keyboard play, with your own keys and buttons (in the game or the launcher).
-- Automatic updates that never touch your settings or saves.
+## About the upstream project
 
-The full list and the known gaps: [docs/PLAYING.md](docs/PLAYING.md).
+Downhill Revived is a native port of the game to Windows, macOS, Linux, Android and iOS, built on a
+matching decompilation: C/C++ source that compiles back to the original game program byte for
+byte, with the PS2 hardware replaced by native code. This fork is Downhill Revived 0.8.10 plus the
+Switch port; upstream has no Switch support. For the PC and phone versions, use upstream:
+[downloads](https://github.com/skuza-oss/downhill-revived/releases/latest),
+[players' guide](docs/PLAYING.md), [Discord](https://discord.gg/XrSeTyzfr2),
+[Ko-fi](https://ko-fi.com/skuza).
 
-## Getting started
-
-1. Download the installer `DownhillRevived-<version>-win-setup.exe` from the
-   [Releases](https://github.com/skuza-oss/downhill-revived/releases/latest) page and run it (no
-   administrator rights needed). It isn't code-signed, so SmartScreen may ask: **More info** >
-   **Run anyway**. Or take `DownhillRevived-<version>-win.zip` and unzip it into a folder you can
-   write to (not Program Files) for a portable copy.
-2. Start Downhill Revived and press PLAY.
-3. The first time, choose your `.iso` of the **USA disc (SCUS-97177)**. It is checked and
-   remembered.
-
-Mac and Linux (experimental): the `-mac-experimental.dmg` (drag the app to Applications) or the
-`-linux-experimental.AppImage` (one file, with the launcher's libraries inside; Steam Deck too),
-or their zips. None of the downloads is signed by a developer certificate:
-[docs/PLAYING.md](docs/PLAYING.md#installing) says how to allow them and where your files go. You
-need Windows 10/11 64-bit (or an Apple silicon Mac, or Linux with glibc 2.35+ and Vulkan) and a
-Direct3D 12 or Vulkan graphics card: minimum and recommended specs for every platform are in
-[docs/PLAYING.md](docs/PLAYING.md#system-requirements).
-
-Android (experimental): the `-android-experimental.apk` for arm64 phones and tablets on Android 10
-or later (minimum: a Helio G80 / Snapdragon 680 class phone with 4 GB RAM), with touch controls;
-every online race, as on the PC. The release page says how to install it.
-
-Nintendo Switch: [above](#playing-on-the-switch).
-
-## Legal notice
-
-- This is a fan project. It is not made, endorsed or supported by Sony Interactive
-  Entertainment, Incognito Entertainment or anyone who holds rights to the game.
-- This repository and its releases contain **no game data**: no disc image, no game executable
-  or data from it, no IOP modules, no textures, sound, music or movies, and no BIOS. `dhd.exe` is
-  the translated code only; at every start it reads the game's data from your disc image, after
-  checking it is the unchanged original.
-- To play you need your own dump of the USA disc. Other regions and modified images are not
-  supported (why: [docs/findings/100-other-releases.md](docs/findings/100-other-releases.md)).
-- The project sells nothing. Donations on Ko-fi are voluntary and unlock nothing: every release
-  is free and the same for everyone.
-
-## Decompilation progress
+### Decompilation progress
 
 <!-- progress:start -->
 | Region | What | Code matched | Functions |
@@ -136,16 +86,24 @@ Nintendo Switch: [above](#playing-on-the-switch).
 A function counts only when a tool confirms its compiled bytes are identical to retail; what
 "matching" means and how it is checked: [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
-## Building and contributing
+## Legal notice
 
-Building needs the original game executable from your own disc; nothing here builds without it.
-How to build: [docs/BUILDING.md](docs/BUILDING.md). How to help (decompiling, port fixes,
-testing): [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
+- This is a fan project. It is not made, endorsed or supported by Sony Interactive
+  Entertainment, Incognito Entertainment, Nintendo or anyone who holds rights to the game.
+- This repository and its releases contain **no game data**: no disc image, no game executable
+  or data from it, no IOP modules, no textures, sound, music or movies, and no BIOS. The NRO is
+  the translated code only; at every start it reads the game's data from your disc image, after
+  checking it is the unchanged original.
+- To play you need your own dump of the USA disc. Other regions and modified images are not
+  supported (why: [docs/findings/100-other-releases.md](docs/findings/100-other-releases.md)).
+- The project sells nothing; every release is free.
 
 ## Credits and licence
 
 Built on the work of PCSX2, ps2sdk, SDL, wgpu, WABT, libmpeg2, OpenGOAL, splat, objdiff,
-decomp.me and many others: the full list is in [docs/CREDITS.md](docs/CREDITS.md).
+decomp.me, devkitPro (libnx, deko3d) and many others: the full list is in
+[docs/CREDITS.md](docs/CREDITS.md). The Switch port started from a contributor's
+`switch-homebrew` branch (finding 272).
 
 [GPL-3.0-or-later](LICENSE). The original game, its data, names and trademarks belong to their
 owners and are not covered by this licence. Code adapted from other projects keeps its own
