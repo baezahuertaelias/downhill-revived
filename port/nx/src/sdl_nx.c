@@ -16,6 +16,17 @@ struct SDL_Semaphore { Mutex m; CondVar c; Uint32 value; };
 
 static Handle thread_self(void) { return threadGetCurHandle(); }
 
+/* EXIT GAME's way back to the Homebrew Menu (nx_threads_end): a thread made here ends at its next
+   delay or untimed wait, where it holds no lock but the one it waits with (finding 270). */
+static volatile int threads_ending;
+static __thread int shim_thread;
+static void end_here(Mutex *held)
+{
+    if (!threads_ending || !shim_thread) return;
+    if (held) mutexUnlock(held);
+    threadExit();
+}
+
 SDL_Mutex *SDL_CreateMutex(void)
 {
     SDL_Mutex *m = calloc(1, sizeof *m);
@@ -52,7 +63,12 @@ static Result wait_on(SDL_Condition *c, SDL_Mutex *m, Sint64 ms)
     Handle self = m->owner;
     m->depth = 0;
     __atomic_store_n(&m->owner, INVALID_HANDLE, __ATOMIC_RELAXED);
-    Result r = ms < 0 ? condvarWait(&c->c, &m->m) : condvarWaitTimeout(&c->c, &m->m, (u64)ms * 1000000);
+    /* untimed: in slices, for end_here; a condition may wake early, and its callers check again */
+    Result r = condvarWaitTimeout(&c->c, &m->m, ms < 0 ? 50000000ull : (u64)ms * 1000000);
+    if (ms < 0) {
+        end_here(&m->m);
+        r = 0;
+    }
     __atomic_store_n(&m->owner, self, __ATOMIC_RELAXED);
     m->depth = depth;
     return r;
@@ -83,7 +99,11 @@ bool SDL_WaitSemaphoreTimeout(SDL_Semaphore *s, Sint32 ms)
     bool got = true;
     mutexLock(&s->m);
     while (!s->value) {
-        if (ms < 0) { condvarWait(&s->c, &s->m); continue; }
+        if (ms < 0) {
+            condvarWaitTimeout(&s->c, &s->m, 50000000);  /* in slices, for end_here */
+            end_here(&s->m);
+            continue;
+        }
         u64 now = armGetSystemTick();
         if (now >= end) { got = false; break; }
         condvarWaitTimeout(&s->c, &s->m, armTicksToNs(end - now));
@@ -99,7 +119,23 @@ Uint32 SDL_GetSemaphoreValue(SDL_Semaphore *s) { return __atomic_load_n(&s->valu
 void nx_spinlock_sleep(void) { svcSleepThread(50000); }
 
 /* ---- threads: where each of the port's threads runs (three cores for an application) ---- */
-struct SDL_Thread { Thread t; SDL_ThreadFunction fn; void *arg; int status; };
+struct SDL_Thread { Thread t; SDL_ThreadFunction fn; void *arg; int status; const char *name; SDL_Thread *next; };
+/* Every thread made here and not yet waited for, detached ones too (nx_threads_end). */
+static Mutex threads_lock;
+static SDL_Thread *threads;
+/* A thread whose stack threadClose couldn't unmap (it ended without libnx's threadExit): the loader
+   can't take the process back then (nx_threads_end). */
+static int stack_kept;
+static void close_thread(SDL_Thread *t)
+{
+    Result r = threadClose(&t->t);
+    if (R_FAILED(r)) {
+        fprintf(stderr, "nx: thread %s: its stack stays mapped: 0x%x\n", t->name ? t->name : "?", r);
+        stack_kept = 1;
+        return;  /* its record stays: libnx's list may still point at it */
+    }
+    free(t);
+}
 
 typedef struct { const char *name; int priority, core; u32 mask; } Placement;
 enum { ANY_CORE = 7 };
@@ -208,6 +244,7 @@ bool SDL_SetTLS(SDL_TLSID *id, const void *value, SDL_TLSDestructorCallback dtor
 static void thread_entry(void *arg)
 {
     SDL_Thread *t = arg;
+    shim_thread = 1;
     t->status = t->fn(t->arg);
     for (int i = 0; i < TLS_SLOTS; i++)
         if (tls[i].dtor && tls[i].value) tls[i].dtor((void *)tls[i].value);
@@ -217,7 +254,7 @@ SDL_Thread *nx_thread_create(SDL_ThreadFunction fn, const char *name, void *arg,
 {
     SDL_Thread *t = calloc(1, sizeof *t);
     if (!t) return NULL;
-    t->fn = fn, t->arg = arg;
+    t->fn = fn, t->arg = arg, t->name = name;
     int priority = 0x3B, core = 2;
     u32 mask = ANY_CORE;
     for (size_t i = 0; i < sizeof placements / sizeof *placements; i++)
@@ -233,6 +270,9 @@ SDL_Thread *nx_thread_create(SDL_ThreadFunction fn, const char *name, void *arg,
         return NULL;
     }
     sampler_register(name, t->t.handle);
+    mutexLock(&threads_lock);
+    t->next = threads, threads = t;
+    mutexUnlock(&threads_lock);
     return t;
 }
 SDL_Thread *SDL_CreateThread(SDL_ThreadFunction fn, const char *name, void *arg)
@@ -243,11 +283,17 @@ void SDL_WaitThread(SDL_Thread *t, int *status)
 {
     if (!t) return;
     threadWaitForExit(&t->t);
+    mutexLock(&threads_lock);
+    for (SDL_Thread **at = &threads; *at; at = &(*at)->next)
+        if (*at == t) {
+            *at = t->next;
+            break;
+        }
+    mutexUnlock(&threads_lock);
     if (status) *status = t->status;
-    threadClose(&t->t);
-    free(t);
+    close_thread(t);
 }
-void SDL_DetachThread(SDL_Thread *t) { (void)t; }  /* its stack and record stay until the process ends */
+void SDL_DetachThread(SDL_Thread *t) { (void)t; }  /* its stack and record stay until nx_threads_end or the process's end */
 bool SDL_SetCurrentThreadPriority(SDL_ThreadPriority p) { (void)p; return true; }  /* placements decide */
 SDL_ThreadID SDL_GetCurrentThreadID(void) { return thread_self(); }
 
@@ -256,7 +302,16 @@ Uint64 SDL_GetPerformanceCounter(void) { return armGetSystemTick(); }
 Uint64 SDL_GetPerformanceFrequency(void) { return armGetSystemTickFreq(); }
 Uint64 SDL_GetTicksNS(void) { return armTicksToNs(armGetSystemTick()); }
 Uint64 SDL_GetTicks(void) { return SDL_GetTicksNS() / 1000000; }
-void SDL_Delay(Uint32 ms) { svcSleepThread((s64)ms * 1000000); }
+void SDL_Delay(Uint32 ms)
+{
+    for (Uint32 left = ms;;) {  /* in slices, for end_here */
+        end_here(NULL);
+        if (!left) return;
+        Uint32 slice = left < 50 ? left : 50;
+        svcSleepThread((s64)slice * 1000000);
+        left -= slice;
+    }
+}
 /* host_wait_wall sleeps to a millisecond before its time and spins the rest: most of that spin kept
    the game's core from gs and native for nothing. This sleep ends 0.2 ms before it instead. */
 void SDL_DelayNS(Uint64 ns) { svcSleepThread((s64)ns + 800000); }
@@ -423,6 +478,33 @@ void SDL_DestroyAudioStream(SDL_AudioStream *s)
     s->closing = 0, s->paused = 0, s->muted = 0, s->clear = 0;
 }
 SDL_AudioDeviceID SDL_GetAudioStreamDevice(SDL_AudioStream *s) { (void)s; return 1; }
+
+/* EXIT GAME's way back to the Homebrew Menu (nx_host.c), on the main thread once the game's thread
+   has ended: the sound stops, every other thread made here ends at end_here and is closed, which
+   gives its stack back. The loader reloads the menu in this same process, where a thread left
+   running would run unloaded code. 0 when one did not end within 2 s (its name is logged). */
+int nx_threads_end(void)
+{
+    SDL_DestroyAudioStream(&audio_stream);
+    threads_ending = 1;
+    u64 deadline = armGetSystemTick() + 2 * armGetSystemTickFreq();
+    int all = 1;
+    mutexLock(&threads_lock);
+    for (SDL_Thread **at = &threads; *at;) {
+        SDL_Thread *t = *at;
+        u64 now = armGetSystemTick();
+        if (R_FAILED(svcWaitSynchronizationSingle(t->t.handle, now < deadline ? armTicksToNs(deadline - now) : 0))) {
+            fprintf(stderr, "nx: thread %s did not end\n", t->name ? t->name : "?");
+            all = 0;
+            at = &t->next;
+            continue;
+        }
+        *at = t->next;
+        close_thread(t);
+    }
+    mutexUnlock(&threads_lock);
+    return all && !stack_kept;
+}
 bool SDL_GetAudioDeviceFormat(SDL_AudioDeviceID id, SDL_AudioSpec *spec, int *frames)
 {
     (void)id;

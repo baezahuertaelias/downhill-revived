@@ -1,6 +1,7 @@
 /* The Switch's host of host_api.h, host_posix.c's counterpart: what has no portable answer. Guest
    pages can't be protected on Horizon, so the deferred store-image reads stay off: the fault guard
    says no and graphics.c reads at once. */
+#include <SDL3/SDL.h>
 #include "host_api.h"
 #include "host_os.h"
 #include <errno.h>
@@ -78,19 +79,20 @@ void host_code_range(uintptr_t *lo, uintptr_t *hi)
 void host_memory_regions(void (*visit)(uintptr_t base, uintptr_t end, int host_memory)) { (void)visit; }
 
 static void (*heartbeat_beat)(void);
-static void heartbeat_run(void *unused)
+/* A thread of the SDL shim, so that EXIT GAME ends it at its delay (nx_threads_end, sdl_nx.c). */
+static int heartbeat_run(void *unused)
 {
     (void)unused;
     for (;;) {
-        svcSleepThread(30000000000ll);
+        SDL_Delay(30000);
         heartbeat_beat();
     }
+    return 0;
 }
 void host_heartbeat_start(void (*beat)(void))
 {
-    static Thread t;
     heartbeat_beat = beat;
-    if (R_SUCCEEDED(threadCreate(&t, heartbeat_run, NULL, NULL, 0x10000, 0x3B, 2))) threadStart(&t);
+    SDL_DetachThread(nx_thread_create(heartbeat_run, "heartbeat", NULL, 0x10000));
 }
 uintptr_t host_heartbeat_eip(void) { return 0; }
 

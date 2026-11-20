@@ -59,7 +59,7 @@ static int game_thread(void *start)
    exit (libnx's _appletExitProcess), which is also the answer the system waits for after an exit request. */
 extern u32 __nx_applet_exit_mode;  /* libnx's */
 void gamepad_nx_hold(int hold);    /* gamepad_nx.c */
-static int game_started, back_to_menu;
+static int game_started;
 static volatile int leaving, main_parked, close_wanted, menu_wanted, menu_exit;
 
 static void flush_all(void)
@@ -83,24 +83,69 @@ static void park(void)
 
 static void last_exit_step(void)
 {
+    if (menu_exit) {  /* the return from main after EXIT GAME, which the game's thread claimed (below) */
+        flush_all();
+        return;
+    }
     if (!claim_leaving()) park();  /* the main thread's force_leave has it */
     if (menu_wanted && game_started && threadGetCurHandle() != main_thread) {
         /* EXIT GAME: back to the Homebrew Menu (sphaira), not the end of the process. This is the last
            exit step, on the game's thread, after the workers and the render thread have stopped
            (host_end, finding 210). The process must leave from the main thread, as libnx's start code
            expects: this thread ends here, and sdl_host_main returns from main. Exit mode stays 0,
-           which is the loader's way back to the menu. */
+           which is the loader's way back to the menu. libnx's threadExit, not svcExitThread: only it
+           marks the thread ended, without which threadClose keeps its 64 MiB stack mapped and the
+           loader stops with InvalidCurrentMemory (finding 270). */
         flush_all();
         menu_exit = 1;
         SDL_SetAtomicInt(&game_running, 0);
-        svcExitThread();
+        threadExit();
     }
-    if (game_started && !back_to_menu) {
+    if (game_started) {
         if (threadGetCurHandle() != main_thread)  /* it stops using hid before libnx closes it */
             for (int i = 0; i < 100 && !main_parked; i++) svcSleepThread(1000000);
         __nx_applet_exit_mode = 1;
     }
     flush_all();
+}
+
+/* DHD_NX_MEMMAP=1 (a test tool, finding 270): every mapped region of the process as EXIT GAME hands it
+   back, into exit_memory.txt beside dhd.log, to find what the loader can't take back. */
+static void memory_map_dump(void)
+{
+    const char *on = getenv("DHD_NX_MEMMAP");
+    if (!on || strcmp(on, "1")) return;
+    FILE *f = fopen(NX_FOLDER "exit_memory.txt", "w");
+    if (!f) return;
+    fputs("address size type attribute permission ipc_refs device_refs\n", f);
+    for (u64 at = 0;;) {
+        MemoryInfo m;
+        u32 page;
+        if (R_FAILED(svcQueryMemory(&m, &page, at)) || !m.size) break;
+        if ((m.type & 0xFF) != MemType_Unmapped)
+            fprintf(f, "%#llx %#llx %#x %#x %#x %u %u\n", (unsigned long long)m.addr, (unsigned long long)m.size, m.type, m.attr,
+                    m.perm, m.ipc_refcount, m.device_refcount);
+        if (m.addr + m.size <= at) break;
+        at = m.addr + m.size;
+    }
+    fclose(f);
+    fprintf(stderr, "nx: memory map in exit_memory.txt\n");
+}
+
+/* EXIT GAME, on the main thread once the game's thread has ended: the loader reloads the menu in this
+   process, so it needs back every thread (one left would run unloaded code), the GPU's blocks and the
+   guest memory (heap left as code memory stopped it with InvalidCurrentMemory; finding 270). 0 when
+   something stayed: then only the system's exit is safe. The sockets go last, in sdl_host_main. */
+static int release_for_menu(void)
+{
+    int nx_threads_end(void);
+    void nx_render_release(void);
+    int nx_guest_memory_release(void);
+    void host64_fiber_guards_release(void);
+    if (!nx_threads_end()) return 0;
+    host64_fiber_guards_release();  /* the EE threads' stack guards, unreadable heap pages */
+    nx_render_release();
+    return nx_guest_memory_release();
 }
 
 /* Main thread, when the game hasn't reached its next field in time (a long load, a stuck wait). */
@@ -247,13 +292,13 @@ static void second_pass(void)
         const char *s = getenv("DHD_NX_EXIT");
         if (s && atof(s) > 0) end = now + atof(s);
     }
-    /* Seconds later: exit on this thread, keeping the old way back to the Homebrew Menu that the
-       test runs start from. A player's game never takes it: see "the end" above. */
-    if (end >= 0 && now > end) {
-        back_to_menu = 1;
-        gamepad_nx_hold(1);
+    /* Seconds later: EXIT GAME's way back to the Homebrew Menu, which the test runs start from. An
+       exit() here, on the main thread, left the render thread presenting while libnx closed the
+       screen under it: deko3d stopped the process at its next acquire (finding 270). */
+    if (end > 0 && now > end) {
+        end = 0;  /* once */
         nx_profile_dump();
-        exit(0);
+        nx_request_close();
     }
 }
 
@@ -286,7 +331,22 @@ int sdl_host_main(int (*game)(void *), void *arg)
     }
     int code = 0;
     SDL_WaitThread(thread, &code);
-    if (menu_exit) fprintf(stderr, "nx: back to the Homebrew Menu\n");
+    if (menu_exit) {
+        int ok = release_for_menu();
+        if (ok) fprintf(stderr, "nx: back to the Homebrew Menu\n");
+        else {
+            fprintf(stderr, "nx: not everything was given back; the system's exit, which closes the Homebrew Menu too\n");
+            __nx_applet_exit_mode = 1;
+        }
+        flush_all();
+        if (ok) {
+            /* The socket service holds 0x234000 bytes of the heap as transfer memory, unreadable until it
+               closes, and libnx's exit doesn't close it: the next NRO gets that heap. After it nxlink's
+               stream is gone, so the map's own line is lost then. */
+            socketExit();
+            memory_map_dump();
+        }
+    }
     return code;
 }
 

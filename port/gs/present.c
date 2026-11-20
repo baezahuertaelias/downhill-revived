@@ -1041,7 +1041,11 @@ static void bench_vsync(void)
     free(frames);
     state = 2;
     const char *quit = getenv("DHD_BENCH_EXIT");
+#ifdef __SWITCH__
+    if (quit && !strcmp(quit, "1")) gs_window_close();  /* EXIT GAME's way: host_exit is the system's exit, which closes the Homebrew Menu too (finding 270) */
+#else
     if (quit && !strcmp(quit, "1")) host_exit(0);
+#endif
 }
 
 const uint32_t *movie_picture(unsigned *width, unsigned *height, unsigned *rows);  /* port/hle/movie.c */

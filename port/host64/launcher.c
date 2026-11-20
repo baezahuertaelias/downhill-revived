@@ -108,8 +108,11 @@ int main(int argc,char **argv) {
 #else
     touch_host_args(argc,argv);
     int code=sdl_host_main(game,&args);
-#ifdef __ANDROID__
+#if defined(__ANDROID__)
     return code;  /* android_main.c logs it and ends the same way */
+#elif defined(__SWITCH__)
+    return code;  /* EXIT GAME ran the handlers on the game's thread; the process leaves from main
+                     (nx_host.c), and host_end here would wait for that thread forever (finding 270) */
 #else
     host_end(code);  /* the game returned: the same end as EXIT GAME (finding 210) */
 #endif
