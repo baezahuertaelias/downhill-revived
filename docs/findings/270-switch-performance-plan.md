@@ -223,6 +223,15 @@ merge in a throwaway worktree. Nothing from it is used here.
   closing sphaira itself with + (GBAtemp, nton issue 12).
 - [ ] step 1: baseline on the console
 - [ ] steps 2 to 5
+- [ ] 2026-11-20, step 5 (`switch/pacing`, built, not yet run on the console): at `fps = 30` the
+  game paced its frames on a wall-clock grid of 1/30 s (`kernel.c` `pace`) while the swapchain
+  showed each picture at the next vblank (swap interval 1), so the two clocks met at a drifting
+  phase and a picture could stay one, two or three vblanks. `dhd_render_nx.c` now sets the
+  swapchain's interval at each present from `port_frame_period()` in whole vblanks (1 to 2): 2 at
+  `fps = 30` in a race, 1 from the load to GO (the grid's 1/60) and at 60, 0 with `vsync = 0`. The
+  game clock is unchanged (finding 139: no fixed step). To check on the console with `DHD_FPS=30`:
+  the `nx present: swap interval` lines in dhd.log, fields/s near 30 with p99 and max field times
+  near 33 ms, the countdown at real speed, and the race's feel against `fps = 60`.
 
 ## Decisions
 
