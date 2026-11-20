@@ -81,6 +81,8 @@ static void park(void)
     for (;;) svcSleepThread(INT64_MAX);
 }
 
+static void nx_profile_dump(void);
+
 static void last_exit_step(void)
 {
     if (menu_exit) {  /* the return from main after EXIT GAME, which the game's thread claimed (below) */
@@ -96,6 +98,7 @@ static void last_exit_step(void)
            which is the loader's way back to the menu. libnx's threadExit, not svcExitThread: only it
            marks the thread ended, without which threadClose keeps its 64 MiB stack mapped and the
            loader stops with InvalidCurrentMemory (finding 270). */
+        nx_profile_dump();  /* DHD_BENCH_EXIT's end comes here too */
         flush_all();
         menu_exit = 1;
         SDL_SetAtomicInt(&game_running, 0);
@@ -267,7 +270,8 @@ static void heartbeat_line(double now)
 extern void __gcov_dump(void) __attribute__((weak));
 static void nx_profile_dump(void)
 {
-    if (!__gcov_dump) return;
+    static int written;
+    if (!__gcov_dump || written++) return;
     fprintf(stderr, "nx: writing the profile\n");
     fflush(stderr);
     __gcov_dump();
