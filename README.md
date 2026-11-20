@@ -1,6 +1,52 @@
-# Downhill Revived
+# Downhill Revived for Nintendo Switch
 
-A PC port of Downhill Domination.
+A homebrew port of Downhill Domination to the Nintendo Switch, built on
+[Downhill Revived](https://github.com/skuza-oss/downhill-revived).
+
+This fork carries the Switch port of Downhill Revived 0.8.10. The upstream project has no Switch
+support; everything Switch-specific lives here (`port/nx/`, the Switch build in
+`port/tools/build_host64.py`, the console test `port/tools/nx_fulltest.py`). The plan of record is
+[finding 270](docs/findings/270-switch-performance-plan.md); the port itself is finding 272.
+
+## Switch status (experimental, no release yet)
+
+Works on the console: the title, the menus and a whole race, the game's memory card saves, and
+EXIT GAME back to the Homebrew Menu. Docked at 1785/768/1600 MHz a race runs at about 47-54
+fields a second and the menus at about 45; the target is 60.
+
+"Ready to play" means a steady 60 fields a second (or a smooth 30 option), no error on exit, and
+button rebinding. Being worked on, each on its own branch:
+
+| Branch | Work | State |
+|---|---|---|
+| `switch/exit-error` | the error some runs show after EXIT GAME; each exit step logged to `exit_steps.txt` | built, console run pending |
+| `switch/pacing` | an even 30 fields a second (`fps = 30`): two vblanks a picture | built, console run pending |
+| `switch/controls` | button rebinding on the CONTROLS page | built, console run pending |
+| `switch/baseline` | clean measurements, profile-guided build, threads and cores | in progress |
+| `switch/mesh-path` | Native VU's mesh draws in deko3d, the biggest speed step | started |
+
+Not on the Switch, and not planned for now: online play and texture packs.
+
+## Playing on the Switch
+
+You need a modded console with Atmosphère and a Homebrew Menu (hbmenu or sphaira). Build the NRO
+yourself ([docs/BUILDING.md](docs/BUILDING.md#nintendo-switch)), then copy two files to the SD
+card, into one folder:
+
+    /switch/downhill-revived/downhill-revived.nro   the game, build/switch/downhill-revived.nro
+    /switch/downhill-revived/SCUS-97177.iso         your own dump of the USA disc, named exactly so
+
+Copy them with the card in a PC, or over the network with sphaira's FTP server (port 5000), e.g.
+`curl -T SCUS-97177.iso ftp://CONSOLE_IP:5000/switch/downhill-revived/`. Then start the Homebrew
+Menu by holding R while starting a game (from the album it has too little memory, and the game
+says so) and pick Downhill Revived. The first start makes `dhd.ini` in that folder (scale 1,
+shadows, lens flare and particles off); `dhd.log` and the saves go there too. Rebinding buttons is
+not on the Switch yet.
+
+After a crash, look in `/atmosphere/crash_reports/`, `/atmosphere/fatal_reports/` and
+`/switch/downhill-revived/dhd.log`.
+
+## The upstream project
 
 Downhill Revived is a native 64-bit Windows port of *Downhill Domination* (PlayStation 2, Incognito
 Entertainment / SCEA, 2003), with experimental builds for Macs with Apple silicon and for 64-bit
@@ -50,20 +96,7 @@ Android (experimental): the `-android-experimental.apk` for arm64 phones and tab
 or later (minimum: a Helio G80 / Snapdragon 680 class phone with 4 GB RAM), with touch controls;
 every online race, as on the PC. The release page says how to install it.
 
-Nintendo Switch (homebrew, experimental, not in a release yet): a modded console with Atmosphère
-and a Homebrew Menu (hbmenu or sphaira). Build the NRO yourself
-([docs/BUILDING.md](docs/BUILDING.md#nintendo-switch)), then copy two files to the SD card, into
-one folder:
-
-    /switch/downhill-revived/downhill-revived.nro   the game, build/switch/downhill-revived.nro
-    /switch/downhill-revived/SCUS-97177.iso         your own dump of the USA disc, named exactly so
-
-Copy them with the card in a PC, or over the network with sphaira's FTP server (port 5000), e.g.
-`curl -T SCUS-97177.iso ftp://CONSOLE_IP:5000/switch/downhill-revived/`. Then start the Homebrew
-Menu by holding R while starting a game (from the album it has too little memory, and the game
-says so) and pick Downhill Revived. The first start makes `dhd.ini` in that folder (scale 1,
-shadows, lens flare and particles off); `dhd.log` and the saves go there too. Online play, texture
-packs and rebinding buttons are not on the Switch yet.
+Nintendo Switch: [above](#playing-on-the-switch).
 
 ## Legal notice
 
