@@ -55,8 +55,10 @@ static void gs_execute(unsigned path, const uint32_t *words, unsigned count, con
     gs.vu_qword = p->qword;
     gs.vu_overlay = p->overlay;
     gs.vu_program = p->program;
+    gs_vu_shadow = p->shadow;
     gs.trace_seconds = p->seconds;
-    gs_feed(&gs, path, words, count);
+    if (path == GS_PATH_MESH) gs_mesh(&gs, words, count);
+    else gs_feed(&gs, path, words, count);
 }
 static FILE *gs_profile_file;
 static int gs_profile_initialized;
@@ -136,8 +138,10 @@ void graphics_gs_wait(void)
         return;
     uint32_t target = gs_position(&gs_written);
     uint32_t observed;
-    while ((int32_t)((observed = gs_position(&gs_consumed)) - target) < 0)
+    while ((int32_t)((observed = gs_position(&gs_consumed)) - target) < 0) {
+        away_turn("a wait for the GS");
         idle_wait(&gs_consumed, observed, &gs_waiting, gs_retired, 1, NULL);
+    }
 }
 static void gs_queue_shutdown(void)
 {
@@ -236,6 +240,7 @@ int graphics_xgkick(uint32_t guest_memory, unsigned qword)
         gs.vu_qword = p->qword;
         gs.vu_overlay = p->overlay;
         gs.vu_program = p->program;
+        gs_vu_shadow = p->shadow;
         gs.trace_seconds = p->seconds;
         return gs_xgkick(&gs, memory, qword);
     }

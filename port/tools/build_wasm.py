@@ -13,7 +13,7 @@ Writes build/wasm/dhd_core.wasm from
 Data symbols are numbers, not linker symbols: wasm-ld has no --defsym, the wasm assembler rejects
 absolute symbols, and an alias needs an anchor as big as the guest space. So each C declaration of
 a data name (D_xxxxxxxx, _gp) becomes a macro for its PS2 address (data.absolute). Design and the
-checks behind it: build/audit/w5-wasm-module.md.
+checks behind it: finding 082 ("W5").
 
 The module's imports are the host_api.h functions only (--allow-undefined-file). Anything else that
 doesn't resolve fails the strict link; a diagnostic link with --allow-undefined then writes the
@@ -37,7 +37,7 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, PORT)  # patches.py
 
 WASM_TARGET = 'wasm32-wasip1'  # the WASI headers need __wasi__ (wasi/version.h); no WASI import is used by the module
-import data, eefloat, objcache, port_source, recomp, transform  # noqa: E402
+import data, eefloat, objcache, port_source, recomp, redzone, transform  # noqa: E402
 from port_source import apply_patches, align_aggregate_allocas  # noqa: E402
 import vu1_aot  # noqa: E402
 import wasm_retail_names  # noqa: E402
@@ -60,7 +60,7 @@ SIMDE = os.environ.get('SIMDE_DIR', str(DEVCACHES / 'simde-src'))
 WABT = os.environ.get('WABT_DIR', str(DEVCACHES / 'wabt/wabt-1.0.42'))
 WASM = os.path.join(OUT, 'dhd_core.wasm')
 
-# The module's own memory: above the scratchpad (0x70000000), see build/audit/w5-wasm-module.md 3.
+# The module's own memory: above the scratchpad (0x70000000), see finding 082 ("W5").
 STACK_BASE = 0x70100000
 STACK_SIZE = 1 << 20
 DATA_BASE = STACK_BASE + STACK_SIZE
@@ -72,11 +72,11 @@ MODULE_UNITS = [
     'runtime/ps2asm.c', 'runtime/vu0_micro.c', 'runtime/vu0_interp.c', 'runtime/recomp.c',
     'runtime/libc_shims.c', 'runtime/memory.c',
     'runtime/sha256.c', 'hle/kernel.c', 'hle/timer.c', 'hle/boot.c', 'hle/sif.c', 'hle/cdvd.c', 'hle/game_data.c',
-    'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/graphics.c', 'hle/pad.c', 'hle/menu_page.c',
-    'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/puppet.c', 'hle/online.c',
-    'hle/online_menu.c', 'hle/autopad.c', 'hle/state_trace.c', 'hle/rate_audit.c', 'hle/sound.c', 'hle/game_options.c',
+    'hle/iop.c', 'hle/mc.c', 'hle/dma.c', 'hle/graphics.c', 'hle/pad.c', 'hle/menu_page.c', 'hle/menu_pads.c',
+    'hle/pc_settings.c', 'hle/widescreen.c', 'hle/exit_menu.c', 'hle/disc_notice.c', 'hle/puppet.c', 'hle/online.c',
+    'hle/online_menu.c', 'hle/autopad.c', 'hle/state_trace.c', 'hle/rate_audit.c', 'hle/scenery_trace.c', 'hle/sound.c', 'hle/game_options.c',
     'hle/fps.c', 'hle/replay.c', 'hle/keyboard.c', 'hle/vif0.c', 'hle/presence.c', 'hle/touch_field.c',
-    'hle/touch_settings.c', 'runtime/wasi_adapter.c',
+    'hle/touch_settings.c', 'hle/controls_settings.c', 'hle/sound_slots.c', 'runtime/wasi_adapter.c',
 ]
 MIRROR_DIRS = ['runtime', 'hle', 'include', 'host', 'gs', 'net']
 
@@ -438,7 +438,8 @@ def image_stage(wanted):
     aliases = {}
     for m in re.finditer(r'/alternatename:(\w+)=(\w+)', symbols_s):
         aliases[m.group(1)] = m.group(2)
-    p = run(['clang', '--target=i686-pc-windows-itanium', '-c', paths[0], '-o', paths[0] + '.o'])
+    # DHD_IMAGE_CC: a clang with the x86 target, where the one on PATH has only wasm's (wasi-sdk's)
+    p = run([os.environ.get('DHD_IMAGE_CC', 'clang'), '--target=i686-pc-windows-itanium', '-c', paths[0], '-o', paths[0] + '.o'])
     if p.returncode:
         sys.exit(p.stderr)
     image_obj = paths[0] + '.o'
@@ -647,6 +648,8 @@ def compile_src(job):
     front = ['clang'] + [f for f in BASE if f != '-c'] + lang + inc + ['-S', '-emit-llvm', '-Xclang', '-disable-llvm-passes',
                                                                      '-include', HEADER_SHIM[0]] + extra
     rec = {'unit': 'src/' + rel, 'status': 'ok', 'stage': '', 'errors': []}
+    if REDZONE:  # a test build: the unit's address-taken locals get red zones (redzone.py)
+        src = redzone_source(front, src, cpp, rec)
     # the shared object cache: both steps and the IR rewrites between them (this file, eefloat.py)
     cache = objcache.source_key(front + [src, '-o', '-'], '-', [' '.join(BASE + extra)] + REWRITERS)
     if cache and objcache.fetch(cache, obj):
@@ -677,6 +680,52 @@ def compile_src(job):
 
 
 HEADER_SHIM = [None]
+# DHD_CORE_REDZONE=1: a test build only (finding 213; never in players' builds, its own core cache key)
+REDZONE = os.environ.get('DHD_CORE_REDZONE', '') not in ('', '0')
+REDZONE_REPORT = []
+
+
+def redzone_source(front, src, cpp, rec):
+    """src rewritten by redzone.py (its address-taken locals in one struct with red zones), or src
+    itself when the rewrite doesn't compile (reported; the unit is then built as in players' builds)."""
+    dump = run([a for a in front if a not in ('-S', '-emit-llvm', '-Xclang', '-disable-llvm-passes')]
+               + ['-fsyntax-only', '-Xclang', '-ast-dump=json', src])
+    if dump.returncode:
+        REDZONE_REPORT.append((rec['unit'], 'no AST', 0, 0, 0))
+        return src
+    text = open(src, encoding='utf-8', errors='surrogateescape').read()
+    out, rep = redzone.instrument_bytes(text, redzone.decode_all(dump.stdout), cpp)
+    if out == text:
+        REDZONE_REPORT.append((rec['unit'], 'none', 0, 0, len(rep['skipped'])))
+        return src
+    rz = src + '.rz' + ('.cpp' if cpp else '.c')
+    write(rz, out)
+    check = run([a for a in front if a not in ('-S', '-emit-llvm', '-Xclang', '-disable-llvm-passes')]
+                + ['-fsyntax-only', rz])
+    if check.returncode:
+        REDZONE_REPORT.append((rec['unit'], 'fallback: ' + check.stderr.strip().splitlines()[0][:200], 0, 0,
+                               len(rep['skipped'])))
+        return src
+    REDZONE_REPORT.append((rec['unit'], 'ok', rep['functions'], rep['locals'], len(rep['skipped'])))
+    return rz
+
+
+def redzone_object():
+    """The red zones' checks (redzone.RUNTIME), linked only into a DHD_CORE_REDZONE build."""
+    if not REDZONE:
+        return None
+    c = os.path.join(OUT, 'redzone_runtime.c')
+    write(c, redzone.RUNTIME)
+    obj = c + '.o'
+    p = run(['clang'] + BASE + [c, '-o', obj])
+    if p.returncode:
+        sys.exit(p.stderr)
+    ok = [r for r in REDZONE_REPORT if r[1] == 'ok']
+    falls = [r for r in REDZONE_REPORT if r[1].startswith('fallback') or r[1] == 'no AST']
+    write(os.path.join(OUT, 'redzone.tsv'), ''.join('\t'.join(map(str, r)) + '\n' for r in sorted(REDZONE_REPORT)))
+    print('red zones (a test build): %d units, %d functions, %d locals; %d units built without (redzone.tsv)'
+          % (len(ok), sum(r[2] for r in ok), sum(r[3] for r in ok), len(falls)), flush=True)
+    return obj
 REWRITERS = objcache.file_hashes(os.path.abspath(__file__), eefloat.__file__, port_source.__file__)
 INTRA_THUNKS = {}  # (name, C signature) -> D signature: C++ adapters the intra-object ABI stage needs
 
@@ -833,6 +882,39 @@ def builtins_lib():
     """compiler-rt's builtins from the wasi-sdk (the same code for every wasm32 OS)."""
     return os.path.normpath(os.path.join(WASI, '..', '..', 'lib', 'clang', '23', 'lib', 'wasm32-unknown-wasi',
                                          'libclang_rt.builtins.a'))
+
+
+def layout_pad_object():
+    """DHD_CORE_LAYOUT_PAD=<bytes>, a test build only (state_trace_layout_test.py, finding 205): an
+    object linked first that moves the core's own layout and nothing else. It adds <bytes> of
+    read-only data, data and bss in front of every other object's, and functions whose addresses
+    are taken (one per 16 bytes, at most 64), so the function table indices after them move too.
+    Nothing calls or reads them: the game is the same game, only the core's addresses change. A
+    normal build (the variable unset) has no such object."""
+    size = os.environ.get('DHD_CORE_LAYOUT_PAD', '')
+    if not size:
+        return None
+    size = int(size, 0)
+    if size <= 0 or size % 4:
+        sys.exit('DHD_CORE_LAYOUT_PAD: a positive multiple of 4 bytes, not %r' % size)
+    functions = min(64, max(1, size // 16))
+    lines = ['/* Generated by build_wasm.py for DHD_CORE_LAYOUT_PAD=%d (finding 205): a test build only. */' % size,
+             '__attribute__((used)) const volatile char dhd_layout_pad_rodata[%d] = {1};' % size,
+             '__attribute__((used)) volatile char dhd_layout_pad_data[%d] = {1};' % size,
+             '__attribute__((used)) volatile char dhd_layout_pad_bss[%d];' % size]
+    lines += ['__attribute__((used, noinline)) int dhd_layout_pad_fn%d(int x) { return x + %d; }' % (i, i)
+              for i in range(functions)]
+    lines.append('__attribute__((used)) int (*const volatile dhd_layout_pad_table[%d])(int) = {%s};'
+                 % (functions, ', '.join('dhd_layout_pad_fn%d' % i for i in range(functions))))
+    c = os.path.join(OUT, 'layout_pad.c')
+    write(c, '\n'.join(lines) + '\n')
+    obj = c + '.o'
+    p = run(['clang'] + BASE + [c, '-o', obj])
+    if p.returncode:
+        sys.exit(p.stderr)
+    print('layout pad: %d bytes of rodata, data and bss, %d functions in the table (a test build)'
+          % (size, functions), flush=True)
+    return obj
 
 
 def wasm_link(objs, out, allow_all, host_syms):
@@ -1274,7 +1356,7 @@ NOT_CORE = ('docs/', 'online/', '.github/', 'port/launcher/', 'port/render/', 'p
 CORE_NEW_FILES = ('src/', 'include/', 'port/runtime/', 'port/hle/', 'port/include/', 'port/host/', 'port/gs/',
                   'port/net/', 'port/tools/', 'port/patches')
 # the environment the build reads (the tools' folders are in the key by their resolved paths)
-CORE_ENV = ('DHD_VUTEXT', 'WASI_SYSROOT', 'SIMDE_DIR', 'WABT_DIR')
+CORE_ENV = ('DHD_VUTEXT', 'WASI_SYSROOT', 'SIMDE_DIR', 'WABT_DIR', 'DHD_CORE_LAYOUT_PAD', 'DHD_CORE_REDZONE')
 
 
 def core_inputs_key():
@@ -1575,6 +1657,12 @@ def build(a, t0, key):
 
     # 7. the link: strict first (imports: host_api.h only), then a diagnostic link that allows the rest
     all_objs = objs + rc_objs + abi_objs + [fx_obj]  # wasm_link adds the code and data tables (codeids.c)
+    pad = layout_pad_object()
+    if pad:
+        all_objs = [pad] + all_objs
+    rzo = redzone_object()
+    if rzo:
+        all_objs.append(rzo)
     strict = wasm_link(all_objs, WASM, False, host_syms)
     print('strict link: %s' % ('ok' if strict.returncode == 0 else 'FAILED'), flush=True)
     link_txt = strict.stdout + strict.stderr

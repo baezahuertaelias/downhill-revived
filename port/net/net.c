@@ -1,4 +1,4 @@
-/* net.h's API: one client (client.c) over one WebSocket (ws.h). The relay's address
+/* net.h's API: one client (client.c) over one WebSocket (ws.h). The server's address
    comes from net_init or the DHD_NET_SERVER environment variable (the official server unless
    dhd.ini or the environment names another, port/hle/host.c). */
 #include "net.h"
@@ -12,17 +12,13 @@
 #include "json.h"
 #include "ws.h"
 
-enum { REJOIN_ATTEMPTS = 5 };
+/* Rejoins after a drop go on as ws.h's backoff says, for up to 30 s (WS_ATTEMPTS_OVER): the room
+   keeps a seat 20 s after it last heard from a member (online/server REJOIN_GRACE_MS, finding 254). */
+enum { SFU_CODE_LENGTH = 6, P2P_CODE_LENGTH = 7 };
 
-/* Online play is not offered on phones yet (finding 143): their speed and the touch controls come
-   first. Android builds refuse every connection here, whatever asks (the menu, DHD_NET_*, a
-   dhd.ini server), and the core hides ONLINE (host_service_net_offered). */
-#ifdef __ANDROID__
-#define NET_OFFERED 0
-#else
-#define NET_OFFERED 1
-#endif
-#define NET_NOT_OFFERED "online play comes to phones later"
+/* The rooms offered (host_api.h NET_OFFER_*): every native build, Android and iOS included, offers
+   SFU and P2P rooms (finding 237); only the browser offers P2P rooms alone (port/web/www/net.js). */
+#define NET_OFFERED (NET_OFFER_SFU | NET_OFFER_P2P)
 
 static NetClient client;
 static WsConn *conn;
@@ -54,8 +50,12 @@ static const char *on_close(void *ctx, int code, const char *reason, int attempt
 {
     NetLobby lobby;
     (void)ctx;
-    if (!client_on_closed(&client, code, reason) || attempt >= REJOIN_ATTEMPTS)
+    if (!client_on_closed(&client, code, reason))
         return NULL;
+    if (attempt >= WS_ATTEMPTS_OVER) {
+        client_rejoin_failed(&client);
+        return NULL;
+    }
     client_lobby(&client, &lobby);
     snprintf(next_url, sizeof next_url, "%s/v1/rooms/%s", base, lobby.code);
     return next_url;
@@ -63,8 +63,14 @@ static const char *on_close(void *ctx, int code, const char *reason, int attempt
 
 static int on_tick(void *ctx)
 {
+    /* the send thread of conn itself: net_leave clears conn before it stops the connection, and
+       a connection's threads end before the next one starts */
+    WsConn *ws = conn;
     (void)ctx;
-    return client_tick(&client);
+    client_race_rtt(&client, ws ? ws_race_rtt_ms(ws) : -1);
+    int dead = client_tick(&client);
+    if (client.cut_ms) ws_test_cut(client.cut_ms), client.cut_ms = 0;  /* DHD_NET_TEST_CUT (tests) */
+    return dead;
 }
 
 void net_init(const char *base_url, const char *player_name, const char *build_version, const char *iso_sha256)
@@ -85,7 +91,7 @@ void net_init(const char *base_url, const char *player_name, const char *build_v
     snprintf(iso, sizeof iso, "%s", iso_sha256);
 }
 
-static int connect_to(const char *path)
+static int connect_to(const char *path, int p2p)
 {
     char url[300];
     WsHandler h = {NULL, on_open, on_message, on_close, on_tick};
@@ -95,12 +101,9 @@ static int connect_to(const char *path)
     SDL_LockMutex(api);
     client_free(&client);
     client_init(&client, name, version, iso);
-    if (!NET_OFFERED) {
-        client.lobby.state = NET_FAILED;
-        snprintf(client.lobby.error, sizeof client.lobby.error, NET_NOT_OFFERED);
-        SDL_UnlockMutex(api);
-        return -1;
-    }
+    /* the install id (port/hle/host.c; finding 161), read here on the game's thread, the one that
+       sets the environment */
+    client_set_install_id(&client, getenv("DHD_NET_INSTALL_ID"));
     if (!base[0]) {
         client.lobby.state = NET_FAILED;
         snprintf(client.lobby.error, sizeof client.lobby.error, "no server: set DHD_NET_SERVER");
@@ -108,29 +111,40 @@ static int connect_to(const char *path)
         return -1;
     }
     client.lobby.state = NET_CONNECTING;
+    client.lobby.is_p2p = p2p;  /* until the welcome says (client.c) */
     snprintf(url, sizeof url, "%s%s", base, path);
     conn = ws_start(url, &h);
     SDL_UnlockMutex(api);
     return 0;
 }
 
-int net_create_room(void)
+int net_create_room(int p2p)
 {
-    return connect_to("/v1/rooms/new");
+    /* the region its creator picked (finding 181): a hint's letters only, never anything else in
+       the URL; "auto", unset or anything odd lets the server pick. A P2P room (finding 186) is a
+       room like any other, with another race transport: its rules and its members' SFU fallback
+       run there too. */
+    const char *region = getenv("DHD_NET_ROOM_REGION");
+    char path[80];
+    int n = snprintf(path, sizeof path, "/v1/rooms/new%s", p2p ? "?transport=p2p" : "");
+    if (region && *region && strcmp(region, "auto") && strlen(region) < 16 && strspn(region, "abcdefghijklmnopqrstuvwxyz-") == strlen(region))
+        snprintf(path + n, sizeof path - n, "%cregion=%s", p2p ? '&' : '?', region);
+    return connect_to(path, p2p);
 }
 
 int net_join_room(const char *code)
 {
     static const char alphabet[] = "23456789ABCDEFGHJKMNPQRSTUVWXYZ";
-    char path[32], up[8];
-    int i;
-    for (i = 0; code[i] && i < 7; i++)
+    char path[32], up[P2P_CODE_LENGTH + 2];
+    int i, p2p;
+    for (i = 0; code[i] && i < P2P_CODE_LENGTH + 1; i++)
         up[i] = (char)toupper((unsigned char)code[i]);
     up[i] = 0;
-    if (i != 6 || strspn(up, alphabet) != 6)
+    p2p = i == P2P_CODE_LENGTH;
+    if ((i != SFU_CODE_LENGTH && !p2p) || strspn(up, alphabet) != (size_t)i)
         return -1;
     snprintf(path, sizeof path, "/v1/rooms/%s", up);
-    return connect_to(path);
+    return connect_to(path, p2p);
 }
 
 void net_leave(void)
@@ -153,7 +167,7 @@ int net_list_lobbies(NetLobbyInfo *out, int max)
     char url[300];
     double sent, got;
     int n;
-    if (!NET_OFFERED || !base[0] || !inited)
+    if (!base[0] || !inited)  /* P2P rooms are never listed (the server's list has none) */
         return -1;
     snprintf(url, sizeof url, "%s/v1/lobbies", base);
     sent = net_now_ms();
@@ -169,13 +183,14 @@ int net_list_lobbies(NetLobbyInfo *out, int max)
 void net_set_room(const NetRoomSettings *s) { client_set_room(&client, s); }
 void net_pick(int member, int rider, int bike) { client_pick(&client, member, rider, bike); }
 void net_set_ready(int ready) { client_ready(&client, ready); }
-void net_kick(int member) { client_kick(&client, member); }
 void net_start_race(void) { client_start(&client); }
 void net_end_race(void) { client_end(&client); }
-void net_finish(unsigned ticks, int place) { client_finish(&client, ticks, place); }
+void net_finish(unsigned ticks, int place, int score) { client_finish(&client, ticks, place, score); }
 void net_back(void) { client_back(&client); }
+void net_watch(void) { client_watch(&client); }
 void net_rules(int finish_window, int next_race, int then) { client_rules(&client, finish_window, next_race, then); }
 void net_rotation(const unsigned char *ids, int count) { client_rotation(&client, ids, count); }
+void net_race_go(double at) { client_race_go(&client, at); }
 
 void net_get_lobby(NetLobby *out)
 {
@@ -204,14 +219,22 @@ int net_ping_ms(void)
     return inited && (l->state == NET_LOBBY || l->state == NET_RACING) && !l->offline && l->code[0] ? l->ping_ms : -1;
 }
 
+/* In a race, the other riders' delay (ms; client_riders_ms), else -1: the counter shows it
+   instead of the ping to the room's server, which carries no race data (finding 169). */
+int net_race_ms(void)
+{
+    const NetLobby *l = &client.lobby;
+    return inited && (l->state == NET_LOBBY || l->state == NET_RACING) && !l->offline && l->code[0] ? client_race_ms(&client) : -1;
+}
+
+int net_riders_ms(void)
+{
+    return inited && client.racing && !client.lobby.offline ? client_riders_ms(&client) : -1;
+}
+
 int net_racing(void)
 {
     return inited && client.racing;
-}
-
-int net_local_slot(void)
-{
-    return client.lobby.local_slot;
 }
 
 
@@ -234,16 +257,18 @@ int net_receive_frame(uint8_t *out, size_t max)
 #include "../include/guest.h"
 void host_service_net_init(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3) { net_init((const char *)GUEST(a0), (const char *)GUEST(a1), (const char *)GUEST(a2), (const char *)GUEST(a3)); }
 int host_service_net_offered(void) { return NET_OFFERED; }
-int host_service_net_create_room(void) { return net_create_room(); }
+int host_service_net_create_room(int p2p) { return net_create_room(p2p); }
 int host_service_net_join_room(uint32_t a0) { return net_join_room((const char *)GUEST(a0)); }
 void host_service_net_leave(void) { net_leave(); }
 void host_service_net_get_lobby(uint32_t a0) { net_get_lobby((NetLobby *)GUEST(a0)); }
 void host_service_net_pick(int a0, int a1, int a2) { net_pick(a0, a1, a2); }
-void host_service_net_finish(uint32_t ticks, int place) { net_finish(ticks, place); }
+void host_service_net_finish(uint32_t ticks, int place, int score) { net_finish(ticks, place, score); }
 void host_service_net_back(void) { net_back(); }
+void host_service_net_watch(void) { net_watch(); }
 void host_service_net_rules(int finish_window, int next_race, int then) { net_rules(finish_window, next_race, then); }
 void host_service_net_rotation(uint32_t address, int count) { if (count >= 0 && count <= 64) net_rotation((const unsigned char *)GUEST(address), count); }
 void host_service_net_end_race(void) { net_end_race(); }
+void host_service_net_race_go(double at) { net_race_go(at); }
 void host_service_net_set_ready(int a0) { net_set_ready(a0); }
 void host_service_net_start_race(void) { net_start_race(); }
 int host_service_net_racing(void) { return net_racing(); }

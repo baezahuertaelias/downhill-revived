@@ -37,7 +37,7 @@ void gs_picture_rect(int left, int top, int right, int bottom, int w, int h);  /
 
 static NativeView native_replacement_view(Native *n, NativeTexture *t)
 {
-    return t->pack ? texpack_view(t->pack, n->field) : t->sharp;
+    return t->sharp ? t->sharp : t->pack ? texpack_view(t->pack, n->field) : NULL;
 }
 
 /* ---- render thread (context lock held) ---- */
@@ -61,6 +61,7 @@ static int native_waits_for_vsync(Native *n)
    present.c's window), in the rectangle that keeps its shape. */
 static void native_present(Native *n)
 {
+    if (!platform_present_active()) return;
     Rust *p = n->exact;
     if (!p->surface || !p->window.size || n->present_failed) return;
     unsigned w, h;
@@ -112,10 +113,27 @@ static void native_surface_reset(Native *n)
 /* The display read: dhdr_native_read_finish waits for the map itself. */
 static int native_read_wait(void) { return 1; }
 
+/* A present failed (native_present_draw): a lost device ends the game (gpu_rust.c, finding 171). */
+static void native_device_lost(void) { device_lost_check(); }
+
 /* PC SETTINGS' Resolution row (port/hle/pc_settings.c): the scale the pictures are drawn at
    (asked 0) or the one asked for (asked 1: DHD_SCALE's, or the window's match before the limit),
    native_scale_now's; 0 before the first picture and without this renderer. */
-int host_service_gs_scale(int asked) { return (int)native_scale_now[asked ? 1 : 0]; }
+int host_service_gs_scale(int asked)
+{
+    if (asked == 2) {  /* a software adapter (finding 262): dhdr_perf_read's adapter kind 4 */
+        uint64_t perf[6] = {0};
+        if (dhdr_perf_read(perf, 6) != 6 || perf[5] != 4) return 0;
+#if defined(_WIN32)
+        return 1;
+#elif defined(__APPLE__)
+        return 2;
+#else
+        return 3;
+#endif
+    }
+    return (int)native_scale_now[asked ? 1 : 0];
+}
 
 /* ---- creation (EE thread, from rust_init) ---- */
 
@@ -149,6 +167,23 @@ static int native_init(Gs *g, Rust *exact)
             fprintf(stderr, "gs: scale memory budget override %llu MiB (DHD_SCALE_MEMORY_MB)\n", mb);
         } else fprintf(stderr, "gs: invalid DHD_SCALE_MEMORY_MB; using adapter memory\n");
     }
+    /* The draw pipelines of earlier runs are built ahead (finding 256): pipelines.txt in
+       DHD_DATA_DIR (the launcher's folder for the player's files), else beside the game (on
+       Android the app's files folder), as dhd.log. The GS test programs link without the host
+       and keep no list. */
+#ifndef DHD_GS_TEST_BUILD
+    {
+        const char *host_getenv(const char *name);          /* port/host (host_api.h) */
+        unsigned host_exe_path(char *out, unsigned size);
+        char list[1024];
+        const char *data = host_getenv("DHD_DATA_DIR");
+        unsigned at = data && *data ? 0 : host_exe_path(list, sizeof list - 16);
+        while (at && list[at - 1] != '\\' && list[at - 1] != '/') at--;
+        if (data && *data) snprintf(list, sizeof list, "%s/pipelines.txt", data);
+        else snprintf(list + at, sizeof list - at, "pipelines.txt");
+        dhdr_native_pipeline_list(list);
+    }
+#endif
     Native *n = native_create_rust(exact, scale_memory, &start);
     if (!n) return 0;
     /* A texture pack (dhd.ini texture_pack, textures): its default budget is half the card's memory. */
@@ -159,7 +194,7 @@ static int native_init(Gs *g, Rust *exact)
     snprintf(most, sizeof most, "%u", n->scale_limit);
     host_putenv_s("DHD_SCALE_MAX", most);
     /* and why it is less than 8: "memory" (graphics memory), "texture" (the largest texture) or
-       "phone" (NATIVE_PHONE_SCALE_MAX) */
+       "phone" (NATIVE_PHONE_SCALE_MAX: Android and iOS) */
     host_putenv_s("DHD_SCALE_MAX_REASON", n->scale_reason == NATIVE_SCALE_MEMORY ? "memory" :
                   n->scale_reason == NATIVE_SCALE_TEXTURE ? "texture" :
                   n->scale_reason == NATIVE_SCALE_PHONE ? "phone" : "");

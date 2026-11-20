@@ -1,0 +1,222 @@
+//! The Controls tab's bindings (finding 157): the tables, the layouts dhd.ini holds (keyboard,
+//! pad1 to pad4: each of the four players' controllers, finding 251) and each change, made by dhd_settings::controls (the game's own rules)
+//! and saved at once. The game takes them at its next start, as the launcher's other settings.
+
+use dhd_settings::controls::{self, Controls, Edit, Outcome};
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+#[derive(Serialize)]
+pub struct Target {
+    label: &'static str,
+    race: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct Key {
+    vk: u8,
+    label: &'static str,
+    /// The browser's KeyboardEvent.code for the key at that place.
+    code: &'static str,
+}
+
+#[derive(Serialize)]
+pub struct PadInput {
+    id: u8,
+    /// Xbox's, PlayStation's and Nintendo's words.
+    labels: [&'static str; 3],
+    /// The Gamepad API's standard-mapping button, -1 none.
+    web: i8,
+}
+
+#[derive(Serialize)]
+pub struct Device {
+    label: &'static str,
+}
+
+/// A shoulder swap (finding 189): its SWAP_* bit and the two inputs (ids) that change places.
+#[derive(Serialize)]
+pub struct Swap {
+    bit: u8,
+    inputs: [u8; 2],
+}
+
+#[derive(Serialize)]
+pub struct Schema {
+    targets: Vec<Target>,
+    /// How many of the targets a controller binds (the rest are the keyboard's stick directions).
+    buttons: usize,
+    keys: Vec<Key>,
+    pads: Vec<PadInput>,
+    devices: Vec<Device>,
+    swaps: Vec<Swap>,
+}
+
+pub fn schema() -> Schema {
+    Schema {
+        targets: controls::TARGETS.iter().map(|t| Target { label: t.label, race: t.race }).collect(),
+        buttons: controls::BUTTONS,
+        keys: controls::KEYS.iter().map(|k| Key { vk: k.vk, label: k.label, code: k.code }).collect(),
+        pads: controls::PAD_INPUTS
+            .iter()
+            .map(|p| PadInput { id: p.id, labels: [p.labels.xbox, p.labels.playstation, p.labels.nintendo], web: p.web })
+            .collect(),
+        devices: controls::DEVICES.iter().map(|d| Device { label: d.label }).collect(),
+        swaps: controls::SWAPS
+            .iter()
+            .map(|(bit, _, inputs)| Swap { bit: *bit, inputs: inputs.map(|n| controls::pad_named(n).unwrap().id) })
+            .collect(),
+    }
+}
+
+#[derive(Serialize)]
+pub struct Layout {
+    inputs: Vec<[u8; controls::SLOTS]>,
+    swap_sticks: bool,
+    invert: u8,
+    /// SWAP_* bits: Swap L1/L2, Swap R1/R2 (finding 189).
+    swap_shoulders: u8,
+}
+
+#[derive(Serialize)]
+pub struct State {
+    layouts: Vec<Layout>,
+}
+
+/// The layouts dhd.ini gives (the game's reading of its lines: a broken one falls back).
+fn read(settings: &Path) -> Controls {
+    let ini = dhd_settings::read(settings).unwrap_or_default();
+    let values = controls::DEVICES.map(|d| ini.value(d.key));
+    Controls::from_values(values.each_ref().map(|v| v.as_str()), &mut Vec::new())
+}
+
+fn state_of(c: &Controls) -> State {
+    State {
+        layouts: c
+            .layouts
+            .iter()
+            .map(|l| Layout { inputs: l.input.to_vec(), swap_sticks: l.swap_sticks != 0, invert: l.invert, swap_shoulders: l.swap_shoulders })
+            .collect(),
+    }
+}
+
+pub fn state(settings: &Path) -> State {
+    state_of(&read(settings))
+}
+
+/// A change as the page asks for it: `edit` is assign, clear, reset, swap, invert (`input` the
+/// INVERT_* bit) or shoulders (`input` the SWAP_* bit: Swap L1/L2, Swap R1/R2).
+#[derive(Deserialize)]
+pub struct Request {
+    edit: String,
+    target: usize,
+    slot: usize,
+    input: u8,
+    on: bool,
+}
+
+#[derive(Serialize)]
+pub struct Answer {
+    /// changed, unchanged or refused
+    outcome: &'static str,
+    message: String,
+    layouts: Vec<Layout>,
+}
+
+/// Makes the change (the game's rules) and saves the device's dhd.ini line when it changed.
+/// `kind`: the connected controller's PAD_KIND_*, for the message's words.
+pub fn edit(settings: &Path, device: usize, r: &Request, kind: i32, save: impl Fn(&str, &str) -> Result<(), String>) -> Result<Answer, String> {
+    if device >= controls::DEVICES.len() {
+        return Err(format!("no such layout: {device}"));
+    }
+    let edit = match r.edit.as_str() {
+        "assign" => Edit::Assign { target: r.target, slot: r.slot, input: r.input },
+        "clear" => Edit::Clear { target: r.target, slot: r.slot },
+        "reset" => Edit::Reset,
+        "swap" => Edit::SwapSticks(r.on),
+        "invert" => Edit::Invert(r.input, r.on),
+        "shoulders" => Edit::SwapShoulders(r.input, r.on),
+        other => return Err(format!("not an edit: {other}")),
+    };
+    let mut c = read(settings);
+    let (outcome, message) = match c.edit(device, edit, kind) {
+        Outcome::Changed(m) => {
+            save(controls::DEVICES[device].key, &c.values()[device])?;
+            ("changed", m)
+        }
+        Outcome::Unchanged => ("unchanged", String::new()),
+        Outcome::Refused(m) => ("refused", m),
+    };
+    Ok(Answer { outcome, message, layouts: state_of(&c).layouts })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The schema the page gets: every key has its browser code, a controller has the buttons only.
+    /// With DHD_CONTROLS_SCHEMA=FILE it is written there, with the default layouts, for
+    /// port/launcher/test_controls.js ({"schema": ..., "state": ...}).
+    #[test]
+    fn schema_for_the_page() {
+        let s = schema();
+        assert_eq!((s.targets.len(), s.buttons, s.devices.len()), (24, 16, 5));
+        assert!(s.keys.iter().all(|k| !k.code.is_empty() && k.vk != 0));
+        assert!(s.pads.iter().any(|p| p.web == 0 && p.labels == ["A", "Cross", "B"]));
+        let id = |n| controls::pad_named(n).unwrap().id;
+        assert!(s.swaps.iter().map(|w| (w.bit, w.inputs)).eq([(controls::SWAP_L, [id("lb"), id("lt")]), (controls::SWAP_R, [id("rb"), id("rt")])]));
+        if let Some(path) = std::env::var_os("DHD_CONTROLS_SCHEMA") {
+            let both = serde_json::json!({ "schema": s, "state": state_of(&Controls::default()) });
+            std::fs::write(path, both.to_string()).unwrap();
+        }
+    }
+
+    #[test]
+    fn edits_saved_and_read_back() {
+        let dir = std::env::temp_dir().join(format!("dhd-launcher-controls-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ini = dir.join("dhd.ini");
+        let _ = std::fs::remove_file(&ini);
+        let save = |k: &str, v: &str| dhd_settings::save(&ini, k, v).map(|_| ()).map_err(|e| e.to_string());
+        let x = controls::key_named("x").unwrap().vk;
+        let square = controls::target("square").unwrap();
+        let ask = |edit: &str, target, input| Request { edit: edit.into(), target, slot: 0, input, on: true };
+        let a = edit(&ini, 0, &ask("assign", square, x), 2, save).unwrap();
+        assert_eq!((a.outcome, a.message.as_str()), ("changed", "Swapped Square and Cross"));
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("keyboard").as_deref(), Some("cross:space,z square:x"));
+        // Cross's last key can't be cleared (finding 157: each device on its own)
+        let cross = controls::target("cross").unwrap();
+        assert_eq!(edit(&ini, 0, &ask("clear", cross, 0), 2, save).unwrap().outcome, "changed");
+        let a = edit(&ini, 0, &ask("clear", cross, 0), 2, save).unwrap();
+        assert_eq!((a.outcome, a.message.as_str()), ("refused", "Cross needs a key"));
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("keyboard").as_deref(), Some("cross:z square:x"));
+        assert_eq!(state(&ini).layouts[0].inputs[square], [x, 0]);
+        let a = edit(&ini, 2, &ask("swap", 0, 0), 2, save).unwrap();
+        assert_eq!(a.outcome, "changed");
+        assert!(a.layouts[2].swap_sticks);
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("pad2").as_deref(), Some("sticks:swap"));
+        // Swap L1/L2 and Swap R1/R2, per controller (finding 189)
+        let a = edit(&ini, 1, &Request { input: controls::SWAP_R, ..ask("shoulders", 0, 0) }, 2, save).unwrap();
+        assert_eq!((a.outcome, a.layouts[1].swap_shoulders, a.layouts[2].swap_shoulders), ("changed", controls::SWAP_R, 0));
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("pad1").as_deref(), Some("r1r2:swap"));
+        assert_eq!(edit(&ini, 0, &Request { input: controls::SWAP_L, ..ask("shoulders", 0, 0) }, 2, save).unwrap().outcome, "unchanged");
+        let a = edit(&ini, 0, &ask("reset", 0, 0), 2, save).unwrap();
+        assert_eq!(a.outcome, "changed");
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("keyboard"), None, "an empty line: the defaults");
+        // Controllers 3 and 4 (finding 251): their own lines, the others left as they are
+        let east = controls::pad_named("east").unwrap().id;
+        let a = edit(&ini, 3, &ask("assign", cross, east), 1, save).unwrap();
+        assert_eq!((a.outcome, a.message.as_str()), ("changed", "Swapped Cross and Circle"));
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("pad3").as_deref(), Some("cross:east circle:south"));
+        let a = edit(&ini, 4, &Request { input: controls::INVERT_LY, ..ask("invert", 0, 0) }, 1, save).unwrap();
+        assert_eq!((a.outcome, a.layouts[4].invert, a.layouts[3].invert), ("changed", controls::INVERT_LY, 0));
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("pad4").as_deref(), Some("invert:ly"));
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("pad2").as_deref(), Some("sticks:swap"));
+        assert_eq!(state(&ini).layouts.len(), 5);
+        assert_eq!(edit(&ini, 3, &ask("reset", 0, 0), 2, save).unwrap().outcome, "changed");
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("pad3"), None);
+        assert_eq!(dhd_settings::read(&ini).unwrap().written("pad4").as_deref(), Some("invert:ly"));
+        assert!(edit(&ini, 5, &ask("reset", 0, 0), 2, save).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

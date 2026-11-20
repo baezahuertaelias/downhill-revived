@@ -49,12 +49,32 @@ change needs them or someone asks.
 
 | Decision | Since | Finding | Do not |
 |---|---|---|---|
-| Online races are state sync: each game runs its own one-player race, the others are puppet riders moved from snapshots (~20 a second); hits are events; each game times its own finish | 2026-10-16 | 044 | add input lockstep, input delay, state hashes or tick agreement between PCs; peers share neither frame rate nor floats |
+| Online races are state sync: each game runs its own one-player race, the others are puppet riders that ride on this game's own physics with their owner's pad and are steered toward the owner's snapshots (finding 202; each player's own rider 60 a second, AI riders 30); hits are events; each game times its own finish | 2026-10-16 | 044 | add input lockstep, input delay, state hashes or tick agreement between PCs; peers share neither frame rate nor floats |
+| Race frames travel through Cloudflare only (Realtime SFU, TURN over TLS on 443 as the fallback); the room sets them up, one Realtime session per member per room; no player ever receives another's address | 2026-11-06 | 177 | add peer-to-peer links or a TURN mesh, or send a player another's address, SDP, session id, TURN credentials, address hash or install id |
 | One delta-time game clock at every frame rate, 60 included and online; deterministic runs keep the original clock | 2026-11-02 | 139 | add a fixed 1/60 step, a frame cap with repaid debt, or extra online fields |
 | Our own GS renderer (Rust, wgpu) with an exact and a native front end; PCSX2 is the referee (replay the same GS stream), not the renderer | 2026-10-14 | 085 | swap in PCSX2's GS or blame the renderer before replaying the stream (025) |
+| The emulated VU1 stays as the reference beside Native VU (the default): the Exact renderer, the lens flare's Z probe, the PCSX2 referee's GS captures and the GPU fallback run on it | 2026-11-16 | 264 | delete the emulated VU1 path or the `native_vu` setting as "legacy", or count it as a second implementation under the rule below |
 | One code path for every platform, no legacy kept beside a new path; old code is deleted when replaced | 2026-10-27 | 099 | keep a second implementation "as a fallback" (the 32-bit build, D3D11, XInput, the game's updater are gone, 088) |
 | Keep the original game's feel: no gameplay additions; QoL and online features are welcome | 2026-10-31 | | add custom music, taunts, assists or handling changes |
-| No online play on Android or in the browser yet: the host does not offer it | 2026-11-03 | 143 | enable ONLINE there without a decision |
+| Phones offer every online mode: Android and iOS have the desktop's ONLINE menu (Quick Race, public and private SFU rooms, P2P rooms) through the same code; the browser offers P2P rooms only (`host_service_net_offered`) | 2026-11-14 | 237 | add a phone-only online path or limit, or offer SFU rooms in the browser without a decision |
+| iOS is a platform since 2026-11-13: built and released by us as an unsigned experimental IPA (`port/ios`, from Gustavo Ribeiro's iOS port), using the shared touch controls and settings like Android; its launcher is the shared mobile launcher | 2026-11-13 | 224 | add an iOS-only launcher, touch controls or settings UI beside the shared ones, or sign the IPA with anyone's Apple account in the repository |
+| One launcher UI for desktop, Android and iOS: `port/launcher/ui` in Tauri or the platform's web view, one bridge (`port/launcher/BRIDGE.md`), every string from `ui/lang` | 2026-11-13 | 225 | write a second launcher UI in Java, Kotlin or Swift, or put a launcher string outside the string table |
+
+P2P rooms (180, 186) are the one exception to "race frames through Cloudflare only": the creator
+picks SFU or P2P per room; a P2P room is the same server room with a second race transport (a
+star of peer connections around a hub the room picks, the room's SFU for a member who can't reach
+it), and the race's synchronization is the SFU's. The owner authorizes peer addressing for them,
+so a P2P room is private (joined by its code, never listed; the game says players see each
+other's network address), and P2P rooms in the browser too (the browser's only rooms). They ship
+from 0.7.14 on (after the test prerelease test-p2p-1). In SFU rooms, phones included (237), no
+player ever receives another's address.
+
+Native VU (194, 198, 199) is the players' default on every platform, the browser included (a
+Graphics setting, on by default; the owner, 2026-11-11). The emulated VU1 path is the one exception
+to "one code path" on the GPU side: it remains only as the automatic fallback (a GPU that refuses
+the mesh draws, one dhd.log line) and as the setting's off (troubleshooting), and is deleted in a
+later lane once players' logs show no fallbacks. Do not build on the emulated draw
+path for the translated loops, and do not make it the default again.
 
 A lane's plan is its finding: copy `docs/findings/TEMPLATE.md` on the lane's first commit
 (`Status: in progress`, which reserves the number) and keep its Progress, Decisions and Surprises
@@ -75,6 +95,7 @@ before you change files in an area, read that area's AGENTS.md yourself.
 | The port: HLE, runtime, host, GS front end, build scripts (`port/`) | `port/AGENTS.md` |
 | The Rust library: renderer, settings, net, disc, presence (`port/render/`) | `port/render/AGENTS.md` |
 | The Android app and APK (`port/android/`) | `port/android/AGENTS.md` |
+| The iOS app and IPA (`port/ios/`) | `port/ios/AGENTS.md` |
 | The online server (`online/server/`) | `online/server/AGENTS.md`, `docs/online-protocol.md` |
 | A new finding, a lane, a release, decomp workers | new finding or lane plan: `docs/findings/TEMPLATE.md`; decomp workers: `docs/WORKER.md`; release: `docs/BUILDING.md` "Releases" and `docs/RELEASE-CHECKLIST.md` |
 

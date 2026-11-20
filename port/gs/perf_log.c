@@ -25,6 +25,7 @@
    renderer's missing render thread) or a value the platform cannot measure is n/a. */
 #include "perf_log.h"
 #include "../render/include/dhd_render_ext.h"   /* dhdr_perf_read */
+#include "../host/host_end.h"
 #include <SDL3/SDL_atomic.h>
 #include <math.h>
 #include <stdatomic.h>
@@ -35,7 +36,7 @@
 
 double host_wall_seconds(void);                                              /* host_sdl.c */
 void host_wait_sink(_Atomic uint64_t *nanoseconds);                          /* host_sdl.c */
-unsigned host_thread_cpu(const char **names, double *seconds, unsigned max); /* host.c */
+unsigned host_thread_cpu(const char **names, double *seconds, unsigned max); /* host_threads.c */
 double host_pacing_period(void);                                             /* host.c */
 void pacing_handed(double *due, double *began);                              /* host.c */
 extern uint64_t kernel_vsync_count;                                          /* host.c: the field */
@@ -48,6 +49,7 @@ static const char *const thread_labels[THREADS] = {"game", "vu", "gs", "render"}
 enum { BINS = 1000 };            /* frame times in 0.25 ms bins up to 250 ms; longer ones in a tail */
 static const double BIN_MS = 0.25;
 static const double WINDOW_SECONDS = 30, SEGMENT_SECONDS = 1, STABLE_SECONDS = 2;
+static const double LONG_FRAME_MS = 500;  /* a picture this long after the last one gets its own line */
 
 static int on = -1;
 int perf_log_on(void)
@@ -83,6 +85,14 @@ void perf_wait_self(double seconds)
 void perf_present_wait(double seconds)
 {
     if (seconds > 0) atomic_fetch_add_explicit(&present_wait_ns, (uint64_t)(seconds * 1e9), memory_order_relaxed);
+}
+
+/* DHD_TIMELINE's per-field rows (graphics_timeline.h, finding 156): the render thread's own waits
+   so far (the next field, its pacing) and its time inside the present, in seconds. */
+void perf_render_waits(double out[2])
+{
+    out[0] = atomic_load_explicit(&self_wait_ns[T_RENDER], memory_order_relaxed) * 1e-9;
+    out[1] = atomic_load_explicit(&present_wait_ns, memory_order_relaxed) * 1e-9;
 }
 
 /* ---- present.c's view of the window and the game ---- */
@@ -416,7 +426,7 @@ void perf_presented(void)
         static int started;
         if (!started) {
             started = 1;
-            atexit(perf_exit);
+            host_end_add(HOST_END_REPORT, "perf summary", perf_exit);
             fputs("perf: a line every 30 s of race or menus with the window in front, and the whole session at "
                   "exit: frames shown, fps shown/requested, low1% = the slowest 1% of frames as fps, over = frames "
                   "longer than 1.2x the budget; per field, each thread's CPU ms / busy ms (not waiting), the "
@@ -430,12 +440,14 @@ void perf_presented(void)
         SDL_UnlockSpinlock(&lock);
         return;
     }
+    double long_ms = 0;
     if ((window & 1) && window == segment.window && state == segment.state && last_present > 0) {
         int paced;
         double requested = requested_fps(&paced), ms = (now - last_present) * 1000;
         double over_ms = paced && requested > 0 ? 1.2 * 1000 / requested : 0;
         count_frame(&window_sums[state], ms, over_ms, requested, paced);
         count_frame(&session_sums[state], ms, over_ms, requested, paced);
+        if (ms >= LONG_FRAME_MS) long_ms = ms;
     }
     last_present = now;
     if (window != segment.window || state != segment.state || now - segment.start >= SEGMENT_SECONDS) {
@@ -444,4 +456,12 @@ void perf_presented(void)
         render_line(now);
     }
     SDL_UnlockSpinlock(&lock);
+    /* a picture that came this long after the one before (what a summary's max= hides: when it was;
+       finding 211): its own line, a few per run, between the game's own lines in the log */
+    static int long_lines;
+    if (long_ms > 0 && long_lines < 40) {
+        long_lines++;
+        fprintf(stderr, "perf: long frame: a picture %.0f ms after the one before (%s, field %llu)\n", long_ms,
+                state ? "race" : "menus", (unsigned long long)kernel_vsync_count);
+    }
 }

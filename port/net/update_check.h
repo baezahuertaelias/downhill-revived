@@ -14,12 +14,17 @@
 
 /* The releases page, for an answer whose page is not this repository's. */
 #define UPDATE_RELEASES_PAGE "https://github.com/skuza-oss/downhill-revived/releases/latest"
+/* Where a phone asks, in order (android_update.c, the launcher's android_launcher.c): the online
+   server's copy of the newest latest.json (online/server/src/latest.ts), then GitHub's release asset. */
+#define UPDATE_SOURCE_SERVER "https://dhd.skuza.app/v1/latest"
+#define UPDATE_SOURCE_GITHUB "https://github.com/skuza-oss/downhill-revived/releases/latest/download/latest.json"
 /* At most one check a day. */
 #define UPDATE_INTERVAL_SECONDS (24 * 60 * 60)
 
-/* "1.2.3" or "v1.2.3" into out; 1 when it is one. */
+/* "1.2.3" or "v1.2.3" (a prerelease's "1.2.3-suffix" too) into out; 1 when it is one. */
 int update_parse_version(const char *text, unsigned out[3]);
-/* 1 when candidate is a version newer than current (both must parse). */
+/* 1 when candidate is a version newer than current (both must parse; a prerelease comes before
+   its release). */
 int update_newer(const char *candidate, const char *current);
 /* 1 when the latest.json text names a release newer than current with a build for platform (a
    url under this repository's releases/download/):

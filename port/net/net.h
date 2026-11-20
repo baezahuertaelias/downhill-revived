@@ -3,14 +3,16 @@
 
    Races use state sync (findings 041, 044): every PC runs its own one-player race and sends
    snapshots of the riders it owns (STATE frames) and hits it deals (EVENT frames) with
-   net_send_frame, through a relay over a WebSocket; the others' riders are puppets
-   (port/hle/online.c, port/hle/puppet.c). A background thread keeps the connection (lobby JSON,
-   binary race frames, pings). */
+   net_send_frame, through the room's SFU association (port/render/net/src/sfu.rs); the others'
+   riders are puppets (port/hle/online.c, port/hle/puppet.c). Background threads keep the room's
+   WebSocket (lobby JSON, binary pings) and the SFU association. */
 #ifndef NET_H
 #define NET_H
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 enum { NET_MAX_SLOTS = 10 };  /* online rider slots, independent of local controllers */
 
@@ -53,6 +55,7 @@ typedef struct {
     int member_id, host_id, is_host;
     char room_name[100];
     int is_public, max_players, started;
+    int is_p2p;                /* a P2P room (findings 180, 186): races over a star of games; never public */
     int track, laps;
     long long seed;            /* -1 until set */
     int nmembers;
@@ -83,7 +86,40 @@ typedef struct {
        location this connection reached, this PC's country and continent as Cloudflare sees them,
        the location the room runs in and its region ("EU", "NA", "ASIA"...). */
     char edge_colo[8], country[4], continent[4], room_colo[8], room_region[8];
+    /* Where the room runs, finer ("EU WEST", "ASIA SE"...; "" unknown or an older server), and
+       whether its creator picked the region (finding 181). */
+    char room_area[12];
+    int room_chosen;
+    /* The server's notice before it restarts the room for new code (finding 184): a footer line
+       while this PC rejoins ("Server updated, reconnecting..."); "" none. The welcome clears it. */
+    char notice[64];
+    /* The race's start moment as the room sent it (server ms; 0 none yet): the host's START over
+       the room as well as the race link, for a game whose race link brought nothing (finding 187). */
+    double race_go_at;
+    /* A scored round (finding 204: the arena's Mosh Bowl round). server_scores: the welcome listed
+       "score", so finishes may carry one and the room ranks a round by it (an older server: 0, and
+       the arena races as before). member_score: the score in member[i]'s finish, result_score in
+       result[i]'s, -1 none. */
+    int server_scores;
+    int member_score[NET_MAX_SLOTS], result_score[NET_MAX_SLOTS];
+    /* How the race this PC took part in ended, from the room's "ended" message (NET_ENDED_*; 0 until
+       it comes, cleared at each start). The message arrives before the room snapshot that carries
+       the race's results, so a game that looked at lastRace to tell the reasons apart saw "no new
+       result" for a moment and blamed the host (finding 211). */
+    int ended;
+    /* A rejoin found the race gone on without this PC, or over with this PC's member listed as left
+       (the room let its seat go after 20 s without a word from it; client.c read_room decides from
+       the room's snapshot after the welcome): the race screen says CONNECTION LOST, not that the
+       race ended (finding 254). Cleared at each start. */
+    int seat_lost;
+    /* Watching a running race (finding 269): server_watch, the welcome listed "watch" (the room page
+       offers WATCH); watching, this PC watches the race it has (its start came with "watch": no slot
+       of its own, local_slot -1; cleared by ended and back); watchers, the members the room's
+       snapshot shows watching (the racers then say their rides again, port/hle/online.c). */
+    int server_watch, watching, watchers;
 } NetLobby;
+enum { NET_ENDED_NONE, NET_ENDED_DONE /* all finished or out, or the finish window ran out */,
+       NET_ENDED_VOID /* the host ended it */, NET_ENDED_UNKNOWN /* an older server: no reason */ };
 
 /* Host settings; fields at -1 (room_name NULL) are left as they are. */
 typedef struct {
@@ -101,13 +137,41 @@ typedef struct {
     char region[8], colo[8];   /* where the room runs ("EU"...; finding 135), "" unknown */
     int timed;                 /* the times above can be counted against net_server_ms(): the list
                                   came with the server's "now", or a room's pings set the clock */
+    char area[12];             /* where the room runs, finer ("EU WEST"...; finding 181), "" unknown */
 } NetLobbyInfo;
 
 /* base_url: "wss://host" or "ws://127.0.0.1:8787". version: the build's version string (the
    server refuses players whose version differs from the host's). iso_sha256: 64 lowercase hex. */
 void net_init(const char *base_url, const char *name, const char *version, const char *iso_sha256);
-int net_create_room(void);
+/* host_service_net_offered's bits: the kinds of room this build offers (port/host/host_api.h). */
+enum { NET_OFFER_SFU = 1, NET_OFFER_P2P = 2 };
+
+/* A room code has 6 characters (an SFU room) or 7 (a P2P room, findings 180, 186): both are
+   server rooms, a P2P one racing over a star of the games' own connections. A room runs where
+   DHD_NET_ROOM_REGION says (dhd.ini room_region, the ONLINE page's Room Region row): a Durable
+   Object location hint the server offers ("weur", "apac-se"...), or "auto"/unset: the server picks
+   (finding 181). */
+int net_create_room(int p2p);
 int net_join_room(const char *code);   /* -1 when the code can't be one */
+
+/* A room's code as dhd.log shows it: net_log_code(code).text. Anyone holding an open P2P room's
+   code can join it and so learn its hub's network address, and players post dhd.log in public:
+   a P2P room's code (7 characters) shows only its first two ("AB*****"; finding 180). An SFU
+   room's (6) shows as it is. DHD_NET_LOG_CODE=1 shows every code in full: the test tools read the
+   host's code from the log (docs/TESTING.md). Core and host both use it, so it lives here. */
+typedef struct { char text[8]; } NetLogCode;
+static inline NetLogCode net_log_code(const char *code)
+{
+    NetLogCode c;
+    size_t n = code ? strlen(code) : 0;
+    memset(&c, 0, sizeof c);
+    if (n > sizeof c.text - 1)
+        n = sizeof c.text - 1;
+    memcpy(c.text, code, n);
+    if (n == 7 && !getenv("DHD_NET_LOG_CODE"))
+        memset(c.text + 2, '*', 5);
+    return c;
+}
 void net_leave(void);
 /* Public lobbies (blocking HTTP GET); returns how many, -1 on error. */
 int net_list_lobbies(NetLobbyInfo *out, int max);
@@ -115,51 +179,51 @@ void net_set_room(const NetRoomSettings *s);       /* host */
 /* member -1: this PC. rider -1 (this PC): choosing a rider now, unready until the next pick. */
 void net_pick(int member, int rider, int bike);
 void net_set_ready(int ready);
-void net_kick(int member);                         /* host */
 void net_start_race(void);                         /* host; session: ready entrants */
 void net_end_race(void);                           /* host: back to the lobby */
 /* Session room calls. next_race: 0 auto, 1 host; then: 0 same, 1 next, 2 random. */
-void net_finish(unsigned ticks, int place);
+/* score: a scored round's points (0-999999, finding 204), sent only to a server that lists "score";
+   -1 for a race. */
+void net_finish(unsigned ticks, int place, int score);
 void net_back(void);
+/* Watch the room's running race (finding 269): only with server_watch, outside the race. */
+void net_watch(void);
 void net_rules(int finish_window, int next_race, int then);
 void net_rotation(const unsigned char *ids, int count);
+/* The race's start moment (server ms) this game named (finding 187): to the room too, which sends
+   it to the racers whose race link may have lost the START event. Only a server that lists
+   "race_go" in its welcome hears it. */
+void net_race_go(double at);
 void net_get_lobby(NetLobby *out);                 /* a copy, for the UI */
 double net_seconds(void);                          /* the clock start_at uses */
 /* The server's clock (ms since the Unix epoch), estimated from the lobby pings' round-trips: the
    same moment on every PC to a few ms, for starting the race together. */
 double net_server_ms(void);
 int net_ping_ms(void);                             /* in a room, else -1 */
+/* In a room: the round trip to Cloudflare's race network (the room's SFU association; the median
+   of the last 5 one-second samples), else -1 (finding 181). */
+int net_race_ms(void);
+/* In a race: how old the other riders' snapshots are when they arrive (the slowest player's
+   median, ms; what the puppets are predicted across), else -1 (finding 169). */
+int net_riders_ms(void);
 
 /* ---- the race ---- */
 
 int net_racing(void);
-int net_local_slot(void);
 
-/* Binary frames the relay forwards as they are to every other racer: a snapshot of riders this
-   PC owns, an event it decided for another PC's rider. A frame is type, slot (the server sets
-   it), payload. */
-/* NET_FRAME_MAX: a STATE frame carries all of a player's riders (up to ten snapshots of at most
-   255 bytes); the server's MAX_BINARY_BYTES is the same. */
+/* Race frames, carried by the Cloudflare Realtime SFU to every other racer (finding 158): a STATE
+   bundle of riders this PC owns, an event it decided for another PC's rider. A frame is type, slot
+   (the receiver sets it from the channel), payload. */
+/* NET_FRAME_MAX: the largest frame accepted. A STATE frame is one bundle of at most
+   STATE_BUNDLE_MAX bytes (port/hle/state_bundle.h: as many riders as fit one datagram, finding
+   169); a PC with more riders sends several. */
 enum { NET_FRAME_STATE = 5, NET_FRAME_EVENT = 6, NET_FRAME_MAX = 3072, NET_RELAY_QUEUE = 128 };
-/* The race's pings (client.c): type, slot, the send time; the server answers PONG with the rest
-   as it was. */
+/* The race's pings over the room WebSocket, its only binary messages (client.c): type, slot, the
+   send time; the server answers PONG with the same bytes and its clock. */
 enum { NET_FRAME_PING = 3, NET_FRAME_PONG = 4 };
 /* Sends type and payload (at most NET_FRAME_MAX - 2 bytes); 0 when not racing. */
 int net_send_frame(int type, const void *payload, size_t n);
 /* The oldest frame received, whole (out[0] type, out[1] sender's slot); its size, 0 if none. */
 int net_receive_frame(uint8_t *out, size_t max);
-
-/* ---- state hashes ---- */
-
-typedef struct {
-    const void *base;
-    size_t size;
-} NetRange;
-
-/* A 64-bit hash (XXH64 per range, chained through the seed) of memory ranges: online.c's
-   DHD_HASH_LOG of the race state, every NET_HASH_PERIOD fields. */
-enum { NET_HASH_PERIOD = 60 };
-uint64_t net_hash_ranges(const NetRange *ranges, int n);
-uint64_t net_hash64(const void *data, size_t size, uint64_t seed);  /* XXH64 */
 
 #endif

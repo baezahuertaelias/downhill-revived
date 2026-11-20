@@ -118,10 +118,6 @@ void host_callbacks_drain(void);
 /* ---- threads: a fire-and-forget job (online_menu.c) ---- */
 int host_thread_detach(void (*fn)(void *), void *arg);  /* 1 if the thread started */
 
-/* ---- the host process's memory regions (state_trace.c, opt-in: DHD_STATE_NORM=host) ---- */
-/* Calls visit for each region [base, end) of the address space from 0x10000 up, with host_memory set
-   for memory the host itself holds (not free, and not the program's own image). */
-void host_memory_regions(void (*visit)(uintptr_t base, uintptr_t end, int host_memory));
 /* The host executable's code section (dhd.exe's .text), for the state trace's code pointers. */
 void host_code_range(uintptr_t *lo, uintptr_t *hi);
 
@@ -130,7 +126,7 @@ void host_heartbeat_start(void (*beat)(void));  /* once: a host thread calls bea
 uintptr_t host_heartbeat_eip(void);  /* where the thread that started the heartbeat is now (a host code address); 0 if unknown */
 
 /* ---- callbacks into the module, guest-safe (finding 082, W7g) ----
-   The module calls these, never the five function-pointer services above; the generated
+   The module calls these, never the four function-pointer services above; the generated
    boundary (gen_host64_imports.py) implements them. fn is a module function as a 32-bit value
    (HOST_CALLBACK: its table index in wasm) and ctx a guest value that the host passes back
    unchanged as fn's first argument. The host runs
@@ -140,7 +136,6 @@ uintptr_t host_heartbeat_eip(void);  /* where the thread that started the heartb
 HostFiber host_callback_fiber(uint32_t fn, uint32_t ctx);          /* void fn(ctx) */
 int host_callback_detach(uint32_t fn, uint32_t ctx);               /* void fn(ctx); 1 if started */
 int host_callback_fault_guard(uint32_t fn, uint32_t ctx);          /* int fn(ctx, address) */
-void host_callback_memory_regions(uint32_t fn, uint32_t ctx);      /* void fn(ctx, base, end, host_memory) */
 void host_callback_heartbeat(uint32_t fn, uint32_t ctx);           /* void fn(ctx) */
 /* host_stack_ranges as guest data: up to max [low, high) pairs of 32-bit addresses at out. */
 int host_stack_ranges_copy(uint32_t out, int max);
@@ -157,6 +152,9 @@ void host_sound_open(void);
 /* Hands over `frames` rendered stereo frames, in game order. Frames that don't fit in the host's
    queue are dropped and counted (the mixer's state has already advanced). */
 void host_sound_write(const int16_t *stereo, int frames);
+/* The app left the screen (1) or came back (0) (a phone's background, finding 227): the device
+   pauses, and plays on from the game's sound at the return (what it had queued is dropped). */
+void host_sound_away(int away);
 /* Forgets everything queued (test fixtures only). */
 void host_sound_reset(void);
 /* Wall-clock diagnostics: one call per sound tick. */
@@ -172,6 +170,8 @@ void host_service_host_init(void);
 void host_service_host_console_init(void);
 int host_service_host_disc_ready(void);
 int host_service_host_poll_dump(void);
+/* 1 once after a phone's app came back from the background (host_app_away, finding 227) */
+int host_service_host_came_back(void);
 void host_service_host_settings_load(void);
 int host_service_host_setting_save(uint32_t a0, uint32_t a1);
 int host_service_host_setting_locked(uint32_t a0);
@@ -198,26 +198,32 @@ void host_service_gs_present_options_apply(void);
 void host_service_gs_window_close(void);
 /* The resolution scale the pictures are drawn at (asked 0), or the one asked for (asked 1:
    DHD_SCALE's, or DHD_SCALE=window's match before the device's limit); 0 before the first
-   picture and without the native renderer (gs/gpu_rust_native.inc; PC SETTINGS shows it). */
+   picture and without the native renderer (gs/gpu_rust_native.inc; PC SETTINGS shows it).
+   asked 2: when the device is a software adapter (no graphics acceleration: the main menu's
+   graphics notice, hle/disc_notice.h, finding 262), the platform: 1 Windows, 2 macOS or iOS, 3
+   another; else 0 (the browser: always 0). */
 int host_service_gs_scale(int asked);
-/* 1 when this build offers online play: the one switch, the host's, so the core is the same on
-   every platform (finding 143). Desktop builds: 1. Android (port/net/net.c NET_OFFERED, at compile
-   time: not until phones are fast enough and the touch controls are ready) and the browser
-   (port/web/www/net.js: its CSP blocks the race server's socket): 0, and no setting turns it on.
-   At 0 the main menu has no ONLINE row, DHD_NET_* starts no online race, and the connections
-   below refuse. */
+/* The rooms this build offers, port/net/net.h's NET_OFFER_* bits: the one switch, the host's, so
+   the core is the same on every platform (finding 143). Native builds (port/net/net.c), the
+   desktop, Android and iOS: SFU and P2P rooms (finding 237). The browser (port/web/www/net.js):
+   P2P rooms only (finding 180), which need no SFU session; no setting changes it. At 0 the main menu has no
+   ONLINE row, DHD_NET_* starts no online race, and the connections below refuse. */
 int host_service_net_offered(void);
 void host_service_net_init(uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3);
-int host_service_net_create_room(void);
+/* p2p: a P2P room (finding 180), else an SFU one. */
+int host_service_net_create_room(int p2p);
 int host_service_net_join_room(uint32_t a0);
 void host_service_net_leave(void);
 void host_service_net_get_lobby(uint32_t a0);
 void host_service_net_pick(int a0, int a1, int a2);
-void host_service_net_finish(uint32_t ticks, int place);
+/* score: a scored round's points (finding 204), -1 for a race */
+void host_service_net_finish(uint32_t ticks, int place, int score);
 void host_service_net_back(void);
+void host_service_net_watch(void);  /* watch the room's running race (finding 269) */
 void host_service_net_rules(int finish_window, int next_race, int then);
 void host_service_net_rotation(uint32_t address, int count);
 void host_service_net_end_race(void);
+void host_service_net_race_go(double at);  /* the race's start moment, to the room too (finding 187) */
 void host_service_net_set_ready(int a0);
 void host_service_net_start_race(void);
 int host_service_net_racing(void);
@@ -235,8 +241,8 @@ int host_service_net_list_lobbies(uint32_t a0, int a1);
    addresses). 1 if the check began. */
 int host_service_disc_check_start(uint32_t iso, uint32_t cache);
 /* 0 working; else dhd_disc_check's answer: 1 hashed now, 2 from iso-check.txt (the game files hash
-   in digest, 32 bytes), -1 unreadable, -2 not the USA disc's files; note (size bytes) what the log
-   says. -1 when no check ran. */
+   in digest, 32 bytes), -1 unreadable, -2 not the USA disc's files, -3 stopped at exit; note (size
+   bytes) what the log says. -1 when no check ran. */
 int host_service_disc_check_poll(uint32_t digest, uint32_t note, int size);
 int host_service_net_list_lobbies_start(int max);      /* 1 if the fetch began */
 int host_service_net_list_lobbies_poll(uint32_t out, int max);  /* the lobby count, -1 failed, -2 working */
@@ -257,7 +263,6 @@ uint32_t host_service_gs_store_image(uint32_t packet, uint32_t destination, uint
 void host_service_gs_store_settle(void);
 uint64_t host_service_gs_register(unsigned reg);
 void host_service_net_set_room(uint32_t address);
-uint64_t host_service_net_hash_ranges(uint32_t address, int count);
 
 /* Graphics worker -> module mailbox. Only consume after graphics_wait. Packet
    output is {u32 path,u32 word_count,u32 words[word_count]}; snapshot is the
@@ -318,6 +323,19 @@ void host_service_text_input_begin(void);
 void host_service_text_input_end(void);
 int host_service_text_input_edit(uint32_t a0, int a1, uint32_t a2);
 int host_service_clipboard_set(uint32_t text);  /* 1 when the text is on the clipboard */
+
+/* ---- keyboard and controller bindings (port/hle/controls_settings.c, finding 157) ----
+   device: 0 the keyboard, 1 Controller 1, 2 Controller 2 (controls_table.h's CONTROL_*). */
+int host_service_controls_layout(int device, uint32_t out);  /* the layout played with into out (52 bytes); 0: none */
+int host_service_controls_pad(int player);  /* player 1's or 2's controller: its PAD_KIND_* + 1, 0 none */
+/* A change (CONTROL_ASSIGN ...) by dhd_settings' rules, saved and played with at once: CONTROL_REFUSED,
+   _UNCHANGED or _CHANGED; what the page says into message (size bytes). */
+int host_service_controls_change(int device, int edit, int target, int slot, int input, uint32_t message, int size);
+/* The wait for a key or button: command 1 begins, 0 asks (the input pressed since, -2 Esc, -1
+   nothing yet), 2: 1 while anything is still held. */
+int host_service_controls_capture(int device, int command);
+/* A controller's state (hle.h GamepadRaw, 16 bytes) through player's layout into a HostPad (tests). */
+void host_service_controls_map(int player, uint32_t raw, uint32_t out);
 void host_service_movie_start(uint32_t name, uint32_t lsn, uint32_t size, int audio, int found);
 int host_service_movie_update(int keep);
 
@@ -349,7 +367,7 @@ typedef struct {
     int32_t race_hud;      /* the race HUD was drawn since the last call, on the race screen */
     int32_t air;           /* player 1's rider is in the air */
     int32_t online;        /* an online race */
-    int32_t clock_moving;  /* the race clock advanced since the last call */
+    int32_t clock_moving;  /* the race clock advanced within the last 1.5 fields' time (finding 218) */
     int32_t pause_row[3];  /* the offline pause menu's rows of RESUME, RE-START and QUIT (-1: none) */
     int32_t fps;           /* VBLANKs a second */
     uint32_t vsync;        /* VBLANKs so far */
@@ -357,8 +375,12 @@ typedef struct {
     int32_t hud_mode;      /* out */
     int32_t leave_race;    /* out */
     int32_t freeze;        /* out */
-    int32_t reserved;
-} HostTouch;  /* 64 bytes */
+    int32_t flyover;       /* the camera's flight over the track plays (race phase 5; finding 209) */
+    int32_t movie;         /* a movie plays (the startup movies, the attract movie, VIDEO CLIPS; finding 214) */
+    int32_t replay;        /* a race's replay is the race loop (the recorder plays; finding 214) */
+    int32_t attract;       /* the title's attract demo plays (race mode 10; finding 214) */
+    int32_t menu_up;       /* a game popup is up (the replay's menu; finding 218) */
+} HostTouch;  /* 88 bytes */
 void host_service_touch_field(uint32_t state);
 
 #endif

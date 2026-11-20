@@ -47,6 +47,7 @@ void pacing_present(double due, double began) { (void)due; (void)began; }
 typedef struct TexPackEntry TexPackEntry;
 TexPackEntry *texpack_find(const Gs *g, unsigned ctxt) { (void)g; (void)ctxt; return NULL; }
 void *texpack_view(TexPackEntry *e, uint64_t field) { (void)e; (void)field; return NULL; }
+uint8_t *texpack_image(TexPackEntry *e, unsigned *w, unsigned *h) { (void)e; *w = *h = 0; return NULL; }
 void texpack_field(uint64_t field) { (void)field; }
 void texpack_report(void) {}
 
@@ -158,6 +159,9 @@ static int native_show(Native *n, DhdrSurface *surface, unsigned w, unsigned h)
 /* The display read (native_read_display) suspends here between begin and finish, so only from the
    core's calls (a promising root). */
 static int native_read_wait(void) { return web_gpu_await(); }
+
+/* A present failed: the browser's lost device has its own handling (port/render/src/web). */
+static void native_device_lost(void) {}
 
 /* A read of GS memory (gs_read_image's pages). The browser's reads are never deferred
    (port/hle/graphics.c defers only behind a memory fault guard, which wasm has not), so the Z

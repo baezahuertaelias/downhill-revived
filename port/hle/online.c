@@ -15,7 +15,7 @@
      clock and every PC starts the countdown then, so the GOs land together (the frame clock
      slips by the wait, kernel_pace_slip).
    - In the race this PC's controller rides rider 0, from the grid place the host has for this
-     player. About 20 times a second it sends a snapshot of the riders it runs (its own; the host
+     player. About 30 times a second it sends a snapshot of the riders it runs (its own; the host
      also the AI riders) as STATE frames; the other humans, and on the other PCs the AI, are
      puppets in AI rider slots (each PC at its player's frame rate, 60-240: snapshots carry race
      time, and every count here is of race ticks, 1/60 s fields, or wall time, never of frames;
@@ -24,12 +24,23 @@
    - The finish: each PC reports its rider's time, the host publishes the order once everyone has
      finished, and every PC's results screen waits for it. A player who leaves becomes the host's
      AI rider (findings 044, 047). Room finishers stay to watch until the server closes the race
-     or they choose BACK TO THE ROOM / LEAVE THE ROOM (finding 122). */
+     or they choose BACK TO THE ROOM / LEAVE THE ROOM (finding 122).
+   - Watching (finding 269): a room member outside the running race takes WATCH in the room; the
+     room sends it the race's start without a slot (NetLobby.watching). Its race loads the track with
+     every rider a puppet: its own rider slot 0 is the puppet of the racer in lobby slot 0
+     (hle_puppet_watch), so it rides nothing, sends no frame, waits for nobody's start and is in no
+     result. The camera is finding 122's from GO (on.spectator). */
 #include "hle.h"
+#include "../runtime/portable.h"
 #include "../gs/present.h"
 #include "../net/net.h"
 #include "../include/version.h"
 #include "../include/fps.h"
+#include "state_bundle.h"
+#include "mosh_round.h"
+#include "race_menu.h"
+#include "menu_page.h"
+#include "room_view.h"
 
 #include <ctype.h>
 #include <stdarg.h>
@@ -64,7 +75,7 @@ static int online_mode(void)
 {
     if (online < 0) {
         online = getenv("DHD_NET_CREATE") != NULL || getenv("DHD_NET_JOIN") != NULL;
-        if (online && !host_service_net_offered()) {  /* Android and the browser: no online yet */
+        if (online && !host_service_net_offered()) {  /* a build without online play */
             fprintf(stderr, "online: DHD_NET_CREATE / DHD_NET_JOIN ignored: this build offers no online play\n");
             online = 0;
         }
@@ -173,90 +184,10 @@ static void parse_setup(const char *text, RaceSetup *s)
     for (int i = 0; i < 4 && *end == ','; i++) s->rider[i] = (int)strtol(end + 1, &end, 0);
 }
 
-/* ---- state hashes ---- */
-
-/* The game's writable static area (.data, .sdata, .sbss, .bss: 0x0026DD00-0x008A0400, which
-   holds the rider world D_002AF2C0, the setup block, the RNG states and the pads), finding 040.
-   Words that point into the EE threads' host stacks count as 0: the game keeps pointers to stack
-   locals, whose values depend on where Windows placed the stacks (finding 041). */
-static uint32_t *copy;
-static const void *state_hash_copy(void) { return copy; }
-
-static uint64_t state_hash(int whole)
-{
-    static uint32_t stacks[64][2];
-    uint32_t start = whole ? 0 : 0x26DD00, end = whole ? 32u << 20 : 0x8A0400, n = (end - start) / 4;
-    const uint32_t *ee = EE_PTR(start);
-    int nstacks = host_stack_ranges_copy(GADDR(stacks), 64);
-    uint32_t low = UINT32_MAX, high = 0;
-    for (int k = 0; k < nstacks; k++) {
-        if (stacks[k][0] < low) low = stacks[k][0];
-        if (stacks[k][1] > high) high = stacks[k][1];
-    }
-    if (!copy && !(copy = malloc(32u << 20))) return 0;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t v = ee[i];
-        if (v >= low && v < high)
-            for (int k = 0; k < nstacks; k++)
-            if (v >= stacks[k][0] && v < stacks[k][1]) { v = 0; break; }
-        copy[i] = v;
-    }
-    NetRange r = {copy, (size_t)n * 4};
-    return host_service_net_hash_ranges(GADDR(&r), 1);
-}
-
-/* The state that decides the race, hashed every NET_HASH_PERIOD fields for DHD_HASH_LOG: the
-   rider world D_002AF2C0 (10 riders, the AI and human controllers), the four random generators
-   (libc rand's state behind D_0028191C, the twister D_00663140, the particle and weather LCGs,
-   D_0029E2C0), the menu, race phase and race clock, and the pads as the game read them. The rest
-   of the static area isn't comparable across PCs: the game copies uninitialised host stack
-   (stale host pointers, which ASLR moves) into some of it (finding 041). */
-static uint64_t game_hash(void)
-{
-    NetRange r[] = {
-        {EE_PTR(0x2AF2C0), 0x501C8},  /* rider world */
-        {EE_PTR(0x663140), 0x9C8},    /* twister */
-        {(const char *)*(void **)EE_PTR(0x28191C) + 0x58, 8},  /* rand */
-        {EE_PTR(0x29E2C0), 4}, {EE_PTR(0x29DAF8), 4}, {EE_PTR(0x29D6D0), 4},
-        {EE_PTR(MENU), 4}, {EE_PTR(PHASE), 4}, {EE_PTR(0x43EEC8), 4},
-        {EE_PTR(0x660B80), 8 * 32},   /* pads */
-    };
-    return host_service_net_hash_ranges(GADDR(r), (int)(sizeof r / sizeof *r));
-}
-
-/* DHD_HASH_LOG=file: offline, the hashes of every NET_HASH_PERIOD-th vsync from boot, for
-   comparing two runs (E4). */
-static void log_hash(uint64_t field)
-{
-    static FILE *f;
-    static int tried;
-    if (!tried++) {
-        const char *path = getenv("DHD_HASH_LOG");
-        if (path) f = fopen(path, "w");
-    }
-    if (!f || field % NET_HASH_PERIOD) return;
-    fprintf(f, "%llu menu=%d phase=%d game=%016llx static=%016llx all=%016llx\n", (unsigned long long)field,
-            EE32(MENU), EE32(PHASE), (unsigned long long)game_hash(), (unsigned long long)state_hash(0),
-            (unsigned long long)state_hash(1));
-    /* DHD_HASH_DUMP=field: the hashed (masked) 32 MB at that field, and the stacks masked */
-    const char *dump = getenv("DHD_HASH_DUMP");
-    if (dump && strtoull(dump, NULL, 10) == field) {
-        static uint32_t stacks[64][2];
-        int n = host_stack_ranges_copy(GADDR(stacks), 64);
-        char name[64];
-        snprintf(name, sizeof name, "hashdump-%llu.bin", (unsigned long long)field);
-        FILE *d = fopen(name, "wb");
-        if (d) fwrite(state_hash_copy(), 32u << 20, 1, d), fclose(d);
-        snprintf(name, sizeof name, "rawdump-%llu.bin", (unsigned long long)field);
-        if ((d = fopen(name, "wb"))) fwrite(EE_PTR(0), 32u << 20, 1, d), fclose(d);
-        for (int i = 0; i < n; i++) fprintf(f, "stack %08lx-%08lx\n", (unsigned long)stacks[i][0], (unsigned long)stacks[i][1]);
-    }
-    fflush(f);
-}
-
 /* ---- online ---- */
 
 void hle_puppet_online(int local, int nslots, int host);
+void hle_puppet_watch(int on);
 void hle_puppet_offline(void);
 void hle_puppet_drop(int lobby, int host, int finished);
 int hle_puppet_pack(int slot, uint8_t *out, int max);
@@ -267,6 +198,8 @@ int hle_puppet_lag(char *out, int size);
 int hle_puppet_hits_taken(void);
 int hle_puppet_global(int slot), hle_puppet_local(int global), hle_puppet_owned(int slot);
 void hle_puppet_start(void);
+void hle_puppet_go(double go_server_ms);
+double hle_puppet_clock_excess(void);
 extern int func_001FA7C0(int frame);                      /* a frame's own colour (the shop's first BIKE COLOR) */
 extern void func_001B45F8(void *timer, int kind, int ticks);  /* the race-end countdown */
 
@@ -276,9 +209,11 @@ enum {
     EVENT_VERSION = 2, EVENT_HIT = 1, EVENT_LOADED = 2, EVENT_SETUP = 3, EVENT_START = 4, EVENT_GO = 5,
     EVENT_FINISH = 6, EVENT_RESULTS = 7, EVENT_PICKUP = 9  /* 8 was 0.7.3's rematch (TRY AGAIN / NEW LEVEL in the race) */
 };
-enum { SNAPSHOT_TICKS = 3 };  /* a snapshot every 3 race ticks: 20 a second at any frame rate */
+/* Snapshots: this PC's own rider every race tick (60 a second at any frame rate), the AI riders it
+   runs every AI_SNAPSHOT_TICKS (30 a second; finding 169). */
+enum { AI_SNAPSHOT_TICKS = 2 };
 enum { NRIDERS = 10, START_LEAD_MS = 1500 };
-_Static_assert(2 + NRIDERS * 256 <= NET_FRAME_MAX, "all owned riders fit one STATE frame");
+_Static_assert(2 + STATE_BUNDLE_MAX <= NET_FRAME_MAX, "a STATE bundle fits one frame");
 #define RACE_CLOCK EE32(0x43EEC8)
 /* The race object D_0043EEC0 (func_0019F210): +8 the race clock, +0x1C finish times (race ticks)
    and +0x58 finished flags by rider slot, +0x62 finishes to apply on the next step. */
@@ -305,7 +240,8 @@ typedef struct {
 
 static struct {
     int released;               /* past the barrier */
-    int setup_done, started;    /* the setup block written; past the start wait */
+    int setup_done, started;    /* the rides exchanged (the load screen may go on); past the start wait */
+    double rides_entered, rides_said; /* the ride exchange (exchange_step): began, last said */
     RaceSetup setup;
     int nslots, local_slot, host_slot;
     char code[8];
@@ -322,8 +258,9 @@ static struct {
        moment; the players it still waits for (start_waiting: the first) */
     double start_entered, start_said;
     int start_announced, start_missing, start_waiting;
-    int last_sent;              /* race clock of the last snapshot sent */
-    unsigned sent, received;
+    int last_sent, last_ai_sent; /* race clock of the last snapshots sent: this PC's rider, the AI */
+    unsigned sent, received;    /* rider snapshots */
+    unsigned bundles_sent;      /* STATE messages (bundles) */
     /* the finish (global rider ids: humans 0..nslots-1, AI riders their slot) */
     int finish[NRIDERS];        /* race ticks, -1: not finished */
     int reported[NRIDERS];
@@ -342,9 +279,24 @@ static struct {
     const char *leave_reason;
     int end_held, end_done;     /* the race-end countdown, held for the results */
     int no_bots;                /* the room's computer riders off (its "laps" option 1) */
+    int spectator;              /* this PC watches the race (finding 269): local_slot -1, no rider of its own */
     int cheats;                 /* the room's cheat codes on (option 2; off: hle_cheat_code) */
     double end_done_at;
     double end_held_at;
+    /* the arena's scored round (finding 204): this race is one; each rider's score by global id
+       (its owner's; this PC's own riders' as last sent); this PC's two minutes ran out; the table
+       stands; the results screen came up */
+    int mosh;
+    MoshScore score[NRIDERS];
+    MoshScore table[NRIDERS];   /* the published table: score as it was when the table stood, then fixed (221) */
+    int round_over, table_done;
+    double round_over_at, results_at;
+    /* the room race's results screen (finding 271): since when, the pad's buttons and the mouse's
+       presses it has seen, and READY pressed on it */
+    double results_from;
+    uint16_t results_buttons;
+    unsigned results_clicks;
+    int results_ready, results_ended, results_watcher;
 } on;
 
 static void title(const char *fmt, ...)
@@ -424,8 +376,8 @@ static void connect_lobby(void)
     host_service_net_init(GADDR(server), GADDR(name && *name ? name : "Rider"), GADDR(version), GADDR(iso));
     if (join && *join) {
         if (host_service_net_join_room(GADDR(join)) < 0) fail("that join code can't be one (6 letters and digits).");
-    } else
-        host_service_net_create_room();
+    } else  /* DHD_NET_CREATE=p2p: a P2P room (findings 180, 186) */
+        host_service_net_create_room(!strcmp(getenv("DHD_NET_CREATE") ? getenv("DHD_NET_CREATE") : "", "p2p"));
     fprintf(stderr, "online: %s, version %s\n", join && *join ? "joining" : "creating a room", version);
 }
 
@@ -494,12 +446,14 @@ static void barrier(void)
         if (lobby.state == NET_FAILED)
             fail(lobby.error[0] ? lobby.error : "the connection to the server failed.");
         if (lobby.state == NET_LOBBY || lobby.state == NET_RACING) {
-            if (!ready_sent) fprintf(stderr, "online: room %s%s\n", lobby.code, lobby.is_host ? " (host)" : "");
+            if (!ready_sent) fprintf(stderr, "online: room %s%s\n", net_log_code(lobby.code).text, lobby.is_host ? " (host)" : "");
             if (lobby.is_host && !settings_sent) {
                 const char *track = getenv("DHD_NET_TRACK"), *room = getenv("DHD_NET_ROOM_NAME");
-                /* DHD_NET_CHEATS=1 (tests): the room's cheats on (options bit 2) */
-                NetRoomSettings s = {track && *track ? atoi(track) : 0, getenv("DHD_NET_CHEATS") ? 2 : -1,
-                                     getenv("DHD_NET_PUBLIC") != NULL, 4, -1, room && *room ? room : NULL};
+                /* tests: DHD_NET_CHEATS=1 the room's cheats on (options bit 2), DHD_NET_NO_AI=1 its
+                   computer riders off (bit 1) */
+                int options = (getenv("DHD_NET_CHEATS") ? 2 : 0) | (getenv("DHD_NET_NO_AI") ? 1 : 0);
+                NetRoomSettings s = {track && *track ? atoi(track) : 0, options ? options : -1,
+                                     getenv("DHD_NET_PUBLIC") != NULL, expected > 4 ? expected : 4, -1, room && *room ? room : NULL};
                 host_service_net_set_room(GADDR(&s));
                 settings_sent = 1;
             }
@@ -550,16 +504,18 @@ static void barrier(void)
     kernel_pace_slip(host_wall_seconds() - entered);  /* the lobby wait isn't game time to catch up */
     /* a room's race can have one rider (START NOW with only them ready): no other player then */
     on.nslots = lobby.nslots < 1 ? 1 : lobby.nslots > NET_MAX_SLOTS ? NET_MAX_SLOTS : lobby.nslots;
-    on.local_slot = lobby.local_slot;
+    on.spectator = from_menu && lobby.watching;
+    on.local_slot = on.spectator ? -1 : lobby.local_slot;
     on.host_slot = 0;
     for (int i = 0; i < lobby.nslots; i++)
         if (lobby.racer[i].member_id == lobby.host_id) on.host_slot = i;
     memcpy(on.code, lobby.code, sizeof on.code);
     choose_riders(&lobby);
     on.setup.track = lobby.race_track;
+    on.mosh = lobby.race_track == MOSH_TRACK && lobby.server_scores;  /* finding 204 */
     on.no_bots = lobby.race_laps & 1;
     on.cheats = (lobby.race_laps & 2) != 0;
-    on.setup.rider[0] = on.pick[on.local_slot];
+    on.setup.rider[0] = on.pick[on.spectator ? 0 : on.local_slot];  /* a watcher's slot 0 shows player 0 */
     for (int i = 1; i < 4; i++) on.setup.rider[i] = -1;
     for (int i = 0; i < NRIDERS; i++) on.finish[i] = -1;
     char seed[16];
@@ -567,20 +523,27 @@ static void barrier(void)
     set_env("DHD_NAV", race_script);
     snprintf(seed, sizeof seed, "%u", lobby.race_seed ? lobby.race_seed : 1u);
     set_env("DHD_RACE_SEED", seed);  /* hle_race_seed: never 0, which falls back to the RTC */
+    hle_puppet_watch(on.spectator);
     hle_puppet_online(on.local_slot, on.nslots, on.host_slot);
-    fprintf(stderr, "online: race starts: player %d of %d, track %d, seed %s%s, cheats %s\n", on.local_slot, on.nslots,
-            on.setup.track, seed, on.no_bots ? ", no computer riders" : "", on.cheats ? "on" : "off");
+    if (on.spectator) fprintf(stderr, "online: watching the room's race: %d racers, no rider of this PC's own\n", on.nslots);
+    fprintf(stderr, "online: race starts: player %d of %d, track %d, seed %s%s, cheats %s%s\n", on.local_slot, on.nslots,
+            on.setup.track, seed, on.no_bots ? ", no computer riders" : "", on.cheats ? "on" : "off",
+            on.mosh ? ", the arena's round (Mosh Bowl, scored)" : "");
     log_pings(&lobby);
 }
 
 static void send_event(const void *payload, int n)
 {
+    if (on.spectator) return;  /* a watcher says nothing to the racers (finding 269) */
     if (!host_service_net_send_frame(NET_FRAME_EVENT, GADDR(payload), (size_t)n))
         fprintf(stderr, "online: an event (type %d) could not be sent\n", ((const uint8_t *)payload)[1]);
 }
 
 static void put32(uint8_t *o, int32_t v) { memcpy(o, &v, 4); }
 static int32_t get32(const uint8_t *i) { int32_t v; memcpy(&v, i, 4); return v; }
+
+#include "online_start.h"
+#include "online_end.h"
 
 /* Pickup pool: retail allocates 150 entries in level-file order (001961D8).
    Only the index travels, never a pointer. Type, track and exact spawn xyz guard it. */
@@ -654,6 +617,7 @@ static void go_skew(int player)
 
 static void read_finish(int global, int time);
 static void read_results(const uint8_t *in, int n);
+static void receive_score(int sender, const uint8_t *e, int n);
 
 /* The relayed frames: snapshots to the puppets, events (a hit, the start, a finish, the results). */
 static void receive_frames(void)
@@ -663,11 +627,9 @@ static void receive_frames(void)
     while ((n = host_service_net_receive_frame(GADDR(frame), sizeof frame)) > 0) {
         int sender = frame[1];
         const uint8_t *e = frame + 2;
-        if (frame[0] == NET_FRAME_STATE) {  /* the sender's riders: [size][snapshot]... */
-            for (const uint8_t *end = frame + n; e < end && e + 1 + e[0] <= end; e += 1 + e[0]) {
-                hle_puppet_receive(sender, e + 1, e[0]);
-                on.received++;
-            }
+        if (frame[0] == NET_FRAME_STATE) {
+            hle_puppet_receive(sender, e, n - 2);
+            on.received++;
             continue;
         }
         if (frame[0] != NET_FRAME_EVENT || n < 4 || e[0] != EVENT_VERSION || sender >= NET_MAX_SLOTS) continue;
@@ -679,8 +641,8 @@ static void receive_frames(void)
             if (!on.loaded[sender]++) fprintf(stderr, "online: player %d has loaded (at %.1f s)\n", sender, host_wall_seconds());
             break;
         case EVENT_SETUP:
-            if (n - 2 >= 30) {
-                Ride *r = &on.ride[sender];
+            if (n - 2 >= 30) {  /* said again every half second (send_ride): logged when new or changed */
+                Ride *r = &on.ride[sender], was = *r;
                 r->rider = get32(e + 2);
                 for (int k = 0; k < 3; k++) r->outfit[k] = get32(e + 6 + 4 * k), r->bike[k] = get32(e + 18 + 4 * k);
                 r->colour = n - 2 >= 34 ? (int32_t)get32(e + 30) : -1;
@@ -688,8 +650,9 @@ static void receive_frames(void)
                    takes the frame's own (-1), so a bad value can't index the game's tables */
                 if (r->colour < -1 || r->colour > 15) r->colour = -1;
                 r->have = 1;
-                fprintf(stderr, "online: player %d rides %X (%d %d %d), bike %d %d %d, colour %d\n", sender, r->rider,
-                        r->outfit[0], r->outfit[1], r->outfit[2], r->bike[0], r->bike[1], r->bike[2], r->colour);
+                if (memcmp(&was, r, sizeof was))
+                    fprintf(stderr, "online: player %d rides %X (%d %d %d), bike %d %d %d, colour %d\n", sender, r->rider,
+                            r->outfit[0], r->outfit[1], r->outfit[2], r->bike[0], r->bike[1], r->bike[2], r->colour);
             }
             break;
         case EVENT_START:
@@ -706,6 +669,9 @@ static void receive_frames(void)
             break;
         case EVENT_RESULTS:
             if (sender == on.host_slot) read_results(e, n - 2);
+            break;
+        case SCORE_EVENT_TYPE:
+            receive_score(sender, e, n - 2);
             break;
         default:  /* EVENT_HIT */
             hle_puppet_event(sender, e, n - 2);
@@ -735,36 +701,104 @@ static void default_bike(int rider, int32_t bike[3])
     }
 }
 
-/* On the load screen, before the race build: the setup block as this PC's menus left it, with
-   the lobby's track and this player's rider; then every PC tells the others what its player
-   rides, and waits for theirs (at most 30 s). */
-static void exchange_rides(void)
+/* This PC's ride, as its setup block has it on the load screen (exchange_step). */
+static void send_ride(void)
 {
+    if (on.local_slot < 0) return;  /* a watcher rides nothing */
     uint8_t e[34] = {EVENT_VERSION, EVENT_SETUP};  /* 34 since finding 128: the colour last */
-    Ride *own = &on.ride[on.local_slot];
-    double entered = host_wall_seconds();
-    own->rider = EE32(SETUP + 0x290);
-    for (int k = 0; k < 3; k++) own->outfit[k] = EE32(SETUP + 0x1B8 + 4 * k), own->bike[k] = EE32(SETUP + 0x11C + 4 * k);
-    own->colour = EE32(SETUP + 0x254);
-    own->have = 1;
+    const Ride *own = &on.ride[on.local_slot];
     put32(e + 2, own->rider);
     for (int k = 0; k < 3; k++) put32(e + 6 + 4 * k, own->outfit[k]), put32(e + 18 + 4 * k, own->bike[k]);
     put32(e + 30, own->colour);
     send_event(e, sizeof e);
-    for (;;) {
-        NetLobby lobby;
-        host_service_net_get_lobby(GADDR(&lobby));
-        receive_frames();
-        int missing = 0;
-        for (int i = 0; i < on.nslots; i++)
-            if (!lobby.racer[i].left && !on.ride[i].have) missing++;
-        if (!missing || !host_service_net_racing() || host_wall_seconds() - entered > 30) break;
+}
+
+/* The ride of the racer in lobby slot 0 as this watcher's own rider (its slot 0 is that racer's
+   puppet), in the setup block (or the race build's copy of it, hle_online_riders): rider id, outfit,
+   bike, colour. A ride not received: the lobby pick on its default bike. */
+static void watch_ride_write(uint8_t *g)
+{
+    const Ride *r = &on.ride[0];
+    int32_t id = r->have ? r->rider : 0x20 * (on.pick[0] + 1), bike[3];
+    if (r->have) memcpy(bike, r->bike, sizeof bike);
+    else default_bike(id, bike);
+    *(int32_t *)(g + 0x290) = id;
+    for (int k = 0; k < 3; k++) {
+        *(int32_t *)(g + 0x1B8 + 4 * k) = r->have ? r->outfit[k] : 0;
+        *(int32_t *)(g + 0x11C + 4 * k) = bike[k];
+    }
+    *(int32_t *)(g + 0x1B8) = id / 32 - 1;
+    *(int32_t *)(g + 0x254) = r->have && r->colour >= 0 ? r->colour : func_001FA7C0(bike[0]);
+}
+
+/* A watcher's load screen (finding 269): the racers exchanged their rides long ago; while the room
+   lists a watcher each racer says its own again once a second (state_sync). Waits for them at most
+   WATCH_RIDES_WAIT seconds (a racer whose word is lost rides its lobby pick), sends nothing.
+   1: done. */
+enum { WATCH_RIDES_WAIT = 5 };
+static int watch_rides(double now)
+{
+    if (!on.rides_entered) on.rides_entered = now;
+    NetLobby lobby;
+    host_service_net_get_lobby(GADDR(&lobby));
+    receive_frames();
+    int missing = 0;
+    for (int i = 0; i < on.nslots; i++)
+        if (!lobby.racer[i].left && !on.ride[i].have) missing++;
+    if (missing && host_service_net_racing() && now - on.rides_entered <= WATCH_RIDES_WAIT) {
+        title("Downhill Revived online - room %s - watching: waiting for %d rider%s", on.code, missing, missing == 1 ? "" : "s");
+        return 0;
+    }
+    if (missing) fprintf(stderr, "online: watching: %d racer%s ride never came: lobby picks for them\n", missing,
+                         missing == 1 ? "'s" : "s'");
+    watch_ride_write(EE_PTR(SETUP));
+    fprintf(stderr, "online: watching: the rides came %.1f s after the load screen\n", now - on.rides_entered);
+    return 1;
+}
+
+/* On the load screen, before the race build: the setup block as this PC's menus left it, with
+   the lobby's track and this player's rider; then every PC tells the others what its player
+   rides, and waits for theirs (at most 30 s). One step a field (pads_begin_field): the load
+   screen stays on the screen, held where it is (hle_online_load_hold), so a game that waits for a
+   slower one goes on drawing (finding 238; before, a loop here stopped the game's fields, and the
+   freeze watch saw a hang). The ride is said again every half second, here and at the start
+   (start_step), as LOADED is: a message sent once is lost when it comes before the other game
+   reads its frames (the 0.8.3 room check lost one, and its host waited out the 30 s). 1: done. */
+static int exchange_step(void)
+{
+    double now = host_wall_seconds();
+    if (on.spectator) return watch_rides(now);
+    if (!on.rides_entered) {
+        Ride *own = &on.ride[on.local_slot];
+        own->rider = EE32(SETUP + 0x290);
+        for (int k = 0; k < 3; k++) own->outfit[k] = EE32(SETUP + 0x1B8 + 4 * k), own->bike[k] = EE32(SETUP + 0x11C + 4 * k);
+        own->colour = EE32(SETUP + 0x254);
+        own->have = 1;
+        on.rides_entered = now, on.rides_said = -1;
+    }
+    if (now - on.rides_said >= 0.5) on.rides_said = now, send_ride();
+    NetLobby lobby;
+    host_service_net_get_lobby(GADDR(&lobby));
+    receive_frames();
+    int missing = 0;
+    for (int i = 0; i < on.nslots; i++)
+        if (!lobby.racer[i].left && !on.ride[i].have) missing++;
+    if (missing && host_service_net_racing() && now - on.rides_entered <= 30) {
         title("Downhill Revived online - room %s - waiting for %d player%s riders", on.code, missing,
               missing == 1 ? "'s" : "s'");
-        host_service_gs_pump_messages();
-        host_sleep_ms(5);
+        return 0;
     }
-    kernel_pace_slip(host_wall_seconds() - entered);
+    if (missing) fprintf(stderr, "online: %d player%s ride never came: default riders for them\n", missing,
+                         missing == 1 ? "'s" : "s'");
+    fprintf(stderr, "online: the rides exchanged %.1f s after the load screen came\n", now - on.rides_entered);
+    return 1;
+}
+
+/* func_001F43C0 (the load screen, menu 9), each field: 1 holds its count where it is, and the
+   shell on it, so the race build waits for the rides (exchange_step) with the screen drawn. */
+int hle_online_load_hold(void)
+{
+    return online_mode() && !on.setup_done && EE32(MENU) == LOAD_MENU;
 }
 
 /* func_001B89C8's AI count for this PC's one-player race (patched there): online the other
@@ -793,6 +827,7 @@ void hle_online_riders(void *game)
 {
     if (!online_mode() || !on.released) return;
     uint8_t *g = game;
+    if (on.spectator) watch_ride_write(g);  /* slot 0: player 0's puppet (finding 269) */
     int used[16] = {0}, next = 0;
     for (int j = 0; j < on.nslots; j++) used[on.ride[j].have ? (on.ride[j].rider / 32 - 1) & 15 : on.pick[j]] = 1;
     while (next < 10 && regular[next] != *(int32_t *)(g + 0x368) / 32 - 1) next++;
@@ -840,7 +875,10 @@ void hle_online_riders(void *game)
    moment on the server's clock and every PC holds the countdown until then, so the GOs land
    within a frame or two of each other on every PC. Both are said again every half second: the PC
    that loads first can be here before another has set up its race, which would drop a single
-   message, and the start would wait 60 s.
+   message, and the start would wait 60 s. The moment goes to the room too, which sends it to the
+   racers (finding 187): a PC whose race link brings nothing still starts with the others. A host
+   that left before naming it hands that to the lowest slot still racing (online_start.h). With no
+   moment 75 s after it came here, a PC leaves the race: it never races alone.
    One step a field (pads_begin_field): the game goes on drawing while it waits, its countdown held
    where it is (hle_online_countdown_hold) and the wait on the screen (hle_online_hud). A PC that
    skipped the flight over the track waits so for one still watching it. The step whose field the
@@ -849,15 +887,24 @@ void hle_online_riders(void *game)
 static int start_step(void)
 {
     static const uint8_t loaded[2] = {EVENT_VERSION, EVENT_LOADED};
-    int host = on.local_slot == on.host_slot;
+    if (on.spectator) {  /* the race runs already: the countdown at once, held for nobody (finding 269) */
+        kernel_pace_shared(1);
+        hle_puppet_start();
+        fprintf(stderr, "online: watching: the countdown starts at once\n");
+        return 1;
+    }
     if (!on.start_entered) {
         on.start_entered = host_wall_seconds(), on.start_said = -1;
         fprintf(stderr, "online: loaded at %.1f s, waiting for the others\n", on.start_entered);
     }
     NetLobby lobby;
     host_service_net_get_lobby(GADDR(&lobby));
+    int left[NET_MAX_SLOTS] = {0}, nslots = lobby.nslots < NET_MAX_SLOTS ? lobby.nslots : NET_MAX_SLOTS;
+    for (int i = 0; i < nslots; i++) left[i] = lobby.racer[i].left;
+    int host = on.local_slot == start_namer(on.host_slot, left, nslots);
     if (host_wall_seconds() - on.start_said >= 0.5) {
         on.start_said = host_wall_seconds();
+        send_ride();  /* for a game still at its load screen that missed it (exchange_step) */
         send_event(loaded, sizeof loaded);
         if (on.start_announced) {
             uint8_t e[10] = {EVENT_VERSION, EVENT_START};
@@ -873,16 +920,31 @@ static int start_step(void)
         }
     on.start_missing = missing;
     double waited = host_wall_seconds() - on.start_entered;
-    int go = !host_service_net_racing() || waited > 75;
-    if (!go && host && !on.start_announced && (!missing || waited > 60)) {
+    int racing = host_service_net_racing();
+    if (!on.go_at && lobby.race_go_at > 0) {
+        on.go_at = lobby.race_go_at;
+        fprintf(stderr, "online: the start moment came from the room (none over the race link), %+.1f ms from now\n",
+                on.go_at - host_service_net_server_ms());
+    }
+    /* a namer that took over from a host gone after naming it keeps that moment */
+    if (racing && host && !on.start_announced && !on.go_at && (!missing || waited > START_NAME_AFTER_S)) {
         uint8_t e[10] = {EVENT_VERSION, EVENT_START};
         on.go_at = host_service_net_server_ms() + START_LEAD_MS;
         memcpy(e + 2, &on.go_at, 8);
         send_event(e, sizeof e);
+        host_service_net_race_go(on.go_at);
         on.start_announced = 1;
         if (missing) fprintf(stderr, "online: %d player%s never said they loaded: starting without waiting\n",
                              missing, missing == 1 ? "" : "s");
     }
+    int rule = start_rule(racing, waited, on.go_at != 0);
+    if (rule == START_LEAVE) {
+        fprintf(stderr, "online: no start moment from the others %.1f s after loading: out of the race, not alone\n", waited);
+        on.leave_reason = "NO START FROM THE OTHERS";
+        host_service_net_back();  /* the room's next snapshot has this PC out; the race screen leaves */
+        rule = START_GO;
+    }
+    int go = rule == START_GO;
     if (!go && on.go_at && on.go_at - host_service_net_server_ms() < 1000 * port_frame_period() + 5) {
         while (host_service_net_server_ms() < on.go_at) host_sleep_ms(0);
         go = 1;
@@ -918,10 +980,14 @@ void func_0020F9F0(int font, int view, int x, int y, const char *text);
    (func_001B4900: the race loop ends with 2 and the race screen opens its pause menu), whose
    builder then leaves the race screen at once as QUIT's Yes does (port_online_pause_rows). While
    the race loop runs, after a finish too, no menu opens: func_0015E0C0 alone or a pushed menu
-   does nothing there. Paused already, the menu opens again when the player resumes. */
+   does nothing there. Paused already, the loop's stop was taken by that pause (func_001B45F8 takes
+   one until the loop runs again), so the request is made again on the loop's first frame after
+   RESUME (hle_online_loop_frame): the menu opens again and leaves at once (finding 165). */
 static int quit_on_pause;
+static double left_at;  /* wall time of the request: the front end's load is the time until race_left */
 static void leave_race(void)
 {
+    left_at = host_wall_seconds();
     quit_on_pause = 1;
     EE32(0x3F52D0 + 0x130) = 0;  /* the pad that paused (D_003F52D0.x130): this PC's */
     func_001B45F8(EE_PTR(0x4B1F40), 2, 0);
@@ -965,9 +1031,14 @@ static const NetMember *self_member(const NetLobby *l)
    finishEndsAt), its last 10 s large; then why this PC's race ends (on.leave_reason). */
 static void race_banner(int view)
 {
-    if (!on.started || !from_menu) return;
+    if (!on.started || !from_menu || on.results_from) return;
     if (on.leave_reason) {
         hud_text(view, 96, 2, 128, 40, 40, on.leave_reason);
+        return;
+    }
+    if (on.mosh) {  /* the round's clock is the HUD's; the others end theirs within moments */
+        if (on.round_over && !on.table_done && host_wall_seconds() - on.round_over_at > 1)
+            hud_text(view, 150, 1, 128, 128, 128, "TIME UP - WAITING FOR THE OTHERS...");
         return;
     }
     NetLobby lobby;
@@ -992,7 +1063,7 @@ static void race_banner(int view)
     double ms = lobby.finish_ends_at - host_service_net_server_ms();
     int left = ms > 0 ? (int)((ms + 999) / 1000) : 0;
     if (left <= 0) {
-        hud_text(view, 96, 2, 128, 40, 40, FINISHED(0) ? "TIME UP" : "TIME UP - DNF");
+        hud_text(view, 96, 2, 128, 40, 40, FINISHED(0) || on.spectator ? "TIME UP" : "TIME UP - DNF");
         return;
     }
     snprintf(text, sizeof text, "%s - RACE ENDS IN %d:%02d", who, left / 60, left % 60);
@@ -1007,12 +1078,18 @@ static const char *rider_label(int global, char *out, int size);
 
 /* The view-0 HUD describes this PC's rider: hidden once the camera watches another (its finish
    place still shows for the first seconds). */
-int hle_online_watch_hud(void) { return online_mode() && from_menu && on.end_held && on.watched; }
+int hle_online_watch_hud(void) { return online_mode() && from_menu && ((on.end_held && on.watched) || on.results_from); }
 
+static void race_menu_draw(int view);
+static void results_draw(int view);
+static RaceMenu race_menu;
 void hle_online_hud(int view)
 {
     if (online_mode()) race_banner(view);
-    if (online_mode() && from_menu && on.end_held && on.watch_slot) {
+    if (online_mode() && race_menu.open && view == 0) race_menu_draw(view);
+    if (online_mode() && from_menu && on.results_from && view == 0) results_draw(view);
+    if (online_mode() && from_menu && on.end_held && (on.watch_slot > 0 || (on.spectator && on.watch_slot == 0)) &&
+        !on.results_from) {
         char name[48], text[96];
         rider_label(hle_puppet_global(on.watch_slot), name, sizeof name);
         snprintf(text, sizeof text, "WATCHING %s", name);
@@ -1093,6 +1170,7 @@ int hle_online_race_end(int ticks)
 {
     (void)ticks;
     if (!online_mode() || !on.started || (!from_menu && on.have_results)) return 0;
+    if (on.spectator) return 1;  /* the watched player 0's puppet crossed the line: nothing of this PC's */
     on.end_held = 1, on.end_held_at = host_wall_seconds();
     fprintf(stderr, "online: finished; the results screen waits for the others (camera mode %d)\n",
             EE32(0x37EA60 + 0x2B8));
@@ -1108,8 +1186,19 @@ static void finish_step(void)
     if (!race_running()) return;
     static double test_finish = -1;  /* DHD_NET_TEST_FINISH=seconds: tests, this PC's rider finishes then */
     if (test_finish < 0) test_finish = getenv("DHD_NET_TEST_FINISH") ? atof(getenv("DHD_NET_TEST_FINISH")) : 0;
-    if (test_finish > 0 && RACE_CLOCK > test_finish * 60 && !FINISHED(0) && !FINISH_NOW(0)) FINISH_NOW(0) = 1;
+    if (test_finish > 0 && !on.mosh && RACE_CLOCK > test_finish * 60 && !FINISHED(0) && !FINISH_NOW(0)) FINISH_NOW(0) = 1;
     int riders = hle_online_race_riders();
+    if (on.spectator) {
+        /* a watcher (finding 269) missed the finishes before it came: the room's snapshot has the
+           racers' (their race ticks, as EVENT_FINISH carries them) */
+        NetLobby lobby;
+        host_service_net_get_lobby(GADDR(&lobby));
+        for (int j = 0; j < on.nslots; j++)
+            for (int i = 0; i < lobby.nmembers; i++)
+                if (lobby.member[i].id == lobby.racer[j].member_id && !strcmp(lobby.member[i].race_state, "finished") &&
+                    lobby.member[i].finish_ticks >= 0 && lobby.member[i].finish_ticks < 0x7FFFFFFF)
+                    read_finish(j, (int)lobby.member[i].finish_ticks);
+    }
     for (int slot = 0; slot < riders; slot++) {
         int global = hle_puppet_global(slot);
         if (hle_puppet_owned(slot)) {
@@ -1120,11 +1209,12 @@ static void finish_step(void)
                 on.reported[global] = 1;
                 read_finish(global, FINISH_TIME(slot));
                 /* this PC's own rider, in a room: its time and place for the room's results */
-                if (slot == 0 && from_menu) host_service_net_finish((uint32_t)FINISH_TIME(0), PLACE(0));
+                if (slot == 0 && from_menu) host_service_net_finish((uint32_t)FINISH_TIME(0), PLACE(0), -1);
             }
         } else if (on.finish[global] >= 0) {
+            /* a watcher's race clock started late: a finish it hears of is over at once */
             if (FINISHED(slot)) FINISH_TIME(slot) = on.finish[global];
-            else if (RACE_CLOCK > on.finish[global] + 60 && !FINISH_NOW(slot)) FINISH_NOW(slot) = 1;
+            else if ((on.spectator || RACE_CLOCK > on.finish[global] + 60) && !FINISH_NOW(slot)) FINISH_NOW(slot) = 1;
         }
     }
     if (on.local_slot != on.host_slot || on.have_results || !on.first_finish) return;
@@ -1150,12 +1240,265 @@ static void finish_step(void)
     read_results(e, 3 + 5 * riders);
 }
 
+
+/* ---- the arena's scored round (finding 204) ----
+   An online race on the Mosh Pit arena runs by the game's own Mosh Bowl rules (mode 15, the timed
+   variant): two minutes from each game's own GO (func_001B7198 sets D_004B1F40[0] to 7200 ticks,
+   func_001B4718 counts it down in the race phases), the HUD the mode's own (func_001772B0: the
+   time left; func_00177F80: this rider's points), points for every hit dealt (func_001301E0, by
+   the attack: punch 50, kick 100, check 200, stick 300, bottle 400), every hit a crash
+   (func_0012E940), hits taken counted, and at the end the mode's COMBAT RESULTS
+   (func_00160A48: by points, with the hits taken). Each rider's score belongs to the PC that runs
+   it and travels as an EVENT (mosh_round.h); the round's table is a rule on those numbers, so it
+   is the same on every screen, and in the room, which ranks the humans' finishes by the score
+   each game reports for its own player. A room whose server does not rank by score (an older
+   one) races the arena as before (Single Event, no finish). */
+enum { MOSH_TABLE_WAIT = 15, MOSH_RESULTS_HOLD = 15 };
+#define RIDER_POINTS(slot) ((float *)(RIDER(slot) + 0x7AC8))  /* five counts, func_001301B8 sums them */
+#define RIDER_HITS(slot) (*(int32_t *)(RIDER(slot) + 0x79AC))  /* hits taken */
+void func_001301E0(void *rider, int kind);  /* the attacker's points for a hit of this kind (0-4) */
+
+static void mosh_read(int slot, MoshScore *s)
+{
+    memset(s, 0, sizeof *s);
+    for (int k = 0; k < 5; k++) {
+        float v = RIDER_POINTS(slot)[k];
+        s->part[k] = v >= MOSH_MAX_SCORE ? MOSH_MAX_SCORE : v > 0 ? (uint32_t)v : 0;
+    }
+    int hits = RIDER_HITS(slot);
+    s->hits = (uint16_t)(hits < 0 ? 0 : hits > 65535 ? 65535 : hits);
+    s->known = 1;
+}
+
+static void mosh_write(int slot, const MoshScore *s)
+{
+    for (int k = 0; k < 5; k++) RIDER_POINTS(slot)[k] = (float)s->part[k];
+    RIDER_HITS(slot) = s->hits;
+}
+
+static void mosh_send(int global, const MoshScore *s)
+{
+    uint8_t e[SCORE_EVENT_SIZE];
+    char name[48];
+    score_encode(e, global, s);
+    send_event(e, sizeof e);
+    if (s->final)
+        fprintf(stderr, "online: round: %s's final score %u, %u hits taken (sent)\n", rider_label(global, name, sizeof name),
+                mosh_points(s), s->hits);
+}
+
+/* A score EVENT: from the rider's owner, or for a player's own rider from that player's PC, whose
+   final can arrive after the room said it left (and the host took the rider over: its own final
+   then is the rider's takeover final). Two finals for one rider never go by arrival order: the
+   player's own final wins over a takeover owner's, a later takeover owner's over an earlier one's
+   (mosh_take, finding 221). */
+static void receive_score(int sender, const uint8_t *e, int n)
+{
+    int global;
+    MoshScore s;
+    char name[48];
+    if (!on.mosh || !score_decode(e, n, &global, &s) || global >= hle_online_race_riders()) return;
+    int own_player = global < on.nslots && global == sender;
+    if (hle_puppet_owner(global) != sender && !own_player) return;
+    if (hle_puppet_owner(global) == on.local_slot && !(own_player && s.final)) return;  /* this PC's numbers */
+    if (mosh_take(&on.score[global], &s, sender, own_player) && s.final)
+        fprintf(stderr, "online: round: %s's final score %u, %u hits taken (from player %d)\n",
+                rider_label(global, name, sizeof name), mosh_points(&s), s.hits, sender);
+}
+
+/* puppet.c hle_puppet_hit: a rider this PC runs (attacker) hit a puppet (victim) as this PC shows
+   it; the hit itself goes to the victim's PC, which applies it (func_0012E940) and counts it there.
+   The attacker's points are its own PC's: the game's own func_001301E0, as func_0012E940 gives
+   them, unless the game would not take the hit (the victim crashing, or +0x7BB6: its first
+   returns). Only for a rider this PC owns (a rider whose owner has sent no snapshot yet is no
+   puppet here, but its points are still its owner's), and only in the arena's round: elsewhere
+   online hits score as before. */
+void hle_online_hit_dealt(void *attacker, void *victim, int kind)
+{
+    if (!online_mode() || !on.mosh || !on.started || on.round_over || !race_running()) return;
+    int slot = 0, riders = hle_online_race_riders();
+    while (slot < riders && (void *)RIDER(slot) != attacker) slot++;
+    if (slot == riders || !hle_puppet_owned(slot)) return;
+    uint8_t *v = victim;
+    if ((*(uint32_t *)(v + 0x4098) >> 2 & 1) || v[0x7BB6]) return;
+    func_001301E0(attacker, kind >= 0 && kind <= 9 ? kind % 5 : 0);
+}
+
+/* The patched func_001B4718 at the round's end on this PC (its timer ran out; the game has put its
+   end message on the HUD): 1 holds the game's own end (the results 120 ticks later) until every
+   rider's final score is here (mosh_step). Offline and in other modes 0: the game's own. */
+int hle_online_round_end(void)
+{
+    if (!online_mode() || !on.started || !on.mosh) return 0;
+    if (!on.round_over) {
+        on.round_over = 1, on.round_over_at = host_wall_seconds();
+        on.end_held = 1, on.end_held_at = on.round_over_at;
+        fprintf(stderr, "online: round: time up at race tick %d; waiting for the others' scores\n", RACE_CLOCK);
+    }
+    return 1;
+}
+
+/* A human's finished score as the room has it (its own game reported it), -1 none. */
+static int room_score(const NetLobby *lobby, int global)
+{
+    if (global >= on.nslots || global >= lobby->nslots) return -1;
+    for (int i = 0; i < lobby->nmembers; i++)
+        if (lobby->member[i].id == lobby->racer[global].member_id)
+            return !strcmp(lobby->member[i].race_state, "finished") ? lobby->member_score[i] : -1;
+    return -1;
+}
+
+static void mosh_table(char *out, int size)
+{
+    int order[NRIDERS], riders = hle_online_race_riders(), n = 0;
+    char name[48];
+    mosh_order(on.table, riders, order);
+    out[0] = 0;
+    for (int i = 0; i < riders && n < size - 48; i++)
+        n += snprintf(out + n, size - n, " %d. %s %u (%u)", i + 1, rider_label(order[i], name, sizeof name),
+                      mosh_points(&on.table[order[i]]), on.table[order[i]].hits);
+}
+
+/* Each field of the round: the riders this PC runs send their scores when they change (final
+   once its round is over), the others show their owners'. When every score is final (or after
+   MOSH_TABLE_WAIT seconds) the table stands: this PC's finish goes to the room with its points
+   and place, and the game's own end runs on to the results. */
+static void mosh_step(void)
+{
+    if (!on.mosh || EE32(MENU) != LOAD_MENU) return;
+    int riders = hle_online_race_riders();
+    for (int slot = 0; slot < riders; slot++) {
+        int global = hle_puppet_global(slot);
+        MoshScore *held = &on.score[global];
+        if (hle_puppet_owner(global) == on.local_slot) {
+            if (held->final) {  /* this PC's round is over: these stay */
+                mosh_write(slot, held);
+                continue;
+            }
+            MoshScore now;
+            mosh_read(slot, &now);
+            now.final = (uint8_t)on.round_over;  /* also a rider taken over after this PC's end */
+            if (!held->known || !mosh_same(held, &now)) {
+                /* this PC's own numbers: its player's own when the rider is this PC's player's */
+                now.from = (uint8_t)on.local_slot, now.by_player = (uint8_t)(global == on.local_slot && global < on.nslots);
+                *held = now, mosh_send(global, held);
+            }
+        } else if (held->known)
+            mosh_write(slot, held);
+    }
+    if (on.table_done) {
+        /* The published table stands (finding 221): a score message that comes later changes
+           on.score, not what the results show or what this PC reported. */
+        for (int slot = 0; slot < riders; slot++) mosh_write(slot, &on.table[hle_puppet_global(slot)]);
+        return;
+    }
+    if (!on.round_over) return;
+    NetLobby lobby;
+    host_service_net_get_lobby(GADDR(&lobby));
+    int missing = 0;
+    for (int global = 0; global < riders; global++) {
+        if (on.score[global].final) continue;
+        int score = room_score(&lobby, global);
+        if (score >= 0 && hle_puppet_owner(global) != on.local_slot) {
+            /* its game reported it to the room (a bot's way too): that is its final */
+            MoshScore s;
+            memset(&s, 0, sizeof s);
+            s.part[1] = (uint32_t)score, s.hits = on.score[global].hits, s.known = s.final = 1;
+            s.from = (uint8_t)global, s.by_player = 1;  /* the room has the player's own report */
+            on.score[global] = s;
+            continue;
+        }
+        missing++;
+    }
+    double waited = host_wall_seconds() - on.round_over_at;
+    if (missing && waited < MOSH_TABLE_WAIT) return;
+    on.table_done = 1;
+    mosh_publish(on.table, on.score, riders);  /* riders whose final never came count with their last score */
+    char table[400];
+    mosh_table(table, sizeof table);
+    fprintf(stderr, "online: round: the table%s (%.1f s after time up):%s\n",
+            missing ? " without every final score" : "", waited, table);
+    title("Downhill Revived online - round results:%s", table);
+    int place = mosh_place(on.table, riders, on.local_slot);
+    if (from_menu)
+        host_service_net_finish((uint32_t)RACE_CLOCK, place > 0 ? place : 1, (int)mosh_points(&on.table[on.local_slot]));
+    func_001B45F8(EE_PTR(0x4B1F40), 1, 90);  /* the game's own end: its COMBAT RESULTS */
+    on.end_done = 1, on.end_done_at = host_wall_seconds();
+    const char *after = getenv("DHD_NET_AFTER_RACE");
+    if (!from_menu && after && *after && getenv("DHD_NET_SCRIPTED")) {
+        char script[1200];
+        snprintf(script, sizeof script, "%s", after);
+        set_env("DHD_NAV", script);
+    }
+}
+
+/* COMBAT RESULTS (func_00160980, its rows) in a room's round: BACK TO THE ROOM, instead of the
+   game's TRY AGAIN, NEW LEVEL and QUIT. */
+void func_0018E408(void *menu, const char *text, int enabled);
+int port_online_round_rows(void *menu)
+{
+    if (!online_mode() || !on.mosh || !on.table_done) return 0;
+    on.results_at = host_wall_seconds();
+    fprintf(stderr, "online: round: the results (COMBAT RESULTS)\n");
+    if (!from_menu) return 0;
+    func_0018E408(menu, "BACK TO THE ROOM", 1);
+    return 1;
+}
+
+/* Its accept (func_00161050): back to the room as QUIT's Yes leaves the race screen. */
+void func_00190660(void *manager, void *screen);
+extern char D_003F52D0[], D_00388E90[];
+int port_online_round_accept(int index)
+{
+    (void)index;
+    if (!online_mode() || !on.mosh || !from_menu || !on.results_at) return 0;
+    fprintf(stderr, "online: round: back to the room from the results\n");
+    func_00190660(D_003F52D0, D_00388E90);
+    return 1;
+}
+
+/* Its table (func_00160A48): the i-th rider is the round's i-th (mosh_order: the same order on
+   every PC; the game's own choice, best, takes the higher rider slot on a tie, and slots differ
+   from PC to PC). */
+int port_online_round_rider(int i, int best)
+{
+    if (!online_mode() || !on.mosh || !on.table_done) return best;
+    int order[NRIDERS], riders = hle_online_race_riders();
+    if (i < 0 || i >= riders) return -1;
+    mosh_order(on.table, riders, order);
+    return hle_puppet_local(order[i]);
+}
+
+/* A player's rider shows its player's name there (two may ride the same rider), as over the riders
+   in the race; the computer riders their own. */
+const char *port_online_round_name(void *rider, const char *name)
+{
+    static char names[NRIDERS][16];
+    if (!online_mode() || !on.mosh) return name;
+    for (int slot = 0; slot < hle_online_race_riders(); slot++) {
+        int global = hle_puppet_global(slot);
+        if ((void *)RIDER(slot) != rider || global >= on.nslots || !on.name[global][0]) continue;
+        snprintf(names[global], sizeof names[global], "%.10s", on.name[global]);
+        for (char *c = names[global]; *c; c++) *c = (char)toupper((unsigned char)*c);
+        return names[global];
+    }
+    return name;
+}
+
 /* Camera 0 is the 0x380-byte view, NOT the RiderCamera at rider +0x3530.
    Its +0xC0 is a direction vector. Leave the rider's animation camera links alone. */
 extern void func_00148560(void *, int);
 extern void func_00148860(void *);
 
-void hle_online_watch_resume(void) { on.watch_paused = on.watch_direction = 0; }
+/* Every frame of the race loop (func_0016C0C8): the pause menu, which runs outside it, is closed.
+   watch_direction keeps the pad's last Left / Right (pads_read_now reads it in the menu too), so a
+   direction held through RESUME is no new press. A leave_race that came while the menu was up asks
+   the loop to stop again (ignored while a stop is pending). */
+void hle_online_loop_frame(void)
+{
+    on.watch_paused = 0;
+    if (quit_on_pause) func_001B45F8(EE_PTR(0x4B1F40), 2, 0);
+}
 
 /* View 0's camera setting (distance, D_004225A0 +0x12220, and its blend +0x12230, for the next
    race too): func_0014CC38 changes it from the view's rider's own camera buttons, so watching a
@@ -1242,7 +1585,7 @@ static int watch_state(const NetLobby *lobby, int slot)
 static void watch_cycle(const NetLobby *lobby, int direction)
 {
     int order[NRIDERS], count = 0, current = -1;
-    for (int slot = 1; slot < hle_online_race_riders(); slot++)
+    for (int slot = on.spectator ? 0 : 1; slot < hle_online_race_riders(); slot++)
         if (watch_state(lobby, slot) == 1) order[count++] = slot;
     for (int i = 1; i < count; i++) {
         int slot = order[i], j = i;
@@ -1252,24 +1595,31 @@ static void watch_cycle(const NetLobby *lobby, int direction)
     for (int i = 0; i < count; i++) if (order[i] == on.watch_slot) current = i;
     if (count) watch_cut(order[current < 0 ? (direction > 0 ? 0 : count - 1)
                                      : (current + direction + count) % count]);
-    else watch_cut(0);
+    else if (!on.spectator) watch_cut(0);
 }
 
 static void watch_step(const NetLobby *lobby)
 {
     if (!on.end_held || host_wall_seconds() - on.end_held_at < 3) return;
-    int state = on.watch_slot ? watch_state(lobby, on.watch_slot) : -1;
+    int state = on.watch_slot > 0 || (on.spectator && on.watch_slot == 0) ? watch_state(lobby, on.watch_slot) : -1;
     if (state == 1) return;
     double now = host_wall_seconds();
     if (state == 0) {
         if (!on.watch_finished_at) on.watch_finished_at = now;
         if (now - on.watch_finished_at < 3) return;
     }
-    int best = 0;
-    for (int slot = 1; slot < hle_online_race_riders(); slot++)
+    int best = -1, riders = hle_online_race_riders();
+    for (int slot = on.spectator ? 0 : 1; slot < riders; slot++)
         if (hle_puppet_global(slot) < on.nslots && watch_state(lobby, slot) == 1 &&
-            (!best || PLACE(slot) < PLACE(best))) best = slot;
-    watch_cut(best);
+            (best < 0 || PLACE(slot) < PLACE(best))) best = slot;
+    if (on.spectator) {
+        /* no human racing: the first computer rider still riding, else the watched one stays */
+        for (int slot = 0; best < 0 && slot < riders; slot++)
+            if (watch_state(lobby, slot) == 1) best = slot;
+        if (best >= 0) watch_cut(best);
+        return;
+    }
+    watch_cut(best < 0 ? 0 : best);
 }
 
 /* ---- disconnects ---- */
@@ -1282,21 +1632,58 @@ static void check_left(void)
     NetLobby lobby;
     host_service_net_get_lobby(GADDR(&lobby));
     for (int j = 0; j < on.nslots; j++) {
-        int gone = j != on.local_slot && (lobby.racer[j].left || lobby.offline);
+        int gone = j != on.local_slot && (lobby.racer[j].left || (lobby.offline && !on.spectator));
         if (!gone || on.gone[j]) continue;
         on.gone[j] = 1;
         int host = on.host_slot;
         if (on.gone[host]) {
             host = 0;
             while (host < on.nslots && on.gone[host]) host++;
-            if (lobby.offline) host = on.local_slot;
+            if (lobby.offline && !on.spectator) host = on.local_slot;
             on.host_slot = host;
         }
         fprintf(stderr, "online: player %d (%s) left at race tick %d; host now player %d\n", j, on.name[j], RACE_CLOCK,
                 host);
-        hle_puppet_drop(j, host, on.finish[j] >= 0);
+        /* in the arena's round a player whose final score is here is done, as a finisher */
+        hle_puppet_drop(j, host, on.finish[j] >= 0 || (on.mosh && on.score[j].final));
     }
 }
+
+/* This tick's snapshots of the riders this PC runs (ai: the AI riders' too), bundled
+   (state_bundle.h, finding 169): as few messages as fit one datagram each, stamped with their
+   moment on the server's clock. */
+static void send_snapshots(int ai)
+{
+    static uint8_t rec[NRIDERS][STATE_RECORD_MAX], bundle[STATE_BUNDLE_RIDERS][STATE_BUNDLE_MAX];
+    const uint8_t *recs[NRIDERS];
+    int size[NRIDERS], slots[NRIDERS], count = 0, bundle_size[STATE_BUNDLE_RIDERS];
+    for (int slot = 0; slot < (ai ? hle_online_race_riders() : 1) && count < NRIDERS; slot++) {
+        int n = hle_puppet_pack(slot, rec[count], STATE_RECORD_MAX);
+        if (n <= 0) continue;
+        recs[count] = rec[count], size[count] = n, slots[count++] = slot;
+    }
+    if (!count) return;
+    /* The moment the snapshots show, on the server clock: our GO there plus the race time. Not
+       the clock at packing: the race clock may trail the wall clock by a few ms (pacing), and the
+       pose is the race clock's (finding 169). When it trails by more (below 30 fps, catching up
+       after a hitch), that much more: the pose happened then (puppet_sync.h, finding 202). */
+    double stamp = on.go_server ? on.go_server + (port_field_seconds(RACE_CLOCK) + hle_puppet_clock_excess()) * 1000
+                                : host_service_net_server_ms();
+    if (slots[0] == 0) {  /* DHD_NET_RECORD: this PC's rider alone, as a bundle of one */
+        int one_size;
+        if (state_bundle_pack(recs, size, 1, stamp, bundle, &one_size)) record(bundle[0], one_size);
+    }
+    int bundles = state_bundle_pack(recs, size, count, stamp, bundle, bundle_size), sent = 0;
+    for (int b = 0; b < bundles; b++)
+        sent += host_service_net_send_frame(NET_FRAME_STATE, GADDR(bundle[b]), bundle_size[b]) != 0;
+    if (!sent) return;
+    on.bundles_sent += sent;
+    on.sent += count;
+    for (int i = 0; i < count; i++) on.ai_sent += slots[i] != 0;
+}
+
+enum { RESULTS_SECONDS = 8 };
+static void results_open(int ended, double now);
 
 /* Each vsync of the race: the snapshots and events in, ours out. */
 static void state_sync(void)
@@ -1305,9 +1692,17 @@ static void state_sync(void)
     int n, clock = RACE_CLOCK;
     receive_frames();
     if (EE32(MENU) != LOAD_MENU) return;
+    if (on.spectator && !on.watched) {
+        /* a watcher (finding 269) watches from its countdown as a finisher does (finding 122): its
+           HUD hidden, the camera on the best-placed human at once, its own camera setting kept */
+        on.saved_zoom = EE32(VIEW0_ZOOM), on.saved_zoom_rate = EE32(VIEW0_ZOOM_RATE);
+        on.watched = 1, on.end_held = 1, on.end_held_at = host_wall_seconds() - 3;
+        on.watch_slot = -1;
+    }
     if (race_running() && !on.go_sent) {  /* GO: when it was, on the server's clock */
         uint8_t e[10] = {EVENT_VERSION, EVENT_GO};
         on.go_server = host_service_net_server_ms() - port_field_seconds(clock) * 1000;
+        hle_puppet_go(on.go_server);  /* snapshots' server stamps onto this race clock */
         memcpy(e + 2, &on.go_server, 8);
         send_event(e, sizeof e);
         on.go_sent = 1;
@@ -1317,25 +1712,48 @@ static void state_sync(void)
     static double checked;
     if (host_wall_seconds() - checked >= 0.25) { checked = host_wall_seconds(); check_left(); }
     finish_step();
+    mosh_step();
     if (from_menu && !on.end_done) {
         /* Finishers stay to watch; the server closes the race for everyone. */
         double now = host_wall_seconds();
         NetLobby lobby;
         host_service_net_get_lobby(GADDR(&lobby));
         const NetMember *me = self_member(&lobby);
-        int out = lobby.state != NET_RACING || !me || !me->in_race;
+        int out = lobby.state != NET_RACING || !me || (on.spectator ? !lobby.watching : !me->in_race);
+        /* the racers say their rides again while the room lists a watcher, who came after the
+           exchange (finding 269; once a second, a reliable EVENT) */
+        if (!on.spectator && lobby.watchers > 0 && !out && now - on.rides_said >= 1) on.rides_said = now, send_ride();
         if (!on.leave_at && out) {
-            on.leave_reason = FINISHED(0) ? "RACE OVER" : lobby.last_race_id != on.last_race_id
-                              ? "TIME UP - DNF" : "THE HOST ENDED THE RACE";
-            fprintf(stderr, "online: race closed: back to the room\n");
-            on.leave_at = now + 2;
+            if (!on.leave_reason) {  /* one the start gave stays (start_step) */
+                RaceEnd end = {.ended = lobby.ended,
+                               .link_lost = lobby.offline || lobby.seat_lost || lobby.state == NET_FAILED ||
+                                            lobby.state == NET_IDLE || lobby.state == NET_RECONNECTING,
+                               .removed = !strcmp(lobby.error_code, "kicked"), .finished = FINISHED(0) || on.spectator,
+                               .own_dnf = me ? me->dnf_reason : "", .new_result = lobby.last_race_id != on.last_race_id};
+                on.leave_reason = race_end_reason(&end);
+                fprintf(stderr, "online: race closed: back to the room (%s: ended %d, link %d, own %s/%s, "
+                        "result %d; race tick %d)\n", on.leave_reason, end.ended, end.link_lost, me ? me->race_state : "-",
+                        end.own_dnf, end.new_result, RACE_CLOCK);
+                /* the room closed the race (not the link, not the host's removal): its results over
+                   the race, instead of the reason's card (finding 271) */
+                if (!end.link_lost && !end.removed && end.ended != NET_ENDED_NONE && !on.mosh)
+                    results_open(end.ended, now);
+            } else
+                fprintf(stderr, "online: race closed: back to the room (race tick %d)\n", RACE_CLOCK);
+            on.leave_at = now + (on.results_from ? RESULTS_SECONDS : 2);
+        }
+        /* a countdown to the next race while the results show (this PC is ready: on them, or
+           since before the race as a watcher): to the room at once, so the start finds it there */
+        if (on.results_from && on.leave_at > now && lobby.countdown_ms >= 0 && (on.results_ready || (me && me->ready))) {
+            fprintf(stderr, "online: results: the next race counts down: to the room now\n");
+            on.leave_at = now;
         }
         watch_step(&lobby);
         if (on.leave_at && now >= on.leave_at) {
             on.end_done = 1, on.end_done_at = now;
             leave_race();
         }
-    } else if (on.end_held && !on.end_done &&
+    } else if (on.end_held && !on.end_done && !on.mosh &&
         (on.have_results || host_wall_seconds() - on.end_held_at > 120)) {
         func_001B45F8(EE_PTR(0x4B1F40), 1, 4 * 60);  /* the results screen in 4 s */
         on.end_done = 1;
@@ -1349,24 +1767,23 @@ static void state_sync(void)
             set_env("DHD_NAV", script);
         }
     }
-    if (!race_running() || clock < on.last_sent + SNAPSHOT_TICKS && clock >= on.last_sent) return;
-    on.last_sent = clock - clock % SNAPSHOT_TICKS;
-    /* All our riders in one frame (the host's AI riders too): one message to the server a
-       snapshot, not one a rider. Each is [size][snapshot]; a snapshot stays within 255 bytes. */
-    int at = 0, riders = 0, ai = 0;
-    for (int slot = 0; slot < hle_online_race_riders(); slot++) {
-        int room = (int)sizeof payload - at - 1;
-        if ((n = hle_puppet_pack(slot, payload + at + 1, room < 255 ? room : 255)) > 0) {
-            payload[at] = (uint8_t)n;
-            if (slot == 0) record(payload + at + 1, n);
-            at += 1 + n, riders++;
-            if (slot && hle_puppet_owned(slot)) ai++;
+    if (!race_running() || clock == on.last_sent) return;
+    {   /* DHD_NET_TEST_HITCH=S:MS (tests, finding 202): once, at race second S, this game's thread
+           stops MS ms (a hitch): the others must hold its riders (HOLD), not ride them on */
+        static HleEnv hitch_env;
+        static int hitched;
+        const char *hitch = hle_env(&hitch_env, "DHD_NET_TEST_HITCH");
+        double at, ms;
+        if (hitch && !hitched && sscanf(hitch, "%lf:%lf", &at, &ms) == 2 && port_field_seconds(clock) >= at) {
+            hitched = 1;
+            fprintf(stderr, "online: test hitch of %.0f ms at race tick %d\n", ms, clock);
+            for (double end = host_wall_seconds() + ms / 1000; host_wall_seconds() < end;) host_sleep_ms(5);
         }
     }
-    if (at && host_service_net_send_frame(NET_FRAME_STATE, GADDR(payload), at)) {
-        on.sent += riders;
-        on.ai_sent += ai;
-    }
+    int ai = clock >= on.last_ai_sent + AI_SNAPSHOT_TICKS || clock < on.last_ai_sent;
+    on.last_sent = clock;
+    if (ai) on.last_ai_sent = clock - clock % AI_SNAPSHOT_TICKS;
+    send_snapshots(ai);
     while ((n = hle_puppet_take_event(payload, sizeof payload)) > 0) send_event(payload, n);
     static double last_title;
     if (host_wall_seconds() - last_title > 1) {
@@ -1380,9 +1797,9 @@ static void state_sync(void)
                   on.nslots, lobby.ping_ms, lobby.offline ? " - offline" : "",
                   on.end_held ? " - finished, waiting for the others" : "");
         extern unsigned kernel_pace_late_ms;
-        fprintf(stderr, "online: race clock %d (%d fps), %u snapshots sent, %u received, hits taken %d, %u ms late, "
-                "lag (ms):%s\n", clock, port_fps(), on.sent, on.received, hle_puppet_hits_taken(),
-                kernel_pace_late_ms, lag);
+        fprintf(stderr, "online: race clock %d (%d fps), %u snapshots sent in %u messages, %u messages received, "
+                "hits taken %d, %u ms late, puppets off by (units)/snapshot age (ms):%s\n", clock, port_fps(), on.sent,
+                on.bundles_sent, on.received, hle_puppet_hits_taken(), kernel_pace_late_ms, lag);
         if (on.end_held) fprintf(stderr, "online: watching: %u owned AI snapshots sent, phase %d\n", on.ai_sent, EE32(PHASE));
         static double last_ping;
         if (last_title - last_ping >= 10) last_ping = last_title, log_pings(&lobby);
@@ -1421,12 +1838,16 @@ extern float port_fov_x;  /* widescreen.c: glyph width scale, 1 when off */
 void hle_online_names(void *rider, int view)
 {
     if (!online_mode() || !on.started || rider != RIDER(0) || !race_running()) return;
+    static HleEnv names_env;
+    const char *names = hle_env(&names_env, "DHD_NAMES");
+    if (names && !dhd_stricmp(names, "off")) return;
+    int name_width = names && !dhd_stricmp(names, "large") ? 400 : names && !dhd_stricmp(names, "medium") ? 320 : 240;
     uint8_t *pen = EE_PTR(0x4F3570), kept[0x20];
     int cx, cy, w, h, drawn = 0;
     func_0023D618(view, &cx, &cy);
     func_0023D650(view, &w, &h);
     memcpy(kept, pen, sizeof kept);
-    for (int slot = 1; slot < hle_online_race_riders(); slot++) {
+    for (int slot = on.spectator ? 0 : 1; slot < hle_online_race_riders(); slot++) {
         int global = hle_puppet_global(slot);
         if (slot == on.watch_slot) continue;
         if (global < 0 || global >= on.nslots || on.gone[global] || !on.name[global][0]) continue;
@@ -1448,7 +1869,7 @@ void hle_online_names(void *rider, int view)
         /* Text normally stays inside the middle 4:3 area. Undo that mapping for
            this world anchor, while keeping the glyphs themselves in proportion. */
         int x = (int)(w / 2 + (local_x - w / 2) / port_fov_x), y = (int)local_y - 16;
-        func_0020FB80(0, 320, 240, -102, -24);
+        func_0020FB80(0, name_width, name_width * 3 / 4, -name_width * 102 / 320, -name_width * 24 / 320);
         int half_width = (func_0020F860(0, on.name[global]) + 31) / 32;
         if (local_x - half_width * port_fov_x < 1 || local_x + half_width * port_fov_x >= w - 1 || y < 1) continue;
         func_0020F518(0, 0, 0, 0, 128);
@@ -1553,12 +1974,96 @@ static int test_skip_pad(HostPad *out)
     return 1;
 }
 
+/* DHD_NET_TEST_MENU=S:step,...[;S:step,...] (tests, finding 215): from race second S (the race
+   clock), the steps on the wall clock, so they go on while a pause stops the race clock: a button
+   (start, cross, circle, square, triangle, up, down, left, right) pressed 0.1 s then let go 0.1 s,
+   or wN, N ms of nothing. While a group runs the script's own buttons are let go. "20:start,w2000,cross"
+   opens the menu at 20 s and RESUMEs 2 s later. */
+enum { TEST_GROUPS = 8, TEST_STEPS = 24 };
+typedef struct { double at; int steps; uint16_t button[TEST_STEPS]; int wait_ms[TEST_STEPS]; } TestGroup;
+static TestGroup test_group[TEST_GROUPS];
+static int test_groups = -1;
+static int test_group_at, test_step;  /* each race runs the script from its start */
+static double test_step_at = -1;
+static void test_menu_reset(void) { test_group_at = 0, test_step = 0, test_step_at = -1; }
+
+static void test_menu_parse(const char *v)
+{
+    static const struct { const char *name; uint16_t button; } names[] = {
+        {"start", PAD_START}, {"cross", PAD_CROSS}, {"circle", PAD_CIRCLE}, {"square", PAD_SQUARE},
+        {"triangle", PAD_TRIANGLE}, {"up", PAD_UP}, {"down", PAD_DOWN}, {"left", PAD_LEFT}, {"right", PAD_RIGHT}};
+    test_groups = 0;
+    while (v && *v && test_groups < TEST_GROUPS) {
+        TestGroup *g = &test_group[test_groups++];
+        g->at = atof(v), g->steps = 0;
+        const char *s = strchr(v, ':'), *end = strchr(v, ';');
+        if (!end) end = v + strlen(v);
+        while (s && s < end && g->steps < TEST_STEPS) {
+            char word[16];
+            size_t len = strcspn(s + 1, ",;");
+            snprintf(word, sizeof word, "%.*s", (int)(len < sizeof word ? len : sizeof word - 1), s + 1);
+            g->button[g->steps] = 0, g->wait_ms[g->steps] = word[0] == 'w' ? atoi(word + 1) : 0;
+            for (size_t i = 0; i < sizeof names / sizeof *names; i++)
+                if (!strcmp(word, names[i].name)) g->button[g->steps] = names[i].button;
+            g->steps++;
+            s = strchr(s + 1, ',');
+        }
+        v = *end ? end + 1 : NULL;
+    }
+}
+
+static void test_menu_pad(HostPad *out)
+{
+    static HleEnv env;
+    const char *v = hle_env(&env, "DHD_NET_TEST_MENU");
+    if (!v || !on.started) return;
+    if (test_groups < 0) test_menu_parse(v);
+    double now = host_wall_seconds();
+    static double clock_said;  /* the race clock against the wall clock, twice a second */
+    if (now - clock_said >= 0.5) {
+        clock_said = now;
+        fprintf(stderr, "online: test clock: race tick %d phase %d wall %.2f\n", RACE_CLOCK, EE32(PHASE), now);
+    }
+    if (test_group_at >= test_groups) return;
+    if (test_step_at < 0) {  /* the group waits for its race second */
+        if (!race_running() || port_field_seconds(RACE_CLOCK) < test_group[test_group_at].at) return;
+        test_step = 0, test_step_at = now;
+    }
+    if (test_step >= test_group[test_group_at].steps) { test_group_at++, test_step_at = -1; return; }
+    /* while a group runs the player has let go of the rider's buttons: only the steps' presses */
+    out->buttons = 0;
+    double t = now - test_step_at;
+    if (!test_group[test_group_at].button[test_step]) {
+        if (t >= test_group[test_group_at].wait_ms[test_step] / 1000.0) test_step++, test_step_at = now;
+        return;
+    }
+    if (t >= 0.2) { test_step++, test_step_at = now; return; }
+    if (t >= 0.1) return;
+    static double said;
+    if (said != test_step_at) {
+        said = test_step_at;
+        fprintf(stderr, "online: test menu: button %04X at race tick %d, wall %.2f\n", test_group[test_group_at].button[test_step],
+                RACE_CLOCK, now);
+    }
+    out->buttons = test_group[test_group_at].button[test_step];
+}
+
+/* After the arena's round the room's menus are Single Event's again (port_online_shell set 12 for
+   the room): the shop's START, for one, goes another way in Mosh Bowl (func_0013BA60). */
+static void round_mode_off(void)
+{
+    if (EE32(SETUP + 0x10C) == MOSH_MODE) EE32(SETUP + 0x10C) = 12;
+}
+
 /* Leaving the race screen and the room returns this PC to offline control. Restore the previous
    script and seed so the online boot script cannot swallow title-menu input. */
 static int connected;
 static void race_over(void)
 {
+    test_menu_reset();
+    race_menu_reset(&race_menu);
     fprintf(stderr, "online: the race is over; back to offline play\n");
+    round_mode_off();
     host_service_net_leave();
     hle_puppet_offline();
     port_online_relock();
@@ -1582,7 +2087,12 @@ static int leaving_room;  /* LEAVE THE ROOM chosen: off the race screen, out of 
 
 static void back_to_room(void)
 {
-    fprintf(stderr, "online: this PC's race is over; back to the room\n");
+    test_menu_reset();
+    race_menu_reset(&race_menu);
+    fprintf(stderr, "online: this PC's race is over; back to the room (%.0f ms after the race screen was asked to leave)\n",
+            left_at ? (host_wall_seconds() - left_at) * 1000 : 0.0);
+    left_at = 0;
+    round_mode_off();
     host_service_net_back();  /* out of the race: unless it finished, DNF (gave up) */
     hle_puppet_offline();
     kernel_pace_shared(0);
@@ -1671,7 +2181,7 @@ void port_online_question(void *menu)
                     : pause_asked == PAUSE_LEAVE ? "LEAVE THE ROOM?" : "BACK TO THE ROOM?";
     const char *why = pause_asked == PAUSE_END ? "NO RESULTS FROM THIS RACE WILL COUNT"
                     : pause_asked == PAUSE_LEAVE ? "YOU LEAVE THE ROOM AND THIS RACE"
-                    : FINISHED(0) ? "THE OTHERS ARE STILL RACING" : "YOU WON'T FINISH THIS RACE (DNF)";
+                    : FINISHED(0) || on.spectator ? "THE OTHERS ARE STILL RACING" : "YOU WON'T FINISH THIS RACE (DNF)";
     title->id = 1, title->string = ask, title->table = D_0029DE68;
     line->id = 1, line->string = why, line->table = D_0029DE68;
 }
@@ -1686,8 +2196,309 @@ void port_online_question_yes(void)
     pause_asked = 0;
 }
 
+/* ---- the race menu online (finding 215, race_menu.h) ----
+   With another human still racing, START opens the room's menu drawn over the running race: the
+   race loop goes on (world, riders, clock, snapshots), this game's rider gets a neutral pad and
+   coasts, the pad drives the menu. Alone, START is the game's own pause (the rows above). The
+   rows act as the pause menu's do: BACK TO THE ROOM as the touch panel's Leave race, END THE RACE
+   sends the end first, LEAVE THE ROOM leaves the room too. */
+static int race_menu_direction;  /* the pad's left / right while the menu is open (watching) */
+
+static int race_alone(const NetLobby *l)
+{
+    unsigned char racing[NET_MAX_SLOTS] = {0};
+    int humans = on.nslots < NET_MAX_SLOTS ? on.nslots : NET_MAX_SLOTS;
+    for (int j = 0; j < humans; j++)
+        racing[j] = (unsigned char)race_menu_racing(on.finish[j] >= 0 || (on.mosh && on.score[j].final),
+                                                    l->racer[j].left, on.gone[j]);
+    return race_menu_alone(racing, humans, on.local_slot);
+}
+
+static void race_menu_shut(const char *why)
+{
+    if (race_menu.open) fprintf(stderr, "online: race menu: closed (%s)\n", why);
+    race_menu.open = 0, race_menu.asking = 0;
+}
+
+static void race_menu_chosen(int row)
+{
+    static const char *const said[] = {"", "", "back to the room", "the host ends the race", "leave the room"};
+    fprintf(stderr, "online: race menu: %s\n", said[row]);
+    if (row == RM_END) host_service_net_end_race();
+    if (row == RM_LEAVE) leaving_room = 1;
+    on.end_done = 1, on.end_done_at = host_wall_seconds();
+    leave_race();
+}
+
+/* Each field of the race (player 1's pad, after the countdown's hold took START away). */
+static void race_menu_pad(HostPad *out)
+{
+    int live = on.started && !on.end_done && !on.results_from && EE32(PHASE) >= 1 && EE32(PHASE) <= 4;
+    if (!live) {
+        race_menu_shut("the race screen ends");
+        race_menu.last = out->buttons;
+        return;
+    }
+    uint16_t buttons = out->buttons;
+    int overlay = 1;
+    if (!race_menu.open && (buttons & PAD_START) && !(race_menu.last & PAD_START)) {
+        NetLobby lobby;
+        host_service_net_get_lobby(GADDR(&lobby));
+        race_menu_rows(&race_menu, from_menu, lobby.is_host);
+        overlay = !race_alone(&lobby);
+        if (!overlay) fprintf(stderr, "online: race menu: alone in the race: the game's own pause\n");
+    }
+    if (race_menu.open) {  /* the stick moves the menu's cursor too */
+        if (out->left_y < 64) buttons |= PAD_UP;
+        if (out->left_y > 192) buttons |= PAD_DOWN;
+        race_menu_direction = (out->buttons & PAD_RIGHT || out->left_x > 176) ? 1
+                            : (out->buttons & PAD_LEFT || out->left_x < 80) ? -1 : 0;
+    }
+    int did, chosen, was_open = race_menu.open;
+    uint16_t to_race = race_menu_field(&race_menu, buttons, overlay, &did, &chosen);
+    if (did == RM_OPENED) fprintf(stderr, "online: race menu: open at race tick %d (the race goes on)\n", RACE_CLOCK);
+    if (did == RM_CLOSED) fprintf(stderr, "online: race menu: resume at race tick %d\n", RACE_CLOCK);
+    if (did == RM_ASKED || did == RM_UNASKED || did == RM_MOVED || did == RM_OPENED)
+        menu_play(did == RM_ASKED || did == RM_OPENED ? "S_SELECT" : did == RM_UNASKED ? "S_BACK" : "S_NEXT");
+    if (race_menu.open || was_open) {
+        uint8_t connected = out->connected;
+        neutral(out);
+        out->connected = connected;
+    }
+    out->buttons = to_race;
+    if (did == RM_CHOSEN) race_menu_chosen(chosen);
+}
+
+/* Drawn with the HUD (hle_online_hud, view 0) in the pause menu's look: its panel, title, rows
+   and cursor bar, in the menus' styles, where the pause menu would be. The popup pieces draw in
+   the popup manager's view, so it is this view while they are queued. */
+static void race_menu_draw(int view)
+{
+    int *manager_view = (int *)(void *)(D_003F52D0 + 0x20), saved = *manager_view;
+    *manager_view = view;
+    menu_draw_begin();
+    int vw, vh;
+    menu_draw_size(&vw, &vh);
+    MenuStyle row = menu_game_style(MENU_STYLE_ROW), lit = menu_game_style(MENU_STYLE_SELECTED);
+    MenuStyle dim = menu_game_style(MENU_STYLE_OFF);
+    static const char *const names[] = {"", NULL, "BACK TO THE ROOM", "END THE RACE", "LEAVE THE ROOM"};
+    const char *text[RACE_MENU_ROWS + 1], *title, *line = NULL;
+    int n, cursor, y0;
+    if (race_menu.asking) {  /* the quit question's words, as port_online_question gives them */
+        int a = race_menu.asking;
+        title = a == RM_END ? "END THE RACE FOR EVERYONE?" : a == RM_LEAVE ? "LEAVE THE ROOM?" : "BACK TO THE ROOM?";
+        line = a == RM_END ? "NO RESULTS FROM THIS RACE WILL COUNT"
+             : a == RM_LEAVE ? "YOU LEAVE THE ROOM AND THIS RACE"
+             : FINISHED(0) || on.spectator ? "THE OTHERS ARE STILL RACING" : "YOU WON'T FINISH THIS RACE (DNF)";
+        text[0] = menu_game_text(0x13), text[1] = menu_game_text(0x12);  /* the question's No, Yes */
+        n = 2, cursor = race_menu.answer, y0 = 0x69;
+    } else {
+        title = "THE RACE GOES ON";
+        for (n = 0; n < race_menu.rows; n++)
+            text[n] = race_menu.row[n] == RM_RESUME ? menu_game_text(0x19) : names[race_menu.row[n]];
+        cursor = race_menu.cursor, y0 = 0x54;
+    }
+    int widest = menu_text_width(title, &row);
+    if (line && menu_text_width(line, &dim) > widest) widest = menu_text_width(line, &dim);
+    for (int i = 0; i < n; i++)
+        if (menu_text_width(text[i], &lit) > widest) widest = menu_text_width(text[i], &lit);
+    int cx = vw / 2, top = 0x40 - 12, bottom = y0 + (n - 1) * 10 + (line ? 24 : 12);
+    menu_draw_box(cx - widest / 2 - 24, top, widest + 48, bottom - top, 90);
+    menu_draw_text(MENU_CENTRE, cx, 0x40, title, &row);
+    for (int i = 0; i < n; i++) {
+        if (i == cursor) menu_draw_bar(cx - widest / 2 - 12, y0 + i * 10 - 1, widest + 24, 10);
+        menu_draw_text(MENU_CENTRE, cx, y0 + i * 10, text[i], i == cursor ? &lit : &row);
+    }
+    if (line) menu_draw_text(MENU_CENTRE, cx, y0 + n * 10 + 4, line, &dim);
+    *manager_view = saved;
+}
+
+/* ---- the room race's results (finding 271) ----
+   When the room closes a race (everyone finished or out, the finish window ran out, the host ended
+   it), this PC's race screen shows its results for RESULTS_SECONDS over the race, darkened, instead
+   of the reason's card: how it went for this PC large ("YOU FINISHED 4TH", "TIME UP - DNF", the
+   winner for a watcher), the track small, every racer in the room's order with the time and the
+   gap to the winner, a DNF with its reason; then the race screen goes, as before, and the room
+   opens. Cross, a click or a tap goes at once. The room's next race counts from the close (30 s,
+   the server's intermission): this screen took 6 s more of it than the old card, so READY works
+   here too (Square, or a tap on its words) and the room has it when this PC comes back. */
+unsigned menu_mouse_clicks(int view, int *x, int *y);  /* menu_page.c */
+const char *port_track_name(int index);                /* online_menu.c */
+static int results_ready_x0, results_ready_x1, results_ready_y;  /* READY's words, view pixels */
+
+static void results_open(int ended, double now)
+{
+    NetLobby lobby;
+    host_service_net_get_lobby(GADDR(&lobby));
+    int x, y;
+    on.results_from = now;
+    on.results_ended = ended;
+    on.results_buttons = 0xFFFF;  /* a button already held is not a press */
+    on.results_clicks = menu_mouse_clicks(0, &x, &y);
+    on.results_ready = 0;
+    on.results_watcher = on.spectator;  /* a watcher reads the winner large (finding 269) */
+    fprintf(stderr, "online: results: shown for %d s (%s)\n", RESULTS_SECONDS, on.leave_reason);
+}
+
+static void results_set_ready(const char *by)
+{
+    if (on.results_ready) return;
+    on.results_ready = 1;
+    host_service_net_set_ready(1);
+    menu_play("S_SELECT");
+    fprintf(stderr, "online: results: READY by %s\n", by);
+}
+
+static void results_pad(HostPad *out)
+{
+    uint16_t held = out->buttons, pressed = held & ~on.results_buttons;
+    int x, y;
+    unsigned clicks = menu_mouse_clicks(0, &x, &y);
+    int click = clicks != on.results_clicks;
+    on.results_buttons = held, on.results_clicks = clicks;
+    if (pressed & (PAD_SQUARE | PAD_START)) results_set_ready("pad");
+    else if (click && results_ready_x1 > results_ready_x0 && x >= results_ready_x0 - 8 && x <= results_ready_x1 + 8 &&
+             y >= results_ready_y - 8 && y <= results_ready_y + 16)
+        results_set_ready("tap");
+    else if ((pressed & PAD_CROSS) || click) {
+        fprintf(stderr, "online: results: continue by %s after %.1f s\n", click ? "tap" : "pad", host_wall_seconds() - on.results_from);
+        menu_play("S_SELECT");
+        on.leave_at = host_wall_seconds();
+    }
+    uint8_t connected = out->connected;
+    neutral(out);
+    out->connected = connected;
+}
+
+static void results_draw(int view)
+{
+    int *manager_view = (int *)(void *)(D_003F52D0 + 0x20), saved = *manager_view;
+    *manager_view = view;
+    menu_draw_begin();
+    int vw, vh;
+    menu_draw_size(&vw, &vh);
+    if (vw <= 0 || vh <= 0) vw = 640, vh = 224;
+#define RX(x) ((x) * vw / 640)
+#define RY(y) ((y) * vh / 224)
+    NetLobby lobby;
+    host_service_net_get_lobby(GADDR(&lobby));
+    MenuStyle row = menu_solid(menu_game_style(MENU_STYLE_ROW)), lit = menu_solid(menu_game_style(MENU_STYLE_SELECTED));
+    static const int white[3] = {0x76, 0x75, 0x7A}, dim[3] = {0x45, 0x48, 0x60}, yellow[3] = {0x7A, 0x72, 0x00},
+                     amber[3] = {0x70, 0x58, 0x17}, green[3] = {0x2C, 0x68, 0x2E};
+#define TINT(s, pct, c) menu_style(s, pct, (c)[0], (c)[1], (c)[2])  /* row and lit are solid (menu_solid) */
+    menu_draw_rect(0, 0, vw, vh, 0, 0, 0, 108);  /* the race behind, darkened */
+    int fresh = lobby.last_race_id != on.last_race_id;  /* the results came (they follow "ended") */
+    char line[64], head[48];
+    const char *where = port_track_name(fresh ? lobby.last_race_track : lobby.race_track);
+    snprintf(line, sizeof line, "RACE RESULTS - %s", where ? where : "");
+    for (char *c = line; *c; c++) *c = (char)toupper((unsigned char)*c);
+    MenuStyle s = TINT(row, 70, dim);
+    menu_draw_text(MENU_CENTRE, RX(320), RY(4), line, &s);
+    if (fresh || on.results_ended == NET_ENDED_VOID) room_results_headline(&lobby, on.results_ended, on.results_watcher, head, sizeof head);
+    else snprintf(head, sizeof head, "%s", on.leave_reason ? on.leave_reason : "RACE OVER");
+    s = TINT(lit, 190, yellow);
+    while (s.size[0] > 0 && menu_text_width(head, &s) > RX(600)) s = menu_style(s, 92, -1, 0, 0);
+    menu_draw_text(MENU_CENTRE, RX(320), RY(13), head, &s);
+    /* the rows: the winner's larger, this PC's yellow */
+    ResultRow rows[NET_MAX_SLOTS];
+    int n = fresh ? room_results(&lobby, rows) : 0, y = 38;
+    if (on.results_ended == NET_ENDED_VOID) {
+        s = TINT(row, 90, white);
+        menu_draw_text(MENU_CENTRE, RX(320), RY(70), "NO RESULTS FROM THIS RACE COUNT", &s);
+        n = 0;
+    }
+    for (int k = 0; k < n; k++) {
+        const ResultRow *w = &rows[k];
+        int h = k == 0 ? 17 : k < 4 ? 14 : 12, pct = k == 0 ? 120 : k < 4 ? 100 : 85, x0 = 77, wide = 486;
+        /* the font's glyphs centre about 5.4 units (at 100 %) below the y they are drawn at */
+        int ty = y + h / 2 - pct * 54 / 1000, gy = y + h / 2 - pct * 70 / 100 * 54 / 1000;
+        menu_draw_rect(RX(x0), RY(y), RX(x0 + wide) - RX(x0), RY(y + h) - RY(y), 0x0C, 0x0C, 0x16, 104);
+        if (w->own) {
+            menu_draw_rect(RX(x0), RY(y), RX(x0 + wide) - RX(x0), RY(y + h) - RY(y), 0x3C, 0x38, 0, 60);
+            menu_draw_rect(RX(x0 - 1), RY(y - 1), RX(wide + 2), RY(1) > 0 ? RY(1) : 1, 0xF4, 0xE4, 0, 128);
+            menu_draw_rect(RX(x0 - 1), RY(y + h), RX(wide + 2), RY(1) > 0 ? RY(1) : 1, 0xF4, 0xE4, 0, 128);
+            menu_draw_rect(RX(x0 - 1), RY(y), RX(1) > 0 ? RX(1) : 1, RY(y + h) - RY(y), 0xF4, 0xE4, 0, 128);
+            menu_draw_rect(RX(x0 + wide), RY(y), RX(1) > 0 ? RX(1) : 1, RY(y + h) - RY(y), 0xF4, 0xE4, 0, 128);
+        }
+        const int *edge = w->own ? (const int[]){0xF4, 0xE4, 0x00} : !w->finished ? (const int[]){0x3A, 0x3C, 0x5C}
+                        : k == 0 ? (const int[]){0xF4, 0xD0, 0x3F} : (const int[]){0x59, 0xD0, 0x5C};
+        menu_draw_rect(RX(x0), RY(y), RX(x0 + 3) - RX(x0), RY(y + h) - RY(y), edge[0], edge[1], edge[2], 128);
+        const int *c = w->own ? yellow : !w->finished ? dim : k == 0 ? white : NULL;
+        MenuStyle rs = c ? TINT(row, pct, c) : menu_style(row, pct, -1, 0, 0), vs = c ? rs : TINT(row, pct, white);
+        menu_draw_text(MENU_LEFT, RX(x0 + 10), RY(ty), w->place, &rs);  /* the place in the row's lilac, name and time white */
+        /* the name up to the time (or the DNF's words): a wide one at the large size shrinks */
+        MenuStyle gs = c == yellow ? TINT(row, pct * 70 / 100, yellow) : TINT(row, pct * 70 / 100, dim);
+        MenuStyle ds = TINT(row, pct * 70 / 100, amber), ns = vs;
+        int name_end = w->finished ? RX(x0 + wide - 100) - menu_text_width(w->time, &vs)
+                                   : RX(x0 + wide - 12) - menu_text_width(w->time, &ds);
+        while (ns.size[0] > 0 && menu_text_width(w->name, &ns) > name_end - RX(x0 + 80)) ns = menu_style(ns, 92, -1, 0, 0);
+        menu_draw_text(MENU_LEFT, RX(x0 + 72), RY(ty), w->name, &ns);
+        if (w->finished) {
+            menu_draw_text(MENU_RIGHT, RX(x0 + wide - 100), RY(ty), w->time, &vs);
+            if (w->gap[0]) menu_draw_text(MENU_RIGHT, RX(x0 + wide - 12), RY(gy), w->gap, &gs);
+        } else
+            menu_draw_text(MENU_RIGHT, RX(x0 + wide - 12), RY(gy), w->time, &ds);
+        y += h + 2;
+    }
+    if (fresh && !n && on.results_ended != NET_ENDED_VOID) {
+        s = TINT(row, 90, white);
+        menu_draw_text(MENU_CENTRE, RX(320), RY(70), "NOBODY RACED TO THE END", &s);
+    }
+    /* back to the room: a bar running out, the time, and what the buttons do */
+    double left = on.leave_at - host_wall_seconds();
+    if (left < 0) left = 0;
+    menu_draw_rect(RX(77), RY(194), RX(563) - RX(77), RY(196) - RY(194), 0, 0, 0, 128);
+    menu_draw_rect(RX(77), RY(194), (int)((RX(563) - RX(77)) * (left > RESULTS_SECONDS ? 1 : left / RESULTS_SECONDS)),
+                   RY(196) - RY(194), 0xA3, 0xA5, 0xF2, 128);
+    snprintf(line, sizeof line, "BACK TO THE ROOM IN %d", (int)(left + 0.999));
+    /* three words on one line: the time left, READY (Square, or a tap on it), Cross; one size
+       that fits all three with their gaps */
+    const char *ready = on.results_ready ? "YOU'RE READY" : GLYPH_SQUARE " READY NEXT", *go = GLYPH_CROSS " CONTINUE";
+    MenuStyle ls, rs, cs;
+    int pct = 80, lw, rw, cw;
+    for (;; pct -= 5) {
+        ls = menu_style(row, pct, -1, 0, 0);
+        rs = on.results_ready ? TINT(row, pct, green) : TINT(row, pct, white);
+        cs = TINT(row, pct, white);
+        lw = menu_text_width(line, &ls), rw = menu_text_width(ready, &rs), cw = menu_text_width(go, &cs);
+        if (lw + rw + cw + RX(24) <= RX(486) || pct <= 50) break;
+    }
+    int fy = RY(203 - pct * 54 / 1000), cx = (RX(77) + lw + RX(563) - cw) / 2;
+    menu_draw_text(MENU_LEFT, RX(77), fy, line, &ls);
+    menu_draw_text(MENU_CENTRE, cx, fy, ready, &rs);
+    menu_draw_text(MENU_RIGHT, RX(563), fy, go, &cs);
+    results_ready_x0 = cx - rw / 2, results_ready_x1 = cx + rw / 2, results_ready_y = fy;
+#undef TINT
+#undef RX
+#undef RY
+    *manager_view = saved;
+}
+
+/* The race load's steps in the log, offline and online (finding 238): from the load screen
+   (menu 9 in the front end) to the race's loop, then the flight over the track (race phase 5)
+   to the countdown (phase 1). Reads only. */
+static void load_timing(void)
+{
+    static double screen_at, loop_at;
+    static int was_screen, was_loop;
+    double now = host_wall_seconds();
+    int loop = port_in_race(), screen = !loop && EE32(MENU) == LOAD_MENU;
+    if (screen && !was_screen) screen_at = now, loop_at = 0;
+    if (loop && !was_loop && screen_at) {
+        loop_at = now;
+        hle_log("load: the race's loop %.1f s after the load screen came\n", now - screen_at);
+    }
+    if (loop && loop_at && EE32(PHASE) == 1) {
+        hle_log("load: the countdown %.1f s after the race's loop (the flight over the track)\n", now - loop_at);
+        loop_at = 0, screen_at = 0;
+    }
+    if (!loop) loop_at = 0;
+    was_screen = screen, was_loop = loop;
+}
+
 void pads_begin_field(void)
 {
+    load_timing();
     choose_view();
     extern uint64_t kernel_vsync_count;
     if (!online_mode()) {
@@ -1698,7 +2509,6 @@ void pads_begin_field(void)
             parse_setup(getenv("DHD_RACE_SETUP"), &offline_setup);
         }
         if (setup == 1 && EE32(MENU) == LOAD_MENU) write_setup(&offline_setup), setup = 2;
-        log_hash(kernel_vsync_count);
         return;
     }
     if (!connected++ && !from_menu) connect_lobby();
@@ -1706,8 +2516,14 @@ void pads_begin_field(void)
         barrier();
         on.released = 1;
     }
-    if (!on.setup_done && EE32(MENU) == LOAD_MENU) {
+    if (!on.setup_done && !on.rides_entered && EE32(MENU) == LOAD_MENU) {
         write_setup(&on.setup);
+        /* The arena's round runs in the game's Mosh Bowl mode, its timed variant (SETUP +0x364 = 0;
+           the Mosh Bowl menu's other choice, 1, is last rider standing), as the game's own menu
+           sets it (func_001EB1D8); the room's other races in Single Event (12, port_online_shell).
+           Finding 204. */
+        if (on.mosh) EE32(SETUP + 0x10C) = MOSH_MODE, EE32(SETUP + 0x110) = 0, EE32(SETUP + 0x364) = 0;
+        else if (EE32(SETUP + 0x10C) == MOSH_MODE) EE32(SETUP + 0x10C) = 12;
         if (selected_ride) {
             EE32(SETUP + 0x290) = selected_rider;
             for (int k = 0; k < 3; k++) {
@@ -1727,7 +2543,8 @@ void pads_begin_field(void)
             for (int k = 0; k < 3; k++) EE32(SETUP + 0x11C + 4 * k) = bike[k];
             EE32(SETUP + 0x254) = func_001FA7C0(bike[0]);  /* the frame's own colour, as the puppets get */
         }
-        exchange_rides();
+    }
+    if (!on.setup_done && EE32(MENU) == LOAD_MENU && exchange_step()) {
         on.setup_done = 1;
         /* the room's last race now, before loading: a race that closes later (TIME UP) changes
            it, a voided one (the host ended it) doesn't. Not at GO: a late GO can come after. */
@@ -1745,9 +2562,27 @@ void pads_begin_field(void)
     if (on.started && EE32(MENU) != LOAD_MENU) race_left();
 }
 
+int port_controls_capturing(void);  /* controls_settings.c: a binding waits for a key or button */
+
+/* While PC SETTINGS > Controls waits for a key or button (and until it is let go), the game sees
+   no input: the press is the page's (finding 157). The pads stay connected. */
+static void held_back(HostPad *out)
+{
+    uint8_t connected = out->connected;
+    neutral(out);
+    out->connected = connected;
+}
+
 /* Online: the menu script, then in the race this PC's controller (DHD_NET_SCRIPTED=1, tests:
    still the script, DHD_RACE_PAD). */
+static void pads_read_now(int player, HostPad *out);
 void pads_read(int player, HostPad *out)
+{
+    pads_read_now(player, out);
+    if (port_controls_capturing()) held_back(out);
+}
+
+static void pads_read_now(int player, HostPad *out)
 {
     static HleEnv scripted_env;
     if (online_mode()) {
@@ -1763,10 +2598,21 @@ void pads_read(int player, HostPad *out)
             if (hle_online_countdown_hold(EE32(PHASE))) out->buttons &= ~PAD_START;
         }
         else if (!on.released || !host_pad_script(player, out)) neutral(out);
+        if (player == 0 && race) test_menu_pad(out);
+        if (player == 0 && race) race_menu_pad(out);
+        if (player == 0 && race && from_menu && on.results_from && !on.end_done) results_pad(out);
+        /* the round's results go back to the room by themselves after a while (BACK TO THE
+           ROOM, their only row: Cross pressed for a quarter second each half second) */
+        if (player == 0 && from_menu && on.mosh && on.results_at &&
+            host_wall_seconds() - on.results_at > MOSH_RESULTS_HOLD) {
+            neutral(out);
+            if ((int)((host_wall_seconds() - on.results_at) * 4) % 2) out->buttons = PAD_CROSS;
+        }
         if (player == 0 && from_menu && on.end_held) {
             int direction = (out->buttons & PAD_RIGHT || out->left_x > 176) ? 1
                           : (out->buttons & PAD_LEFT || out->left_x < 80) ? -1 : 0;
-            if (!on.watch_paused && !EE32(0x398C40 + 0x5BE4) && direction && !on.watch_direction && !(out->buttons & PAD_START)) {
+            if (race_menu.open) direction = race_menu_direction;  /* held through RESUME: no new press */
+            if (!race_menu.open && !on.watch_paused && !EE32(0x398C40 + 0x5BE4) && direction && !on.watch_direction && !(out->buttons & PAD_START)) {
                 NetLobby lobby;
                 host_service_net_get_lobby(GADDR(&lobby));
                 watch_cycle(&lobby, direction);
@@ -1779,5 +2625,18 @@ void pads_read(int player, HostPad *out)
     if (!host_pad_script(player, out)) {
         host_service_host_pad_device(player, GADDR(out));
         menu_mouse_merge(player, out);
+        return;
+    }
+    /* DHD_TOUCH_WITH_SCRIPT=1 (tests): the device's buttons (the touch controls, and a keyboard or
+       pad if one is used) join a menu script's, so a DHD_NAV route can take the menus to a screen and
+       the touches take it from there (finding 209); taps on the menus too (finding 266) */
+    static int with_device = -1;
+    if (with_device < 0) with_device = getenv("DHD_TOUCH_WITH_SCRIPT") != NULL;
+    if (with_device && player == 0) {
+        HostPad device;
+        host_service_host_pad_device(0, GADDR(&device));
+        out->buttons |= device.buttons;
+        menu_mouse_merge(0, out);
+        for (int i = 0; i < 12; i++) out->pressure[i] = out->buttons & pressure_order[i] ? 255 : 0;
     }
 }

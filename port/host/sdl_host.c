@@ -6,7 +6,8 @@
    the window, and SDL's documentation puts the video calls and the event queue on one thread),
    it pumps the events and sends them where they belong (the window, the keyboard, the text field,
    the controllers), and it runs the controllers' pass (gamepad.c) every 4 ms. The game ends the
-   process itself (exit, host_exit) or returns from its thread; main then returns its code.
+   process itself (host_end, host_exit) or returns from its thread; main then ends it the same
+   way (launcher.c, android_main.c).
 
    The game thread never waits on SDL's queue. It reads copies: the keyboard's keys
    (keyboard.c), the controllers' states (gamepad.c), and the window's size and close (present.c).
@@ -22,9 +23,17 @@
 #include "host_api.h"
 #include "../hle/hle.h"
 #include "../hle/text_input.h"
+#include "../hle/controls_table.h"
 #include "../gs/present.h"
 
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE  /* the SwiftUI app owns main and UIApplication (port/ios, finding 224) */
+#define SDL_MAIN_HANDLED
+#include <SDL3/SDL_main.h>
+#endif
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -38,21 +47,16 @@ static void (*request_fn)(void *); /* the pending request (under slot_lock) */
 static void *request_arg;
 static SDL_Semaphore *request_done;
 
-/* Keys that are not letters, by the Windows virtual-key code the game's tables use (keyboard.c). */
+/* Keys that are not letters, by the Windows virtual-key code of the US key at their place, which
+   the game's tables use (keyboard.c): Esc and every key a binding can take (controls_table.h, by
+   its scan code; finding 157). The keypad's Enter is Enter. */
 static unsigned special_key(SDL_Scancode sc)
 {
-    switch (sc) {
-    case SDL_SCANCODE_LEFT: return 0x25;
-    case SDL_SCANCODE_UP: return 0x26;
-    case SDL_SCANCODE_RIGHT: return 0x27;
-    case SDL_SCANCODE_DOWN: return 0x28;
-    case SDL_SCANCODE_SPACE: return 0x20;
-    case SDL_SCANCODE_RETURN: case SDL_SCANCODE_KP_ENTER: return 0x0D;
-    case SDL_SCANCODE_ESCAPE: return 0x1B;
-    case SDL_SCANCODE_TAB: return 0x09;
-    case SDL_SCANCODE_BACKSPACE: return 0x08;
-    default: return 0;
-    }
+    if (sc == SDL_SCANCODE_ESCAPE) return 0x1B;
+    if (sc == SDL_SCANCODE_KP_ENTER) sc = SDL_SCANCODE_RETURN;
+    for (int i = 0; i < CONTROL_KEYS; i++)
+        if (control_keys[i].scancode == sc) return control_keys[i].vk;
+    return 0;
 }
 
 /* The control character Windows sent as WM_CHAR for the key (0: none). */
@@ -203,6 +207,9 @@ int sdl_host_main(int (*game)(void *), void *arg)
     host_thread_name("sdl");
     main_thread = SDL_GetCurrentThreadID();
     slot_lock = SDL_CreateMutex();
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    SDL_SetMainReady();  /* SDL's own main is not used: SDL_Init would refuse without it */
+#endif
     int events = SDL_Init(SDL_INIT_EVENTS);
     if (events) wake_event = SDL_RegisterEvents(1);
     else fprintf(stderr, "sdl: no event queue (%s)\n", SDL_GetError());

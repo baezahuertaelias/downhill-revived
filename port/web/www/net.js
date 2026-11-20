@@ -1,43 +1,71 @@
 // Browser network host services. Struct offsets come from the shared C header.
 import { layout } from './net_layout.js';
 
-// Online play is not offered in the browser (finding 143): the page's CSP blocks the race server's
-// socket, so it never worked here. The core asks host_service_net_offered and shows no ONLINE row;
-// the connections below refuse whatever asks. The same switch is off on Android (port/net/net.c).
-// online: true only in check_net.mjs, which tests the session code for when it comes back.
-const ONLINE_OFFERED = false;
+// The browser offers P2P rooms only (host_api.h NET_OFFER_P2P, findings 180, 186): server rooms
+// whose races run over page-owned WebRTC in a star around the room's hub, routed by the same Rust
+// star (dhd_star) as the native games'. SFU rooms need the native SFU client.
+const NET_OFFER_P2P = 2, P2P_CODE_LENGTH = 7;
+const ONLINE_OFFERED = true;
 
-export function createNet({span, str, online = ONLINE_OFFERED}) {
+// RTCPeerConnection belongs to Window. This socket-shaped bridge keeps the game host ABI
+// in its worker while the page owns the room connection, WebRTC and the star (p2p.js).
+let bridgedSocket;
+if(typeof addEventListener==='function')addEventListener('message', e => {
+  const m=e.data;if(m.type!=='net'||!bridgedSocket)return;
+  const s=bridgedSocket;
+  if(m.event==='open'){s.readyState=1;s.onopen?.();}
+  else if(m.event==='message')s.onmessage?.({data:typeof m.data==='string'?m.data:new Uint8Array(m.data).buffer});
+  else if(m.event==='close'){s.readyState=3;s.onclose?.();}
+  else if(m.event==='error')s.onerror?.();
+});
+function openP2p(url) {
+  const socket={readyState:0,send:data=>postMessage({type:'net',op:'send',data}),close:()=>postMessage({type:'net',op:'close'})};
+  bridgedSocket=socket;postMessage({type:'net',op:'connect',url});return socket;
+}
+
+export function createNet({span, str, online = ONLINE_OFFERED, openSocket = openP2p}) {
   let base = 'wss://dhd.skuza.app', name = '', version = '', iso = '', ws;
-  let room = {}, start = {}, member = -1, state = 0, seq = 0, offset = 0, welcome = {}, where = {};
-  let frames = [], list = [], listing = false, listError = false, timer, clockKnown = false;
+  // goAt: the race's start moment from the room (race_go, finding 187); serverGo: the room takes ours.
+  // serverScore: the room ranks a round by score (finding 204).
+  let room = {}, start = {}, member = -1, state = 0, seq = 0, offset = 0, welcome = {}, where = {}, p2p = false, goAt = 0, serverGo = false, serverScore = false, ended = 0;
+  // after: until when an ended race's frames still pass both ways (performance.now ms; 0 none), as
+  // client.c's race_frames_until: the race screen shows its last seconds, until the game is back
+  // (host_service_net_back), at most RACE_FRAMES_AFTER_MS (finding 216)
+  let frames = [], timer, after = 0;
+  const RACE_FRAMES_AFTER_MS = 10000;
+  const raceOver = () => { if (state === 3) after = now() + RACE_FRAMES_AFTER_MS; state = 2; };
+  const raceFrames = () => state === 3 || now() < after;
   let error = '', errorCode = '';
   const send = m => { if (ws?.readyState === 1) ws.send(JSON.stringify(m)); };
   const now = () => performance.now();
   const serverMs = () => now() + offset;
   const me = () => room.members?.find(x => x.id === member);
   function connect(path) {
-    if (!online) { state = 5; error = 'Online play is not offered in the browser.'; seq++; return -1; }
-    ws?.close(); clearInterval(timer); state = 1; room = {}; start = {}; frames = []; welcome = {}; where = {};
-    ws = new WebSocket(base + path); ws.binaryType = 'arraybuffer';
+    if (!online || !path) { state = 5; error = 'Only P2P rooms are offered in the browser.'; seq++; return -1; }
+    ws?.close(); clearInterval(timer); state = 1; room = {}; start = {}; frames = []; welcome = {}; where = {}; p2p = false; goAt = 0; serverGo = false; serverScore = false;
+    ws = openSocket(base + path); ws.binaryType = 'arraybuffer';
     const socket = ws;
     ws.onopen = () => {
-      send({type:'hello', protocol:2, version, clientVersion:version.match(/\d+\.\d+\.\d+/)?.[0] || '0.7.4',
-        isoSha256:iso, name, features:['countdown','session']});
+      // race_go: it takes the start moment from the room (finding 187); p2p: it races in P2P rooms
+      // (finding 186); no race_rejoin: a dropped page doesn't rejoin.
+      send({type:'hello', protocol:4, version, clientVersion:version.match(/\d+\.\d+\.\d+/)?.[0] || '0.7.13',
+        isoSha256:iso, name, features:['countdown','session','race_go','p2p']});
       timer = setInterval(() => send({type:'ping',t:now()}),1000);
     };
     ws.onmessage = e => {
       if (socket !== ws) return;
-      if (typeof e.data !== 'string') { if (state===3) {frames.push(new Uint8Array(e.data)); if(frames.length>128)frames.shift();} return; }
+      if (typeof e.data !== 'string') { if (raceFrames()) {frames.push(new Uint8Array(e.data)); if(frames.length>128)frames.shift();} return; }
       const m = JSON.parse(e.data);
       if(m.type==='ping') send({type:'pong',s:m.s});
       if(m.type==='pong' && m.t !== undefined) offset=m.serverTime-(now()+m.t)/2;
-      if(m.type==='welcome') {member=m.memberId;state=2;room.code=m.code;offset=m.serverTime-now();welcome=m;}
+      if(m.type==='welcome') {member=m.memberId;state=2;room.code=m.code;offset=m.serverTime-now();welcome=m;p2p=m.transport==='p2p';
+        serverGo=(m.features||[]).includes('race_go');serverScore=(m.features||[]).includes('score');}
       if(m.type==='where') where=m;  // the room's region and the members' regions (finding 135)
-      if(m.type==='room') {room=m;if(!me()?.inRace && m.phase)state=2;}
-      if(m.type==='start') {start=m;state=3;frames=[];}
+      if(m.type==='room') {room=m;if(!me()?.inRace && m.phase)raceOver();}
+      if(m.type==='start') {start=m;state=3;frames=[];goAt=0;ended=0;after=0;}
+      if(m.type==='race_go' && state===3 && !goAt && m.race===start.startAt && m.at>0) goAt=m.at;
       if(m.type==='left' && start.players?.[m.slot])start.players[m.slot].left=1;
-      if(m.type==='ended') {state=2;frames=[];}
+      if(m.type==='ended') {raceOver();ended=m.reason==='void'?2:m.reason==='done'?1:3;}  // NET_ENDED_* (finding 211)
       if(m.type==='error') {error=m.message;errorCode=m.code;}
       seq++;
     };
@@ -54,18 +82,18 @@ export function createNet({span, str, online = ONLINE_OFFERED}) {
       const [at,size]=f;
       if(typeof value==='string') b.set(new TextEncoder().encode(value).subarray(0,size-1),at);
       else if(typeof value==='bigint') d.setBigInt64(at,value,true);
-      else if(['race_started_at','finish_ends_at','next_race_at','countdown_ends_at','server_time','start_at'].includes(key)) d.setFloat64(at,value||0,true);
+      else if(['race_started_at','finish_ends_at','next_race_at','countdown_ends_at','server_time','start_at','race_go_at'].includes(key)) d.setFloat64(at,value||0,true);
       else if(typeof value==='number'||typeof value==='boolean') d.setInt32(at,Number(value),true);
     }
   }
   function lobby(a) {
     const rules=room.rules||{}, members=room.members||[], results=room.lastRace?.entrants||[];
     write('NetLobby',a,{state,seq,code:room.code||'',member_id:member,host_id:room.hostId??-1,is_host:room.hostId===member,
-      room_name:room.roomName||'',is_public:!!room.public,max_players:room.maxPlayers||0,started:!!room.started&&(!room.phase||!!me()?.inRace),
+      room_name:room.roomName||'',is_public:!!room.public,is_p2p:p2p||state===1,max_players:room.maxPlayers||0,started:!!room.started&&(!room.phase||!!me()?.inRace),
       track:room.settings?.track||0,laps:room.settings?.laps||0,seed:BigInt(room.settings?.seed??-1),
       nmembers:members.length,ping_ms:-1,local_slot:start.yourSlot||0,nslots:start.players?.length||0,
       race_track:start.track||0,race_laps:start.laps||0,race_seed:start.seed||0,
-      start_at:start.startAt?(start.startAt-offset)/1000:0,offline:state===5,
+      start_at:start.startAt?(start.startAt-offset)/1000:0,offline:state===5,race_go_at:goAt,
       error_code:errorCode,error,countdown_ms:room.countdownEndsAt?Math.max(0,room.countdownEndsAt-serverMs()):-1,
       phase:room.phase||'',last_event:room.lastEvent||'',race_started_at:room.raceStartedAt,
       finish_ends_at:room.finishEndsAt,next_race_at:room.nextRaceAt,countdown_ends_at:room.countdownEndsAt,
@@ -73,33 +101,34 @@ export function createNet({span, str, online = ONLINE_OFFERED}) {
       finish_window:rules.finishWindow??60,next_race:rules.nextRace==='host',then:rules.then==='same'?0:rules.then==='random'?2:1,
       rotation_count:room.rotation?.length||0,last_race_id:room.lastRace?.id||0,last_race_track:room.lastRace?.track||0,nresults:results.length,
       edge_colo:welcome.edgeColo||'',country:welcome.country||'',continent:welcome.continent||'',
-      room_colo:where.colo??welcome.roomColo??'',room_region:where.region??welcome.roomRegion??''});
+      room_colo:where.colo??welcome.roomColo??'',room_region:where.region??welcome.roomRegion??'',server_scores:serverScore,ended});
     members.slice(0,10).forEach((m,i)=>write('NetMember',a+layout.NetLobby.member[0]+i*layout.NetMember.size,
       {...m,rtt_ms:m.rttMs??-1,in_race:!!m.inRace,race_state:m.raceState||'',dnf_reason:m.dnfReason||'',finish_ticks:BigInt(m.finishTicks??-1),
         region:where.members?.find(x=>x.id===m.id)?.region||''}));
     (start.players||[]).slice(0,10).forEach((m,i)=>write('NetRacer',a+layout.NetLobby.racer[0]+i*layout.NetRacer.size,{...m,member_id:m.memberId}));
     results.slice(0,10).forEach((m,i)=>write('NetResult',a+layout.NetLobby.result[0]+i*layout.NetResult.size,{...m,dnf_reason:m.dnfReason||'',ticks:BigInt(m.ticks??-1)}));
     span(a+layout.NetLobby.rotation[0],64).set((room.rotation||[]).slice(0,64));
-  }
-  function writeList(a,max) {
-    list.slice(0,max).forEach((m,i)=>write('NetLobbyInfo',a+i*layout.NetLobbyInfo.size,
-      {...m,room_name:m.roomName,host_name:m.hostName,max_players:m.maxPlayers,race_started_at:m.raceStartedAt,
-        finish_ends_at:m.finishEndsAt,next_race_at:m.nextRaceAt}));
-    return Math.min(list.length,max);
+    // a scored round's scores (finding 204), -1 none, by member and by result
+    const scores=(at,list)=>{const b=span(a+at,40),d=new DataView(b.buffer,b.byteOffset,b.byteLength);
+      for(let i=0;i<10;i++){const v=list[i]?.score;d.setInt32(i*4,Number.isInteger(v)&&v>=0&&v<=999999?v:-1,true);}};
+    scores(layout.NetLobby.member_score[0],members); scores(layout.NetLobby.result_score[0],results);
   }
   const api = {
     host_service_net_init:(a,b,c,d)=>{base=a?str(a):base;name=str(b);version=str(c);iso=str(d);},
-    host_service_net_offered:()=>online?1:0,
-    host_service_net_create_room:()=>connect('/v1/rooms/new'),
-    host_service_net_join_room:a=>connect('/v1/rooms/'+str(a)),
+    host_service_net_offered:()=>online?NET_OFFER_P2P:0,
+    host_service_net_create_room:p2p=>connect(p2p?'/v1/rooms/new?transport=p2p':''),
+    host_service_net_join_room:a=>{const code=str(a).toUpperCase();
+      return /^[23456789A-HJKMNP-Z]+$/.test(code)&&code.length===P2P_CODE_LENGTH?connect('/v1/rooms/'+code):-1;},
     host_service_net_leave:()=>{send({type:'leave'});ws?.close();ws=null;clearInterval(timer);state=0;},
     host_service_net_get_lobby:lobby,
     host_service_net_pick:(member,rider,bike)=>send({type:'pick',...(member>=0?{member}:{}),...(rider<0?{choosing:true}:{rider,bike,choosing:false})}),
     host_service_net_set_ready:ready=>send({type:'ready',ready:!!ready}),
     host_service_net_start_race:()=>send({type:'start'}),
     host_service_net_end_race:()=>send({type:'end'}),
-    host_service_net_finish:(ticks,place)=>send({type:'finish',ticks:ticks>>>0,place}),
-    host_service_net_back:()=>{send({type:'back'});state=2;frames=[];const m=me();if(m)m.inRace=false;seq++;},
+    host_service_net_watch:()=>{},  // finding 269: SFU rooms only, which the browser does not offer
+    host_service_net_race_go:at=>{if(serverGo&&state===3&&start.startAt&&at>0)send({type:'race_go',race:start.startAt,at});},  // finding 187
+    host_service_net_finish:(ticks,place,score)=>send({type:'finish',ticks:ticks>>>0,place,...(serverScore&&score>=0?{score}:{})}),
+    host_service_net_back:()=>{send({type:'back'});state=2;frames=[];after=0;const m=me();if(m)m.inRace=false;seq++;},
     host_service_net_rules:(finishWindow,nextRace,then)=>send({type:'settings',finishWindow,nextRace:['auto','host'][nextRace],then:['same','next','random'][then]}),
     host_service_net_rotation:(a,n)=>{if(n>=0&&n<=64)send({type:'settings',rotation:[...span(a,n)].map(x=>x&31),trackLimits:[...span(a,n)].map(x=>10-2*(x>>5&3)),pickOnly:[...span(a,n)].filter(x=>x&128).map(x=>x&31)});},
     host_service_net_set_room:a=>{
@@ -112,21 +141,12 @@ export function createNet({span, str, online = ONLINE_OFFERED}) {
     host_service_net_seconds:()=>now()/1000,
     host_service_net_server_ms:serverMs,
     host_service_net_send_frame:(type,a,n)=>{
-      if(state!==3||n>3070)return 0;const f=new Uint8Array(n+2);f[0]=type;f.set(span(a,n),2);ws.send(f);return 1;},
+      if(!raceFrames()||n>3070)return 0;const f=new Uint8Array(n+2);f[0]=type;f.set(span(a,n),2);ws.send(f);return 1;},
     host_service_net_receive_frame:(a,n)=>{const f=frames.shift();if(!f||f.length>n)return 0;span(a,f.length).set(f);return f.length;},
-    host_service_net_list_lobbies_start:()=>{
-      if(listing||!online)return 0;listing=true;listError=false;
-      // the list's "now" sets the clock when no room's pings have, so its times count from the server's (finding 135)
-      const sent=now();
-      fetch(base.replace(/^ws/,'http')+'/v1/lobbies').then(r=>r.json()).then(r=>{
-        const inRoom=state===2||state===3;
-        if(r.now>0&&!inRoom){offset=r.now-(sent+now())/2;clockKnown=true;}
-        list=r.lobbies.map(x=>({...x,timed:clockKnown||inRoom?1:0}));
-      }).catch(()=>listError=true).finally(()=>listing=false);
-      return 1;
-    },
-    host_service_net_list_lobbies_poll:(a,n)=>listing?-2:listError?-1:writeList(a,n),
-    host_service_net_list_lobbies:(a,n)=>writeList(a,n),
+    // P2P rooms are never listed, and the browser offers no SFU rooms: no list here.
+    host_service_net_list_lobbies_start:()=>0,
+    host_service_net_list_lobbies_poll:()=>-1,
+    host_service_net_list_lobbies:()=>0,
   };
   return api;
 }

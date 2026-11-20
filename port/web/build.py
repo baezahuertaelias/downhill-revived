@@ -4,8 +4,8 @@
 
 CORE defaults to build/wasm/dhd_core.wasm (port/tools/build_wasm.py's output).
 The graphics reactor links gpu_rust_web.c and the Rust renderer module is built into
-build/web/renderer (port/web/build_renderer.py). --renderer rust is accepted for old callers (the
-JS renderer, www/gpu.js, is gone: cleanup CL5, finding 088).
+build/web/renderer (port/web/build_renderer.py); the JS renderer, www/gpu.js, is gone
+(cleanup CL5, finding 088).
 Threads (the default; --no-threads for one worker; findings 087 BS2, 090 SP4): the game core, VIF1/VU1
 and the GS reactor in three Web Workers on one shared memory (www/worker.js, www/vu.js and
 www/graphics.js, the queues of port/web/web_queue.h): the core's browser copy, the two graphics
@@ -28,10 +28,9 @@ ROOT=Path(__file__).resolve().parents[2]
 OUT=ROOT/'build/web'
 BINARYEN=(DEVCACHES / 'binaryen/binaryen-version_133/bin/wasm-opt.exe')
 def main():
-    p=argparse.ArgumentParser(description=__doc__)
+    p=argparse.ArgumentParser(description=__doc__,allow_abbrev=False)
     p.add_argument('input',type=Path,nargs='?',default=ROOT/'build/wasm/dhd_core.wasm',
                    help='already-linked core, with indirect-call postlink applied (default build/wasm/dhd_core.wasm)')
-    p.add_argument('--renderer',choices=('rust',),default='rust',help='accepted for old callers: the Rust renderer is the only one')
     p.add_argument('--renderer-profile',choices=('release','fixloop'),default='release',help='cargo profile of the Rust renderer')
     p.add_argument('--no-opt',action='store_true',help='keep instruction wrappers for cost measurements')
     p.add_argument('--debug-memory',action='store_true',help='assert every bypassed access is not a mirror')
@@ -53,6 +52,7 @@ def main():
     renderer=build_renderer(a.renderer_profile,not a.no_opt,OUT)
     settings=OUT/'dhd_settings.wasm'
     run(sys.executable,ROOT/'port/tools/rustgs.py','build','--target','wasm32-unknown-unknown','--crate','dhd_settings','--profile',a.renderer_profile)
+    run(sys.executable,ROOT/'port/tools/rustgs.py','build','--target','wasm32-unknown-unknown','--crate','dhd_star','--profile',a.renderer_profile)
     if not a.no_opt:
         tmp=OUT/'dhd_settings-optimized.wasm'
         wasm_opt(BINARYEN,settings,'-Oz','--all-features','--disable-compact-imports','-o',tmp)

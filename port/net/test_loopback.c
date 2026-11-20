@@ -1,10 +1,11 @@
 /* Four players in one process: client.c over a fake transport, through a fake relay that does
-   what online/server does (docs/online-protocol.md): welcome and room snapshots, slots at start,
-   STATE and EVENT relayed with the slot byte overwritten, PING answered, left when a socket
-   closes. Each player has its own one-way latency; delivery keeps each socket's order. Each
+   what the room (online/server) and the race network (the SFU) do together
+   (docs/online-protocol.md): welcome and room snapshots, slots at start, STATE and EVENT
+   forwarded with the slot byte set to the sender's, PING answered, left when a socket closes. Each player has its own one-way latency; delivery keeps each socket's order. Each
    player's game thread sends numbered STATE frames for a while, as online.c does about 20 times
    a second, and checks that every other player's frames arrive whole and in order. */
 #include "client.h"
+#include "../hle/state_bundle.h"
 #include "json.h"
 
 #include <windows.h>
@@ -161,9 +162,11 @@ static void relay_binary(Player *p, const uint8_t *data, size_t n)
         for (i = 0; i < PLAYERS; i++)
             if (&players[i] != p)
                 deliver(&players[i], p, 1, frame, n);
-    } else if (frame[0] == NET_FRAME_PING) {
+    } else if (frame[0] == NET_FRAME_PING && n + sizeof(double) <= sizeof frame) {
+        double clock = net_now_ms();  /* the server's clock after the ping's bytes (protocol 4) */
         frame[0] = NET_FRAME_PONG;
-        deliver(p, p, 1, frame, n);
+        memcpy(frame + n, &clock, sizeof clock);
+        deliver(p, p, 1, frame, n + sizeof clock);
     } else {
         printf("  relay: unexpected binary frame type %d\n", frame[0]);
         failures++;
@@ -198,7 +201,13 @@ static void drop(Player *p)
         if (players[i].open)
             text_to(&players[i], p, text);
     LeaveCriticalSection(&relay);
-    client_on_closed(&p->client, 1006, "dropped");
+    /* In a race a drop starts a rejoin (finding 175); this relay never takes the player back, so
+       the attempts end at once, as net.c ends them at WS_ATTEMPTS_OVER. */
+    if (!client_on_closed(&p->client, 1006, "dropped") || !p->client.rejoining) {
+        fprintf(stderr, "test_loopback: a drop in the race started no rejoin\n");
+        failures++;
+    }
+    client_rejoin_failed(&p->client);
 }
 
 /* The network thread: deliveries when due, and ticks. */
@@ -255,6 +264,10 @@ static DWORD WINAPI game(void *arg)
         }
         while ((n = client_receive_frame(&p->client, frame, sizeof frame)) > 0) {
             int from = frame[1];
+            double held, quiet;
+            /* HOLD (state_bundle.h): another game's network thread once its game stopped sending */
+            if (n == 2 + STATE_HOLD_SIZE && frame[0] == NET_FRAME_STATE && state_hold_check(frame + 2, STATE_HOLD_SIZE, &held, &quiet))
+                continue;
             CHECK(n == 2 + 64 && frame[0] == NET_FRAME_STATE && from < PLAYERS && from != p->slot);
             if (n != 2 + 64 || from >= PLAYERS)
                 continue;

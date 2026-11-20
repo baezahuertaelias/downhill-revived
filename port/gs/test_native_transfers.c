@@ -19,6 +19,7 @@ volatile int gs_native_view;
 double host_seconds(void) { return GetTickCount64()/1000.0; }
 double host_wall_seconds(void) { return host_seconds(); }
 void host_thread_name(const char *n) {(void)n;}
+void host_end_add(int stage, const char *name, void (*fn)(void)) { (void)stage; (void)name; atexit(fn); }  /* as atexit did */
 void host_putenv_s(const char *name, const char *value) {_putenv_s(name, value);}
 void pacing_handed(double *d,double *b) {*d=*b=0;}
 void pacing_present(double d,double b) {(void)d;(void)b;}
@@ -29,6 +30,7 @@ int texpack_open(const ReplaceDevice *d,uint64_t m) {(void)d; (void)m; return 0;
 int texpack_available(void) {return 0;}
 TexPackEntry *texpack_find(const Gs *g,unsigned c) {return NULL;}
 void *texpack_view(TexPackEntry *e,uint64_t f) {(void)e; (void)f; return NULL;}
+uint8_t *texpack_image(TexPackEntry *e,unsigned *w,unsigned *h) {(void)e; *w = *h = 0; return NULL;}
 void texpack_field(uint64_t f) {}
 void texpack_report(void) {}
 int font_sharp_on(void) {return 0;}
@@ -36,13 +38,15 @@ int font_sharp_active(void) {return 0;}
 int font_sharp_icon_style(void) {return 0;}
 int font_sharp_icon_style_latch(void) {return 0;}
 int font_sharp_match(uint64_t t) {return 0;}
-void *font_sharp_view(const ReplaceDevice *d,const uint32_t *p,unsigned w,unsigned h,uint64_t k) {(void)d; (void)p; (void)w; (void)h; (void)k; return NULL;}
+void *font_sharp_view(const ReplaceDevice *d,const uint32_t *p,unsigned w,unsigned h,uint64_t k,
+                      const FontSharpPack *pk) {(void)d; (void)p; (void)w; (void)h; (void)k; (void)pk; return NULL;}
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <xmmintrin.h>
 
 const uint32_t *gs_wgpu_presented(unsigned *width, unsigned *height);  /* gpu_rust_test.c */
+void gs_wgpu_present_again(Gs *g);                                      /* gpu_rust_test.c */
 
 enum { WIDTH = 512, HEIGHT = 224 };
 enum { PRESENTED_W = 1280, PRESENTED_H = 720 };  /* DHD_NATIVE_TEST_PRESENTED's window: 4:3 with bars */
@@ -172,6 +176,83 @@ static void sample_alpha(unsigned x, unsigned y, unsigned alpha, const char *nam
     show(256, alpha, name);
 }
 
+/* Finding 196: an upscaled sprite interpolates its UVs smoothly across the whole sprite, not
+   once per GS pixel: a 2-GS-pixel-wide sprite over a black-to-white 2-texel texture shows a
+   four-step gradient at 2x, where GS-pixel sampling showed two flat pairs. */
+static void sprite_gradient(void)
+{
+    clear(256, 0xFF000000);
+    gs_write_pixel(&gs, GS_PSMCT32, 4096, 1, 0, 0, 0xFF000000);
+    gs_write_pixel(&gs, GS_PSMCT32, 4096, 1, 1, 0, 0xFFFFFFFF);
+    gs_write_pixel(&gs, GS_PSMCT32, 4096, 1, 0, 1, 0xFF000000);
+    gs_write_pixel(&gs, GS_PSMCT32, 4096, 1, 1, 1, 0xFFFFFFFF);
+    gs_write(&gs, GS_TEX0_1, 4096ULL | 1ULL << 14 | 1ULL << 26 | 1ULL << 30 | 1ULL << 34);
+    gs_write(&gs, GS_TEX1_1, 1ULL << 5 | 1ULL << 6);
+    gs_write(&gs, GS_PRIM, 6 | 16 | 256);
+    gs_write(&gs, GS_RGBAQ, 0x3F80000080808080ULL);
+    gs_write(&gs, GS_UV, 8 | 8ULL << 16);
+    gs_write(&gs, GS_XYZ2, 16 * 16ULL | (16 * 16ULL) << 16);
+    gs_write(&gs, GS_UV, 24 | 24ULL << 16);
+    gs_write(&gs, GS_XYZ2, 18 * 16ULL | (18 * 16ULL) << 16);
+    gs_priv_write(&gs, GS_PMODE, 2);
+    gs_priv_write(&gs, GS_SMODE2, 0);
+    gs_priv_write(&gs, GS_DISPFB2, 256 | 8ULL << 9);
+    gs_priv_write(&gs, GS_DISPLAY2, (WIDTH - 1ULL) << 32 | (HEIGHT - 1ULL) << 44);
+    unsigned w = 0, h = 0;
+    ++kernel_vsync_count;
+    gs_native_vsync(&gs, &w, &h, 0);
+    uint32_t *pixels = gs_native_picture(&gs, &w, &h);
+    dump("upscaled sprite interpolates smoothly", pixels, w, h);
+    check_presented("upscaled sprite interpolates smoothly", pixels, w, h);
+    unsigned r[4] = {0, 0, 0, 0};
+    int ok = pixels && w == WIDTH * 2 && h == HEIGHT * 2;
+    if (ok)
+        for (unsigned i = 0; i < 4; i++) r[i] = pixels[34 * w + 32 + i] & 255;
+    ok = ok && r[0] < r[1] && r[1] < r[2] && r[2] < r[3] && r[3] - r[0] > 100;
+    if (!ok) failures++;
+    printf("upscaled sprite interpolates smoothly: %s (%u %u %u %u)\n", ok ? "PASS" : "FAIL",
+           r[0], r[1], r[2], r[3]);
+}
+
+/* A field that stays on screen while its surface is drawn into again (finding 247): the page is
+   shown in `color`, then a field with no display (DISPFB2's width 0: nothing is scanned out, the
+   last picture stays) draws another colour into the same page and presents nothing. The picture
+   presented again after it (a repeated refresh: gs_wgpu_present_again) must still be the first,
+   although the first present sampled it from the surface that now holds the other colour:
+   checked on the presented surface (DHD_NATIVE_TEST_PRESENTED), and on the picture read back. No
+   dump: these fields are not in the goldens. */
+static void held(unsigned page, uint32_t color, const char *name)
+{
+    static uint32_t want[WIDTH * 2 * HEIGHT * 2];
+    unsigned w = 0, h = 0;
+    clear(page, color);
+    gs_priv_write(&gs, GS_PMODE, 2);
+    gs_priv_write(&gs, GS_SMODE2, 0);
+    gs_priv_write(&gs, GS_DISPFB2, page | 8ULL << 9);
+    gs_priv_write(&gs, GS_DISPLAY2, (WIDTH - 1ULL) << 32 | (HEIGHT - 1ULL) << 44);
+    ++kernel_vsync_count;
+    gs_native_vsync(&gs, &w, &h, 0);
+    clear(page, color ^ 0x00FFFFFF);
+    gs_priv_write(&gs, GS_DISPFB2, page);
+    ++kernel_vsync_count;
+    gs_native_vsync(&gs, &w, &h, 0);
+    if (presented_on) gs_wgpu_present_again(&gs);
+    for (unsigned i = 0; i < WIDTH * 2 * HEIGHT * 2; i++) want[i] = color;
+    unsigned before = failures;
+    check_presented(name, want, WIDTH * 2, HEIGHT * 2);
+    uint32_t *pixels = gs_native_picture(&gs, &w, &h);
+    unsigned changed = 0;
+    if (pixels)
+        for (unsigned i = 0; i < w * h; i++)
+            changed += (pixels[i] & 0xFFFFFF) != (color & 0xFFFFFF);
+    int ok = pixels && w == WIDTH * 2 && h == HEIGHT * 2 && !changed;
+    if (!ok) failures++;
+    printf("%s: %s (%ux%u, %u incorrect pixels%s)\n", name, ok && failures == before ? "PASS" : "FAIL", w, h,
+           changed, failures != before && ok ? ", the window differs" : "");
+    /* the page is displayed again for what follows */
+    gs_priv_write(&gs, GS_DISPFB2, page | 8ULL << 9);
+}
+
 /* A blend scene's picture: no expected colour, compared across backends (dump). */
 static void picture(unsigned page, const char *name)
 {
@@ -245,6 +326,7 @@ static void blend_scenes(void)
     const uint64_t fix = 0 | 1 << 2 | 2 << 4 | 1 << 6 | 0x50ULL << 32;   /* (Cs - Cd) * 0x50 + Cd */
     const uint64_t sub = 1 | 0 << 2 | 0 << 4 | 1 << 6;            /* (Cd - Cs) * As + Cd */
     const uint64_t inverse = 0 | 1 << 2 | 0 << 4 | 2 << 6;        /* (Cs - Cd) * As + 0 */
+    const uint64_t keep = 0 | 0 << 2 | 0 << 4 | 1 << 6;           /* (Cs - Cs) * As + Cd: the colour kept */
     const uint64_t always = 1ULL << 16 | 1ULL << 17, gequal = 1ULL << 16 | 2ULL << 17, greater = 1ULL << 16 | 3ULL << 17;
     const unsigned tri = 3 | 8 | 64;
     blend_scene("blend As, alpha written, no Z", blend, 0, 0, 0, tri);
@@ -263,6 +345,11 @@ static void blend_scenes(void)
     blend_scene("blend As, alpha test AFAIL FB_ONLY", blend, 0, greater | 1 | 5 << 1 | 0x60 << 4 | 1 << 12, 1, tri);
     blend_scene("blend As, alpha test AFAIL RGB_ONLY", blend, 0, gequal | 1 | 5 << 1 | 0x60 << 4 | 3 << 12, 1, tri);
     blend_scene("no blending, Z GREATER with writes", blend, 0, greater, 1, 3 | 8);
+    /* The colour kept (blend Zero / One; finding 176): drawn without blending, colour masked. */
+    blend_scene("Cd kept, alpha written, Z GEQUAL with writes", keep, 0, gequal, 1, tri);
+    blend_scene("Cd kept, alpha masked, Z GREATER with writes", keep, 0xFF000000u, greater, 1, tri);
+    blend_scene("Cd kept, alpha masked, Z GEQUAL read only", keep, 0xFF000000u, gequal, 0, tri);
+    blend_scene("Cd kept, alpha test AFAIL FB_ONLY", keep, 0, greater | 1 | 5 << 1 | 0x60 << 4 | 1 << 12, 1, tri);
 }
 
 /* A full picture from CPU memory alone (an upload: no draw). */
@@ -273,6 +360,34 @@ static void upload(unsigned page, uint32_t color)
     gs_write(&gs, GS_TRXREG, WIDTH | (uint64_t)HEIGHT << 32);
     gs_write(&gs, GS_TRXDIR, 0);
     for (unsigned i = 0; i < WIDTH * HEIGHT / 2; i++) gs_write(&gs, GS_HWREG, color | (uint64_t)color << 32);
+}
+
+/* A local-to-host read of a frame the native renderer drew (finding 250: Poster Maker reads its
+   512 x 224 frame back in two 512 x 112 reads, func_0019C220; before the fix the CPU's memory,
+   which never held the picture, came back black). Last, so no dumped VRAM above changes: the read
+   writes the surface's pixels into the CPU's memory. */
+static void colour_read(void)
+{
+    enum { ROWS = 112 };
+    static uint32_t read[WIDTH * ROWS];
+    clear(232, 0x80336699);
+    unsigned w = 0, h = 0;
+    ++kernel_vsync_count;
+    gs_native_vsync(&gs, &w, &h, 0);  /* the picture handed over: the read waits until it is drawn */
+    for (unsigned half = 0; half < 2; half++) {
+        memset(read, 0, sizeof read);
+        gs_write(&gs, GS_BITBLTBUF, 232ULL * 32 | 8ULL << 16);
+        gs_write(&gs, GS_TRXPOS, (uint64_t)(half * ROWS) << 16);
+        gs_write(&gs, GS_TRXREG, WIDTH | (uint64_t)ROWS << 32);
+        gs_write(&gs, GS_TRXDIR, 1);
+        size_t got = gs_read_image(&gs, read, sizeof read);
+        unsigned wrong = 0;
+        for (unsigned i = 0; i < WIDTH * ROWS; i++) wrong += read[i] != 0x80336699u;
+        int ok = got == sizeof read && !wrong;
+        if (!ok) failures++;
+        printf("colour read of a drawn frame, rows %u-%u: %s (%u of %u pixels not the drawn colour, first %08X)\n",
+               half * ROWS, half * ROWS + ROWS - 1, ok ? "PASS" : "FAIL", wrong, WIDTH * ROWS, read[0]);
+    }
 }
 
 int main(void)
@@ -331,6 +446,7 @@ int main(void)
     sample_alpha(9, 9, 0x7E, "8H replaces the byte");
     sample_alpha(10, 9, 0xA0, "zero nibble is still written");
     sample_alpha(0, 0, 0xA5, "partial uploads preserve other pixels");
+    sprite_gradient();
 
     clear(56, 0x8000FF00);
     show(56, 0x8000FF00, "first loading buffer before font upload");
@@ -372,7 +488,9 @@ int main(void)
     gs_write(&gs, GS_TRXDIR, 0);
     for (unsigned i = 0; i < WIDTH * HEIGHT / 16; i++) gs_write(&gs, GS_HWREG, 0x5A5A5A5A5A5A5A5AULL);
     show(400, 0x80336699, "no draw: font alpha over a copied surface");
+    held(56, 0x80204060, "a held picture survives a draw into its surface");
     blend_scenes();
+    colour_read();
 
     if (presented_on) {
         printf("presented: %u pictures checked against the window\n", presented_checks);

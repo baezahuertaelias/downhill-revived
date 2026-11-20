@@ -19,10 +19,10 @@ game program byte for byte, built for the PC with the PS2 hardware replaced by n
   pacing, 1x to 8x resolution, Hor+ widescreen at any shape, windowed, borderless or fullscreen.
 - Online races for 2 to 10 players (experimental), public or private with a code; after your
   finish you watch the others ride to the line.
-- PC SETTINGS in the game's own OPTIONS menu, a sharp font, Unlock All, the movies, memory card
-  saves, PCSX2 texture packs, mouse in the menus, Discord Rich Presence.
+- REVIVED SETTINGS in the game's own OPTIONS menu, a sharp font, Unlock All, the movies, memory
+  card saves, PCSX2 texture packs, mouse in the menus, Discord Rich Presence.
 - Controllers (Xbox, DualSense, DualShock 4, Switch Pro, 8BitDo and most others) and full
-  keyboard play.
+  keyboard play, with your own keys and buttons (in the game or the launcher).
 - Automatic updates that never touch your settings or saves.
 
 The full list and the known gaps: [docs/PLAYING.md](docs/PLAYING.md).
@@ -43,11 +43,27 @@ Mac and Linux (experimental): the `-mac-experimental.dmg` (drag the app to Appli
 or their zips. None of the downloads is signed by a developer certificate:
 [docs/PLAYING.md](docs/PLAYING.md#installing) says how to allow them and where your files go. You
 need Windows 10/11 64-bit (or an Apple silicon Mac, or Linux with glibc 2.35+ and Vulkan) and a
-Direct3D 12 or Vulkan graphics card.
+Direct3D 12 or Vulkan graphics card: minimum and recommended specs for every platform are in
+[docs/PLAYING.md](docs/PLAYING.md#system-requirements).
 
-Android (experimental): the `-android-experimental.apk` for arm64 phones and tablets on Android 11
-or later, with touch controls; no online races on phones yet. The release page says how to
-install it.
+Android (experimental): the `-android-experimental.apk` for arm64 phones and tablets on Android 10
+or later (minimum: a Helio G80 / Snapdragon 680 class phone with 4 GB RAM), with touch controls;
+every online race, as on the PC. The release page says how to install it.
+
+Nintendo Switch (homebrew, experimental, not in a release yet): a modded console with Atmosphère
+and a Homebrew Menu (hbmenu or sphaira). Build the NRO yourself
+([docs/BUILDING.md](docs/BUILDING.md#nintendo-switch)), then copy two files to the SD card, into
+one folder:
+
+    /switch/downhill-revived/downhill-revived.nro   the game, build/switch/downhill-revived.nro
+    /switch/downhill-revived/SCUS-97177.iso         your own dump of the USA disc, named exactly so
+
+Copy them with the card in a PC, or over the network with sphaira's FTP server (port 5000), e.g.
+`curl -T SCUS-97177.iso ftp://CONSOLE_IP:5000/switch/downhill-revived/`. Then start the Homebrew
+Menu by holding R while starting a game (from the album it has too little memory, and the game
+says so) and pick Downhill Revived. The first start makes `dhd.ini` in that folder (scale 1,
+shadows, lens flare and particles off); `dhd.log` and the saves go there too. Online play, texture
+packs and rebinding buttons are not on the Switch yet.
 
 ## Legal notice
 

@@ -23,14 +23,14 @@ out of date). New findings: copy `TEMPLATE.md` to the next free number on the la
 | Matching decomp | 002 compiler, 003 build, 004 small data, 012 C idioms, 013/014 asm forms, 074 NONMATCHING, `docs/WORKER.md` | 001 |
 | Port core (wasm32 core, 64-bit host) | 081 plan, 082 host runtime, 088 one 64-bit build, 099 one code path, 104 tests | 015, 017, 018, 020 (32-bit parts) |
 | Game clock and pacing | 139 delta-time clock, 142 replays on it, 052 just-in-time frames, 026 vblank wait | 027, 036, 049 (survey still true), 067 |
-| Renderer (GS, Rust/wgpu) | 021 GS core, 084 WGSL, 085/086 Rust renderer, 088 CL2, 131 draw pass, 045/136 scale | 025, 031-033, 035, 038 |
+| Renderer (GS, Rust/wgpu) | 021 GS core, 084 WGSL, 085/086 Rust renderer, 088 CL2, 131 draw pass, 045/136 scale, 171 lost device | 025, 031-033, 035, 038 |
 | VU0/VU1 | 016, 019, 030, 090 (VU1R, OP3, SP1) | 027, 029, 037 |
 | Audio and movies | 022, 133, 055 | |
-| Online (state sync) | 044 puppets, 047 race protocol, 114 any frame rate, 118/119 rooms, 123, 128, 135, 137, 144, `docs/online-protocol.md` | 039-042 (lockstep parts) |
+| Online (state sync) | 044 puppets, 047 race protocol, 114 any frame rate, 118/119 rooms, 123, 128, 135, 137, 144, 158 SFU transport, 177 room sessions, 186 P2P rooms (hub star, SFU fallback), 169 snapshots, 202 puppets on this game's physics, 173 stalls, 175 rejoin in a race, 179, `docs/online-protocol.md` | 039-042 (lockstep parts) |
 | Menus, settings, input | 050, 064, 092, 101/102 settings, 059/134 controllers, 141 touch, 056/140 widescreen | 065 (WM_CHAR part) |
 | Launcher, releases, installers | 093, 125, 138, 143, 098 disc check | 053, 054, 070 |
 | Speed (PC) | 089, 090, 129 perf log, 130/131 iGPU | 031, 032, 046, 048, 051, 066, 069 |
-| Android and phones | 091, 107, 108, 126/127 low-end profile, 143, 145, 146-149 | |
+| Android and phones | 091, 107, 108, 126/127 low-end profile, 143, 145, 146-149, 170 PowerVR | |
 | Browser | 083, 087, 102 | |
 
 ## Numbers not in this folder
@@ -97,7 +97,7 @@ out of date). New findings: copy `TEMPLATE.md` to the next free number on the la
 | 055 | [The movies play (round 40)](055-movies.md) | partly superseded | [140](140-widescreen-everywhere.md) for movies shown at 4:3 |
 | 056 | [Widescreen HUD at any shape, player defaults, EXIT GAME](056-widescreen-hud-defaults.md) | partly superseded | [101](101-one-settings-implementation.md) for player_defaults in host.c, the disc prompt, 4:3 cards; since 154 the bike shop corner past 16:9 |
 | 057 | [Round 40: texture replacement packs (upscale mods) in PCSX2's format](057-texture-packs.md) | current |  |
-| 058 | [the game's font drawn sharp at high resolutions](058-sharp-font.md) | current |  |
+| 058 | [the game's font drawn sharp at high resolutions](058-sharp-font.md) | partly superseded | [200](200-unlock-live-and-pack-icons.md) for a texture pack's entry for the menus' font with other button icons chosen |
 | 059 | [keyboard play and generic controllers (SDL3)](059-keyboard-generic-pads.md) | partly superseded | [099](099-one-code-path.md) for XInput/raw-HID fallback, the i686 SDL build |
 | 060 | [Native progressive field jitter](060-menu-jitter.md) | current |  |
 | 061 | [Pickup flare investigation (round 45)](061-pickup-flare.md) | current |  |
@@ -126,7 +126,7 @@ out of date). New findings: copy `TEMPLATE.md` to the next free number on the la
 | 092 | [online flow, centred menu layer, mouse (UI1)](092-ui.md) | partly superseded | [128](128-room-ready-bikes.md) for bike and outfit online "not done" |
 | 093 | [the player launcher (DownhillRevived.exe)](093-launcher.md) | current |  |
 | 094 | [Crash after a Super Career finish that does not advance (issue #8)](094-career-finish-crash.md) | current |  |
-| 095 | [PC SETTINGS "Unlock All" reads, never writes](095-unlock-all.md) | current |  |
+| 095 | [PC SETTINGS "Unlock All" reads, never writes](095-unlock-all.md) | partly superseded | [200](200-unlock-live-and-pack-icons.md) for when `func_001BB670` runs, and when a toggle shows on the rider select |
 | 096 | [Sky mosaic from high jumps (issue #2), native renderer](096-sky-mosaic.md) | current |  |
 | 097 | [the lens flare's Z probe caused the race stutter (issue #2)](097-lens-flare-probe-stutter.md) | current |  |
 | 098 | [a player couldn't create a public room (the disc image), and the log said nothing](098-online-disc-image-refusal.md) | current |  |
@@ -162,9 +162,9 @@ out of date). New findings: copy `TEMPLATE.md` to the next free number on the la
 | 129 | [perf: lines, how fast the game ran and what held it back, in every dhd.log](129-perf-log.md) | current |  |
 | 130 | [Integrated GPU performance](130-igpu-performance.md) | current |  |
 | 131 | [The draw pass from first principles: where an iGPU frame's time goes, and what is left](131-gpu-first-principles.md) | current |  |
-| 132 | [Track picker names and disc previews](132-track-picker.md) | current |  |
+| 132 | [Track picker names and disc previews](132-track-picker.md) | partly superseded | [166](166-online-more-tracks.md) for the 23-track list: 25 since 166 |
 | 133 | [Ambient sound too loud on Mt. Liddellroch (issue #19)](133-ambient-sound.md) | current |  |
-| 134 | [controllers: stick dead zone, button icons, starting without the launcher](134-controllers.md) | current |  |
+| 134 | [controllers: stick dead zone, button icons, starting without the launcher](134-controllers.md) | partly superseded | [200](200-unlock-live-and-pack-icons.md) for the icons when a texture pack replaces the menus' font |
 | 135 | [where the player and the room are, in dhd.log and in the room list, and rooms made near...](135-net-region.md) | current |  |
 | 136 | [The resolution scale the GPU allows, said where the player picks it](136-scale-cap.md) | current |  |
 | 137 | [rejoining players no longer clone themselves in online rooms](137-rejoin-clones.md) | current |  |
@@ -173,7 +173,7 @@ out of date). New findings: copy `TEMPLATE.md` to the next free number on the la
 | 140 | [Widescreen everywhere: no 4:3 screens left](140-widescreen-everywhere.md) | current |  |
 | 141 | [touch controls for phones](141-touch-controls.md) | current |  |
 | 142 | [race replays, the attract demo and the ghost on the delta-time clock](142-delta-time-replays.md) | current |  |
-| 143 | [the Android APK as a release asset (release key, update notice, no online on phones)](143-android-release.md) | current |  |
+| 143 | [the Android APK as a release asset (release key, update notice, no online on phones)](143-android-release.md) | partly superseded | [237](237-mobile-all-online.md) for no online on phones; phones offer every room now |
 | 144 | [Shared online track pickups](144-shared-online-pickups.md) | current |  |
 | 145 | [Android black screen on an Adreno 710 (the gralloc lock in the surface format query)](145-android-gralloc-format-hang.md) | current |  |
 | 146 | [The throttled Mi 11i at 2x and 4x paced 60: where a race field goes, and what moved it](146-phone-60.md) | current |  |
@@ -186,6 +186,120 @@ out of date). New findings: copy `TEMPLATE.md` to the next free number on the la
 | 153 | [The native renderer's pipelines on Mali's r54p1 shader compiler](153-mali-shader-compiler-crash.md) | current |  |
 | 154 | [The rider missing from the inventory screen on phones](154-menu-rider-missing-on-phones.md) | current |  |
 | 155 | [The Android build for every arm64 core (ARMv8.0)](155-android-armv8-baseline.md) | current |  |
+| 156 | [Where a frame's time goes, before replacing the VU1 and GS emulation](156-profile-vu1-gs.md) | current |  |
+| 157 | [Keyboard and controller rebinding, in the launcher and in the game](157-control-rebinding.md) | partly superseded | [251](251-controls-pads-3-4.md) for players 3 and 4: they have layouts of their own, `pad3`, `pad4` |
+| 158 | [race frames over Cloudflare Realtime SFU, and puppets with less delay](158-online-sfu-transport.md) | partly superseded | [177](177-sfu-room-sessions.md) for the per-race Realtime sessions set up at the race's start, and TURN credentials per racer per race |
+| 159 | [Touch controls gone after loading a career save](159-touch-gone-after-save-load.md) | current |  |
+| 160 | [Garbage blocks on screen in the first seconds after start](160-boot-garbage-frames.md) | current |  |
+| 161 | [online abuse guard: kill switch, rate limits, bans and a short moderation log](161-online-abuse-guard.md) | current |  |
+| 162 | [Native VU1 and GS rendering, phase 0: what the game draws and how](162-native-vu1-gs-phase0.md) | current |  |
+| 163 | [REVIVED SETTINGS: tabs, a clearer Controls page, online name size](163-revived-settings.md) | current |  |
+| 164 | [Native VU1 rendering, phase 1: the world mesh loop on the GPU](164-native-vu1-world-mesh.md) | current |  |
+| 165 | [no port patch in code the port does not compile](165-dead-patch-guard.md) | current |  |
+| 166 | [Online races on the tracks without a split-screen level (Salt City MX and TD)](166-online-more-tracks.md) | current |  |
+| 167 | [Native VU1 rendering, phase 2: the remaining VU1 programs](167-native-vu1-phase2.md) | current |  |
+| 168 | [Native mesh draws batched, for the render thread](168-native-mesh-draw-batching.md) | current |  |
+| 169 | [online riders closer to now: bundled snapshots, 60 a second, shared clock, prediction](169-online-latency-round2.md) | partly superseded | [202](202-online-riders-rebuild.md) for item 4, the straight-line prediction |
+| 170 | [PowerVR GE8320 phones close at start](170-powervr-ge8320-crash.md) | current |  |
+| 171 | [The picture freezes when the GPU device is lost](171-gpu-device-lost.md) | current |  |
+| 172 | [Fewer state changes per draw on the render thread](172-render-thread-state-changes.md) | partly superseded | [195](195-phone-speed.md) for the constants per draw by instance index: undone, the draw constants are a uniform block at a dynamic offset again |
+| 173 | [STATE snapshots that stop for seconds on the SFU, then arrive at once](173-sfu-snapshot-stalls.md) | current |  |
+| 174 | [60 fps at 2x on a Mali-G52 phone (Redmi 9): the GPU side](174-mali-gpu-60-at-2x.md) | current |  |
+| 175 | [online follow-ups after 0.7.12 (rejoin in a race, setup that never takes a race down, T...](175-online-followups.md) | partly superseded | [177](177-sfu-room-sessions.md) for the rejoin's SFU session restart: `sfu_restart` and the welcome's `race.sfu`; per-race sessions |
+| 176 | [PowerVR GE8320 phones close in the Bike Shop ("Out of Memory")](176-powervr-out-of-memory.md) | current |  |
+| 177 | [one Realtime session per member per room, set up before the race](177-sfu-room-sessions.md) | current |  |
+| 178 | [pre-release online lifecycle review](178-pre-0713-review.md) | partly superseded | [179](179-sfu-review-risks.md) for the three risks left open, now fixed |
+| 179 | [the three SFU risks the pre-release review left open](179-sfu-review-risks.md) | current |  |
+| 180 | [P2P rooms, chosen per room (host star)](180-p2p-prototype.md) | partly superseded | [186](186-p2p-transport.md) for the host's coordinator and the P2P server and Worker, TURN between games and its renewal, host loss ending the room; P2P rooms are server rooms with a hub star and an SFU fallback now |
+| 181 | [the room's region chosen by its creator, a smarter Auto, and a race ping beside the ser...](181-room-region-race-ping.md) | current |  |
+| 182 | [a slow Realtime API call no longer takes a racer out of the race](182-sfu-call-timeouts.md) | current |  |
+| 183 | [Performance settings: shadows and sun glow, lens flare, particles](183-performance-effects.md) | current |  |
+| 184 | [server rollouts that restart rooms only at a safe moment](184-server-rollout.md) | current |  |
+| 185 | [online code we don't maintain, removed](185-online-cleanup.md) | current |  |
+| 186 | [P2P as a race transport of the server's rooms (hub star, SFU fallback)](186-p2p-transport.md) | current |  |
+| 187 | [a racer whose race link delivers nothing no longer races alone](187-silent-race-link.md) | current |  |
+| 188 | [dual-source blending off on Intel GPUs](188-intel-dual-source.md) | current |  |
+| 189 | [Swap L1/L2 and R1/R2 per controller, and the game's codes on touch](189-shoulder-swap-touch-codes.md) | current |  |
+| 190 | [the online room's track list in Super Career order](190-room-track-order.md) | current |  |
+| 191 | [Android 10 (API 29) as the APK's minimum](191-android-10.md) | current |  |
+| 192 | [widescreen sprite width table and menu focal projection](192-widescreen-sprites-focal.md) | current |  |
+| 193 | [helicopters, birds and other scenery at the right speed at every frame rate](193-fast-scenery-high-fps.md) | current |  |
+| 194 | [Native VU (experimental), a Graphics setting on every platform](194-native-vu-option.md) | partly superseded | [198](198-native-vu-default.md) for off by default, "experimental" and the browser left out: Native VU is the players' default on every platform, the browser too since finding 199; the emulated path is only the fallback and the setting's off |
+| 195 | [the phone's biggest remaining costs, measured and cut](195-phone-speed.md) | partly superseded | [198](198-native-vu-default.md) for the encoder cut on Mali GPUs: a picture stays in one encoder there, the cut lost the Mali-G52's device |
+| 196 | [smooth bilinear sprites at high resolution scale](196-native-rt-texture-scale.md) | current |  |
+| 197 | [the phone's vertex loops and palette path, Native VU off](197-phone-speed-2.md) | current |  |
+| 198 | [Native VU is the default](198-native-vu-default.md) | partly superseded | [199](199-native-vu-browser.md) for the browser left out: Native VU runs in the browser too, on by default |
+| 199 | [Native VU in the browser](199-native-vu-browser.md) | current |  |
+| 200 | [Unlock All applies at once; button icons over a texture pack's font](200-unlock-live-and-pack-icons.md) | current |  |
+| 201 | [PowerVR GE8322 (driver 1.18) closes at the first picture's submit](201-powervr-ge8322-submit.md) | current |  |
+| 202 | [online riders that look right: a bench of today's puppets, then a rebuild](202-online-riders-rebuild.md) | current |  |
+| 203 | [Online MOSH PIT closes the game at the race start (issue #84)](203-online-mosh-start.md) | current |  |
+| 204 | [online MOSH PIT rounds run by the game's Mosh Bowl rules](204-online-mosh-bowl.md) | current |  |
+| 205 | [a state trace that does not depend on the core's layout](205-state-trace-core-layout.md) | current |  |
+| 206 | [the online test tools drive their riders; the room card's state beside its tags](206-online-test-riders-room-card.md) | current |  |
+| 207 | [Posters in OPTIONS closes the game (issue 87)](207-posters-crash.md) | current |  |
+| 208 | [the Bike Shop closes the game on a Redmi Note 13 4G (issue #78)](208-bike-shop-crash-redmi-note-13.md) | current |  |
+| 209 | [Touch controls can skip the flight over the track](209-touch-skip-flyover.md) | current |  |
+| 210 | [EXIT GAME on Android aborts in the C library while the process ends](210-android-exit-abort.md) | current |  |
+| 211 | [Three small online and phone UI bugs: wrong race-end message, room stall, keyboard tab...](211-online-ui-small.md) | current |  |
+| 213 | [stack locals that the EE frame makes one object (the class of 094 and 207)](213-stack-overrun-sweep.md) | current |  |
+| 214 | [A D-pad as a touch steering choice, and the touch gaps beside the flyover](214-touch-dpad-and-gaps.md) | current |  |
+| 215 | [Online, the race menu does not pause the race](215-online-menu-no-pause.md) | current |  |
+| 216 | [an online race's last seconds, the finish on every screen, a reset as a respawn](216-online-race-end.md) | current |  |
+| 217 | [Android aborts when the perf log asks an ended thread for its CPU time](217-android-thread-clocks.md) | current |  |
+| 218 | [READY on a phone in an online room, the attract demo's SKIP, the D-pad's place and taps...](218-phone-room-and-touch.md) | current |  |
+| 219 | [three checks that passed when they should fail](219-check-tools-false-pass.md) | current |  |
+| 220 | [another game's snapshots checked before they are used](220-online-snapshot-checks.md) | current |  |
+| 221 | [score rules: the server's mode, one final per rider, a table that stands](221-score-rules.md) | current |  |
+| 222 | [a sound with no position (the crash on the rider screen after an online race)](222-sound-emitter-gone.md) | current |  |
+| 223 | [The pipeline worker's crash in wgpu-hal's DX12 `load_shader` (FXC blobs shared across t...](223-dx12-fxc-shader-cache-race.md) | current |  |
+| 224 | [The native iOS port on main](224-ios-port.md) | current |  |
+| 225 | [one launcher for desktop, Android and iOS, translatable](225-mobile-launcher.md) | current |  |
+| 226 | [Touch layout freedom and tablet defaults](226-touch-layout-freedom.md) | partly superseded | [228](228-android-editor-alone.md) for the launcher's entry point on Android: "The launcher's entry point, and main's" |
+| 227 | [iOS: the launcher's bridge and the first on-screen run's fixes](227-ios-launcher-and-fixes.md) | current |  |
+| 228 | [The launcher's layout editor alone on Android, and the merged main proved](228-android-editor-alone.md) | current |  |
+| 229 | [Touch buttons that show what they do](229-touch-action-icons.md) | current |  |
+| 230 | [Back through the Online menus](230-online-menu-back.md) | current |  |
+| 231 | [PowerVR startup black screen diagnostics](231-powervr-startup.md) | in progress |  |
+| 232 | [Keep non-gamepads out of controller slots](232-pad-slot-filter.md) | current |  |
+| 233 | [Remove finished experiments and migration leftovers](233-finished-experiments.md) | current |  |
+| 234 | [One boot-disc check](234-one-disc-check.md) | current |  |
+| 235 | [Shared launcher rules](235-shared-launcher-rules.md) | current |  |
+| 236 | [the background noticed only at the return (Android, in a race)](236-android-background-miss.md) | current |  |
+| 237 | [phones get every online mode](237-mobile-all-online.md) | current |  |
+| 238 | [the online race load: a live load screen while a game waits, and where a phone's second...](238-online-load-wait.md) | current |  |
+| 239 | [Slow phones start at suitable graphics settings](239-slow-phone-defaults.md) | current |  |
+| 240 | [iOS: the disc reachable without the picker's hand-over](240-ios-disc-pick.md) | current |  |
+| 241 | [Adreno 505 device loss after the menus start](241-adreno-505-stop.md) | current |  |
+| 242 | [Two test tools fixed, one Share-log builder, one phone disc-import rule set](242-shared-phone-rules.md) | current |  |
+| 243 | [Rider tent close on a Helio P35 phone](243-rider-tent-crash.md) | current |  |
+| 244 | [remove the dead code the C audit proved](244-dead-code-c.md) | current |  |
+| 245 | [Bluetooth pad after Android room-code entry](245-pad-after-room-code.md) | current |  |
+| 246 | [Phone SFU fallback and network return](246-phone-online-links.md) | current |  |
+| 247 | [more race frames a second on weak Android phones](247-low-end-android-speed.md) | current |  |
+| 248 | [Racers on the TURN fallback left out of every race](248-turn-players-left-out.md) | current |  |
+| 249 | [Native VU must not cost speed where the GPU limits](249-native-vu-speed.md) | current |  |
+| 250 | [the online room takes the stick; Poster Maker's picture](250-room-stick-and-poster-maker.md) | current |  |
+| 251 | [Bindings for controllers 3 and 4](251-controls-pads-3-4.md) | current |  |
+| 252 | [Why the TURN fallback fails (channel bind timeout, allocate 400)](252-turn-fallback-fails.md) | current |  |
+| 253 | [Native VU finished: the near batches clipped on the VU thread](253-native-vu-finish.md) | current |  |
+| 254 | [online riders and reconnects on bad networks (late or lost snapshots, outages, drops)](254-online-feel-bad-networks.md) | current |  |
+| 255 | [menus, HUD and world at the same speed at 60 and 240 (issue #76)](255-high-fps-sweep.md) | current |  |
+| 256 | [the slow frames on weak phones](256-phone-stutter.md) | current |  |
+| 257 | [where a frame goes now on the throttled phone (0.8.6)](257-frame-budget.md) | current |  |
+| 258 | [the game starts on iPhones with 3 GB of memory (guest memory in two pieces)](258-ios-guest-memory.md) | current |  |
+| 259 | [the Redmi 9 on 0.8.6: Native VU crashes the Mali driver; speed, limits, stutter, picture](259-redmi9-086.md) | current |  |
+| 260 | [the Redmi 9 dies at the title in 0.8.6: the Mali-G52 compiler and the mesh vertex stage](260-mali-mesh-shader.md) | current |  |
+| 262 | [three small fixes after 0.8.7: the guard in a shared folder, 258's Result, software GPUs](262-small-fixes.md) | current |  |
+| 263 | [weak phones start with Performance Mode, at 2x where it reaches 60](263-weak-phone-settings.md) | current |  |
+| 264 | [Native VU only: nothing left on the emulated VU1, then the emulated path deleted](264-native-vu-only.md) | current |  |
+| 266 | [touch players stuck on "PRESS X TO CONTINUE" messages (issue #105)](266-touch-continue.md) | current |  |
+| 267 | [the game runs on the iPhone XR (A12, 3 GB): the CPU floor and the guest memory's second...](267-ios-a12.md) | current |  |
+| 268 | [touch players cannot change what the game's menus change with left/right (issue #108)](268-touch-left-right.md) | current |  |
+| 269 | [watch a running room race from the room (issue #109)](269-room-spectate.md) | current |  |
+| 270 | [Switch speed: bring the port up to main, then cut CPU work](270-switch-performance-plan.md) | in progress |  |
+| 271 | [the online room redesigned, and a results screen at the race end](271-room-redesign.md) | current |  |
+| 272 | [The Nintendo Switch port (homebrew NRO)](272-switch-port.md) | in progress |  |
 | 075 | no file: the portable-core plan was numbered 075 on its branch and merged as 081 | renumbered | see 081 |
 | 113 | no file: the delta-time clock work was numbered 113 on its branch; the mixer's VBLANK time is in 139 | renumbered | see 139 |
 <!-- index:end -->

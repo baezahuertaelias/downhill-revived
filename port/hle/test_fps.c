@@ -19,7 +19,8 @@ int func_00243CE8(int ignored) { (void)ignored; waits++; return 0; }
 void hle_log(const char *fmt,...) { (void)fmt; }
 static double fake_wall=1;
 double host_wall_seconds(void) { return fake_wall; }
-int host_display_hz(void) { return 0; }  /* DHD_FPS=monitor is not checked here */
+static int display_rate;
+int host_display_hz(void) { return display_rate; }
 void func_00155E78(void *p,int kind) { (void)p;recoveries++;recovery_kind=kind; }
 int func_0012D300(void *p) { (void)p;return 0; }
 float func_0012DF48(void *p) { (void)p;return (float)braking; }
@@ -70,6 +71,67 @@ int main(int argc,char **argv)
     int n=atoi(argv[1]);
     /* the core's guest memory: the registers at 0x10000000, PS2 RAM at 0x08000000 */
     host_putenv_s("DHD_FPS",argv[1]);  /* the host environment port_fps reads */
+    if (argc>2 && !strcmp(argv[2],"display")) {
+        display_rate=120;
+        host_putenv_s("DHD_IOS_DISPLAY_AUTO","1");
+        assert(port_fps()==120);
+        port_clock_wall(1);
+        port_clock_reset();
+        D_0029E3D8=0;
+        port_clock_wait(NULL);  /* half a field */
+        assert(port_whole_step()==0);
+        display_rate=60;
+        assert(port_fps_update_display() && port_fps()==60);
+        assert(!port_fps_update_display());
+        fake_wall+=1.0/60;
+        port_clock_wait(NULL);  /* 1.5 cumulative fields */
+        display_rate=120;
+        assert(port_fps_update_display() && port_fps()==120);
+        fake_wall+=1.0/120;
+        port_clock_wait(NULL);  /* exactly two fields */
+        assert(D_0029E3D8==2 && port_whole_step()==1);
+        port_clock_grid(GRID_WHOLE);
+        port_clock_wait(NULL);
+        display_rate=60;
+        assert(port_fps_update_display() && port_frame_period()==1.0/60);
+        port_clock_grid(GRID_PLAY);
+        port_clock_wait(NULL);
+        port_clock_force(90);
+        double replay_period=port_frame_period();
+        assert(fabs(replay_period-0.0125)<1e-9);
+        display_rate=120;
+        assert(port_fps_update_display() && port_frame_period()==replay_period);
+        return 0;
+    }
+    if (argc>2 && !strcmp(argv[2],"away")) {
+        /* A phone's app in the background (present.c's app_away_wait, finding 227): online the
+           clock keeps what the two-field cap left over and gives it back at up to two fields a step,
+           so 17 s away would be fast-forwarded for 17 s; the return rebases the clock instead, and
+           the first step is an ordinary one, offline and online. */
+        port_clock_wall(1);
+        port_loop_frame(1);*(int *)0x0829DED8=9;*(int *)0x0843F348=2;   /* a race's loop runs */
+        for (online=0;online<2;online++) {
+            port_clock_reset();
+            for (int i=0;i<120;i++) { fake_wall+=1.0/n; port_clock_wait(NULL); port_clock_step(); }
+            fake_wall+=17;
+            port_clock_wait(NULL); port_clock_step();
+            if (online) assert(port_fps_behind()>16);   /* without the rebase: 17 s owed */
+            else assert(port_fps_behind()<.04);        /* offline the cap drops it */
+            assert(!port_clock_after_away(0));          /* no return: the debt stays */
+            if (online) assert(port_fps_behind()>16);
+            assert(port_clock_after_away(1));           /* the return, as kernel.c takes it */
+            fake_wall+=1.0/n;
+            port_clock_wait(NULL); port_clock_step();
+            assert(port_step()<=2.000001 && port_fps_behind()<.04);
+            for (int i=0;i<60;i++) {
+                fake_wall+=1.0/n; port_clock_wait(NULL); port_clock_step();
+                assert(port_step()<=60.0/n+.5);   /* no catch-up: steps stay near the rate's */
+            }
+        }
+        online=0;
+        printf("%d: port_clock_after_away, given the return's flag: the time away is no game time\n",n);
+        return 0;
+    }
     assert(port_fps()==n);
     int wall=argc>2 && !strcmp(argv[2],"wall");
     if(n==60 && !wall) {
@@ -82,7 +144,7 @@ int main(int argc,char **argv)
     if (wall) port_clock_wall(1);
     assert(port_delta_clock() && port_animation_scale()==1024);
     port_clock_reset();
-    *(int *)0x0829DED8=9;*(int *)0x0843F348=2;
+    port_loop_frame(1);*(int *)0x0829DED8=9;*(int *)0x0843F348=2;   /* a race's loop runs (fps.h) */
     unsigned char __attribute__((aligned(16))) rider[0x7BD0]={0},bike[0x4C0]={0};
     if (wall) {
         /* The delta-time clock (finding 139): each step is the wall time since the last frame,
@@ -230,6 +292,7 @@ int main(int argc,char **argv)
         assert(port_vblank_seconds()==1.0/n);
         return 0;
     }
+    *(int *)0x0829DED8=22;   /* a career continued from a save races on screen 22 (finding 159) */
     *(void **)(bike+0x158)=rider;bike[0x354]=bike[0x3D4]=1;
     *(int *)(rider+0x7A5C)=1;
     *(float *)(rider+0x7A78)=1;
@@ -246,6 +309,13 @@ int main(int argc,char **argv)
         assert(recoveries==(i==n*2-1)); /* velocity jitter cannot reset immobility */
     }
     assert(recovery_kind==2);
+    port_clock_reset();recoveries=0;port_loop_frame(0);
+    for (int i=0;i<n*3;i++) {
+        *(float *)(bike+0x50)=i&1 ? .05f : -.05f;
+        port_fps_contact_recovery(bike);
+    }
+    assert(!recoveries); /* the menus after a race: the phase is left at 2-4, the front end runs */
+    port_loop_frame(1);
     port_clock_reset();recoveries=0;braking=1;
     for (int i=0;i<n*3;i++) port_fps_contact_recovery(bike);
     assert(!recoveries); /* holding the brake is intentional */
@@ -356,6 +426,19 @@ int main(int argc,char **argv)
             if (marks && timer>0) assert(copy==timer+1);
         }
         assert(timer==0 && cleared==1 && marks==1);
+    }
+    /* Finding 193: a turn capped at an angle a field (a quaternion's w clamp, 0012B448 and the other
+       ground tilts) turns that angle a field at any step; a blend helper called once per event
+       (0012ACC8, 0015B460) moves by retail's rate and least step per call. */
+    {
+        double turned=0, field=2*acos((double)0.9999619f);
+        for (int i=0;i<n;i++) {
+            port_clock_wait(NULL);port_clock_step();
+            turned+=2*acos((double)port_turn_limit(0.9999619f));
+            assert(fabsf(port_blend(port_event_rate(.08f))-.08f)<1e-6f);
+            assert(fabsf(port_event_least(.1f)*port_step()-.1f)<1e-6f);
+        }
+        assert(fabs(turned/(60*field)-1)<.01);
     }
     int scale=port_animation_scale();
     online=1;

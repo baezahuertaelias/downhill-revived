@@ -48,8 +48,9 @@ static inline const char *hle_env(HleEnv *cache, const char *name)
 
 /* ---- host.c ---- */
 void host_init(void);         /* the crash report */
+/* port/host/host_threads.c (finding 217) */
 void host_thread_name(const char *name); /* names the calling OS thread for bench/profile reports */
-unsigned host_thread_cpu(const char **names, double *seconds, unsigned max); /* CPU time of each */
+unsigned host_thread_cpu(const char **names, double *seconds, unsigned max); /* CPU time of each; an ended one's is kept */
 void host_poll_dump(void);   /* optional watchdog request at a kernel boundary */
 void host_backtrace(void);    /* the same report, here */
 void host_settings_load(void); /* dhd.ini next to the exe into DHD_* variables (host.c) */
@@ -69,6 +70,7 @@ int host_setting_locked(const char *name);  /* the environment sets this DHD_* v
 void host_pad_vibrate(int port, int light, int heavy);  /* the DualShock 2's motors to the PC pad */
 void host_widescreen_init(void);  /* DHD_WIDESCREEN: Hor+ field of view, any aspect (widescreen.c) */
 void host_widescreen_vsync(void); /* its live-memory part, once a field */
+double host_widescreen_frame_aspect(void);
 double host_widescreen_aspect(void);  /* the widescreen picture's width / height; 0 when off */
 void widescreen_card_mode(int on);   /* the next field's 2D is for a card: unmapped (widescreen.c) */
 void host_display_aware(void);    /* the process sees real pixels (DPI aware), before any window */
@@ -84,6 +86,8 @@ enum { PAD_SELECT = 0x0001, PAD_L3 = 0x0002, PAD_R3 = 0x0004, PAD_START = 0x0008
 int autopad_read(const char *script, double seconds, uint16_t *buttons);
 int autopad_nav(const char *script, unsigned long long field, uint16_t *buttons);  /* DHD_NAV */
 void race_sync_vsync(unsigned long long field);  /* DHD_RACE_SYNC, see autopad.c */
+void disc_check_field(unsigned long long field);  /* the disc image's files, once a start (online_menu.c) */
+void hle_disc_lookup(const char *path, int found);  /* the crash report's last disc files (cdvd.c) */
 int race_sync_pad(int player, uint16_t *buttons);
 double race_sync_seconds(void);  /* race clock seconds after GO (DHD_RACE_SYNC), -1 before */
 int race_sync_capture(const char *prefix, char *name, size_t size);
@@ -102,10 +106,16 @@ void host_pad_read(int port, HostPad *out);  /* a script if one is set, else the
 int host_pad_script(int player, HostPad *out);  /* DHD_NAV / DHD_AUTOPAD / DHD_RACE_PAD; 0 if none */
 void host_pad_device(int port, HostPad *out);   /* the controller, and for port 0 the keyboard too */
 
-/* keyboard.c: keys (Windows virtual-key codes, down[key] != 0) as a pad, merged into `out`;
-   `riding`: the game's riding controls are on (D_0029E290), the arrows move the left stick. */
-void keyboard_pad(const uint8_t down[256], int riding, double now, HostPad *out);
-const uint8_t *keyboard_keys(int *count);  /* the keys it reads */
+/* A keyboard or controller layout (port/hle/controls_table.h, finding 157): which key or
+   controller input stands for each PS2 button. */
+struct ControlsLayout;
+
+/* keyboard.c: keys (Windows virtual-key codes, down[key] != 0) as a pad by the layout (NULL: the
+   default one), merged into `out`; `riding`: the game's riding controls are on (D_0029E290), the
+   d-pad's keys move the left stick. */
+void keyboard_pad(const struct ControlsLayout *layout, const uint8_t down[256], int riding, double now, HostPad *out);
+/* The keys it reads with the layout (NULL: the default one) into list (49 at most): their count. */
+int keyboard_keys(const struct ControlsLayout *layout, uint8_t *list);
 void keyboard_reset(void);
 int keyboard_game_axis(int raw);           /* the game's reading of a stick byte (-127..127) */
 int keyboard_script(const char *script, double seconds, uint8_t down[256]);  /* DHD_KEYS */
@@ -115,6 +125,9 @@ int keyboard_script(const char *script, double seconds, uint8_t down[256]);  /* 
 void keyboard_key(unsigned position, unsigned typed, int down);
 unsigned keyboard_typed_of(unsigned position);  /* what that key types on the current layout */
 int keyboard_position_down(unsigned position);
+/* The keys pressed since the last call, held or already let go (taps[position] != 0), then none:
+   once a field, so a tap shorter than a field still counts for one (finding 262). */
+void keyboard_taps_take(uint8_t taps[256]);
 int keyboard_is_down(unsigned typed);           /* a key that types `typed` is held */
 void keyboard_focus(int focused);               /* the game's window has the keyboard */
 int keyboard_focused(void);
@@ -122,11 +135,25 @@ enum { VKEY_SHIFT = 0x10, VKEY_CONTROL = 0x11, VKEY_MENU = 0x12, VKEY_LWIN = 0x5
 
 /* gamepad.c: controllers through SDL3 (XInput, DirectInput, HID: DualSense, DualShock 4, Switch
    Pro and the generic pads in SDL's mapping database). gamepad_start: 1 if SDL is running. The
-   pads are read on the SDL thread (sdl_host.c: the main thread), which calls gamepad_thread_*. */
+   pads are read on the SDL thread (sdl_host.c: the main thread), which calls gamepad_thread_*.
+   A controller's state by its inputs' places (GamepadRaw: a bit per input id of
+   controls_table.h, the triggers' bytes 0-255, SDL's stick axes: left X, Y, right X, Y), which
+   gamepad_apply turns into the PS2 pad's with a layout and the sticks' dead zone (stick.h). */
+typedef struct {
+    uint32_t buttons;
+    uint8_t trigger[2];
+    int16_t axis[4];
+} GamepadRaw;  /* 16 bytes */
 int gamepad_start(void);
-int gamepad_read(int player, HostPad *out);  /* 0: no controller for that player */
+void gamepad_set_multiplayer(int local_multiplayer); /* game thread publishes setup before reading pads */
+int gamepad_raw(int player, GamepadRaw *out);  /* 0: no controller for that player */
+/* The game's read once a field (host_pad_device): the same, with every button held at any moment
+   since the last such read, so a press shorter than a field still counts for one (finding 262). */
+int gamepad_raw_take(int player, GamepadRaw *out);
+void gamepad_apply(const struct ControlsLayout *layout, const GamepadRaw *raw, int dead_zone, HostPad *out);
+int gamepad_place(const struct ControlsLayout *layout, int id);  /* id's place with the layout's Swap L1/L2, R1/R2 */
+int gamepad_input_id(const char *name);  /* a controls_table.h input's id by its dhd.ini name (0: none) */
 void gamepad_vibrate(int player, int light, int heavy);
-void gamepad_dead_zone(int dead);  /* stick.h: STICK_GAME or a percentage */
 /* What a controller's buttons are labelled: for the button icons (port/gs/button_icons.c). */
 enum { PAD_KIND_NONE = 0, PAD_KIND_PLAYSTATION = 1, PAD_KIND_XBOX = 2, PAD_KIND_NINTENDO = 3 };
 int gamepad_kind_of(int type, int south_label);  /* PAD_KIND_* of an SDL_GamepadType and its bottom button's label */
@@ -139,6 +166,14 @@ union SDL_Event;
 int touch_host_event(const union SDL_Event *e);
 void touch_host_tick(void);
 void touch_host_merge(HostPad *out);
+/* 1 when the pad's button names apply: no touch here, or a controller sent input since the last
+   touch (port/host/touch_host.c, finding 227) */
+int touch_host_pad_prompts(void);
+/* The app left the screen (1) or came back (0), a phone's background (port/gs/present.c's
+   app_away_wait, finding 227): the touch controls let go and pause a race offline at the return,
+   the sound pauses, the freeze watch expects no field meanwhile. Game thread. */
+void host_app_away(int away);
+void touch_host_app_away(int away);   /* port/host/touch_host.c */
 /* sdl_host.c's SDL thread: the pads' start (1 if up), a device change, and every pass. */
 int gamepad_thread_start(void);
 void gamepad_device(int change, unsigned id);
@@ -181,6 +216,9 @@ int graphics_deferred(void);
 void graphics_vblank(void);
 void graphics_present(const void *payload, unsigned bytes);
 extern void (*graphics_present_marked)(const void *payload);
+/* present.c (finding 236): called from the game thread's waits for the drawing (graphics_queue.c),
+   so a phone's app that left the screen meanwhile waits there; `where` names the wait. */
+extern void (*graphics_away_wait)(const char *where);
 
 /* ---- sif.c: RPC servers (one per IOP module server id) ---- */
 typedef void (*RpcServer)(int fno, void *send, int ssize, void *recv, int rsize);

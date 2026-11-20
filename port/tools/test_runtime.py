@@ -36,7 +36,7 @@ def python_checks():
     check_scalar_guard()
     for name in ('quad_abi', 'scalar_dispatch', 'format_abi', 'shared_scalars', 'particle_packets', 'scalar_abi',
                  'particle_float', 'ready_ratio', 'tween_float', 'terrain_float', 'slab_float', 'proximity_float',
-                 'npc_distance_float', 'rider_step', 'blend_float', 'virtual_scale'):
+                 'npc_distance_float', 'rider_step', 'blend_float', 'virtual_scale', 'state_diff', 'rider_states'):
         __import__('test_' + name).main()
 
 
@@ -86,16 +86,85 @@ def guest_tests():
     run('member-abi', [member_test])
     run('autopad', [HLE / 'autopad.c', HLE / 'test_autopad.c'])
     run('game-options', [HLE / 'game_options.c', HLE / 'test_game_options.c'])
+    run('settings-tabs', [HLE / 'test_settings_tabs.c'])
     run('keyboard', [HLE / 'keyboard.c', HLE / 'test_keyboard.c'])  # layout and steering ramp (finding 059)
-    run('sif', [HLE / 'sif.c', HLE / 'test_sif.c'])
+    # the SIF packets live in the HLE window (memory.h): here at 15 MiB of a 16 MiB guest, not at
+    # 0x70004000, which would need the guest to be 1.8 GB
+    run('sif', [HLE / 'sif.c', HLE / 'test_sif.c'], defines=['PS2_HLE_WINDOW=0x00F00000u'], memory=0x01000000)
+    run('pad-snapshot', [HLE / 'test_pad_snapshot.c'])
+    run('state-bundle', [HLE / 'test_state_bundle.c'])  # STATE bundles fit a datagram (finding 169)
+    run('online-start', [HLE / 'test_online_start.c'])  # no solo start (finding 187)
+    run('online-end', [HLE / 'test_online_end.c'])  # why a race closes, never the wrong blame (finding 211)
+    run('room-view', [HLE / 'test_room_view.c'])  # the room's rows, names and results (finding 271)
+    run('disc-notice', [HLE / 'test_disc_notice.c'])  # a changed disc image's notice, once per image (finding 208)
+    run('puppet-sync', [HLE / 'test_puppet_sync.c'])  # puppets steered by their snapshots (finding 202)
+    run('puppet-link', [HLE / 'test_puppet_link.c'])  # the test link: loss, delay, outages, hitches (finding 202)
+    run('puppet-record', [HLE / 'test_puppet_record.c'])  # another game's records checked before use (finding 220)
     run('timer', [HLE / 'timer.c', HLE / 'test_timer.c'])
     run('sound', [HLE / 'sound.c', HLE / 'test_sound.c'], defines=['SND_NO_HOST'])
+
+
+END_STUB = ROOT / 'port/host/test_host_end_stub.c'  # host_end.h's registration for programs that never end through it
+
+
+def end_tests():
+    """How the process ends (port/host/host_end.c, finding 210)."""
+    import time
+    exe = testprog.host('host-end', [ROOT / 'port/host/host_end.c', ROOT / 'port/host/test_host_end.c'], sdl=True)
+    p = testprog.run(exe, 'order', expect=7, quiet=True)
+    # by stage, the last added first within one, and no atexit handler after host_end
+    assert p.stdout.splitlines() == ['workers', 'render', 'report', 'devices b', 'devices a', 'log'], p.stdout  # no atexit after
+    p = testprog.run(exe, 'exit', expect=4, quiet=True)  # a missed path ends in the same order
+    assert p.stdout.splitlines() == ['render', 'log', 'atexit ran'], p.stdout
+    p = testprog.run(exe, 'thread', quiet=True)  # joined first, no destructor under the thread
+    assert 'thread joined' in p.stdout and 'VIOLATION' not in p.stdout and 'destructor done' not in p.stdout, p.stdout
+    # the Android abort in miniature: without the stop handler the destructor runs under the thread
+    p = testprog.run(exe, 'unjoined', expect=42, quiet=True)
+    assert 'VIOLATION' in p.stdout, p.stdout
+    start = time.time()
+    p = testprog.run(exe, 'hang', env={'DHD_END_TIMEOUT_MS': '300'}, expect=5, quiet=True)
+    assert 'still running' in p.stderr and 'stuck' in p.stderr and time.time() - start < 5, p.stderr
+    testprog.run(exe, 'nested', expect=9, quiet=True)
+    kept = OUT / 'host_end_kept.txt'
+    kept.unlink(missing_ok=True)
+    testprog.run(exe, 'flush', kept, quiet=True)  # the open file's buffer reached the disk
+    assert kept.read_text() == 'kept'
+
+
+def thread_tests():
+    """The named threads' CPU times (port/host/host_threads.c, finding 217): an ended thread is
+    never asked by handle, its time is kept."""
+    exe = testprog.host('host-threads', [ROOT / 'port/host/host_threads.c', ROOT / 'port/host/test_host_threads.c'],
+                        sdl=True)
+    p = testprog.run(exe, quiet=True)
+    assert p.stdout.splitlines()[-1] == 'ok' and 'FAIL' not in p.stdout, p.stdout
+
+
+def sanitized(name, sources):
+    """A test program on the host under the address sanitizer (finding 220: the receive path's
+    fuzz). On Windows its runtime DLL is copied next to it from the toolchain; a toolchain without
+    one is said and skipped."""
+    import shutil
+    flags = ['-fsanitize=address', '-fno-omit-frame-pointer', '-g']
+    if testprog.WINDOWS:
+        found = sorted(Path(testprog.CLANG).resolve().parent.parent.glob('lib/clang/*/lib/windows/clang_rt.asan_dynamic-x86_64.dll'))
+        if not found:
+            print('%s: no address sanitizer runtime in this toolchain; skipped' % name)
+            return
+        exe = testprog.host(name, sources, flags=flags)
+        shutil.copy(found[-1], Path(exe).parent)
+    else:
+        exe = testprog.host(name, sources, flags=flags)
+    testprog.run(exe)
 
 
 def host_tests():
     """The host's code: the GS, its captures, VU1 and the VIF, the graphics queue and the SDL
     devices. The GS renderer's own tests (test_gpu, test_depth, test_present) run on the Rust
     renderer: port/tools/test_gs_wgpu.py."""
+    end_tests()
+    thread_tests()
+    sanitized('puppet-record-asan', [HLE / 'test_puppet_record.c'])  # random and mutated records (finding 220)
     gs = [GS / 'memory.c', GS / 'gs.c']
     run = lambda name, sources, *args, env=None, **kw: testprog.run(testprog.host(name, sources, **kw), *args, env=env)
     run('gs', gs + [GS / 'display.c', GS / 'test_gs.c'], low=True)
@@ -105,9 +174,9 @@ def host_tests():
     testprog.run(capture, capture_dir)
     testprog.run(capture, capture_dir, 6)
     run('vu1', [RT / 'vu0_interp.c', RT / 'test_vu1.c', testprog.HOST_FP] + gs, low=True)
-    vif = [RT / 'vu0_interp.c', HLE / 'vif.c', HLE / 'graphics.c', HLE / 'test_vif.c'] + gs
+    vif = [RT / 'vu0_interp.c', HLE / 'vif.c', HLE / 'graphics.c', HLE / 'test_vif.c', END_STUB] + gs
     run('vif', vif, low=True)
-    queue = testprog.host('graphics-queue', [HLE / 'graphics_queue.c', HLE / 'test_graphics_queue.c'],
+    queue = testprog.host('graphics-queue', [HLE / 'graphics_queue.c', HLE / 'test_graphics_queue.c', END_STUB],
                           defines=['GRAPHICS_QUEUE_TEST'], sdl=True, low=True)
     testprog.run(queue)
     testprog.run(queue, 'inline')
@@ -116,13 +185,54 @@ def host_tests():
     # SDL3 starts and enumerates the controllers (none needed): gamepad.c's smoke test, with the
     # SDL thread (host/sdl_host.c), the keyboard and the text field it feeds (W11)
     # and gamepad.c's reading of what SDL reports: the pads' kinds and the sticks' dead zone (finding 134)
-    gamepad = testprog.host('gamepad', [HLE / 'gamepad.c', HLE / 'keyboard.c', HLE / 'text_input.c',
-                                        ROOT / 'port/host/sdl_host.c', HLE / 'test_gamepad.c'], sdl=True, low=True)
+    gamepad = testprog.host('gamepad', [HLE / 'gamepad.c', HLE / 'gamepad_layout.c', HLE / 'keyboard.c', HLE / 'text_input.c',
+                                        ROOT / 'port/host/sdl_host.c', HLE / 'test_gamepad.c', END_STUB],
+                          sdl=True, low=True)
     testprog.run(gamepad)
     testprog.run(gamepad, 'mapping')
     # the touch controls' rules: scaling, flick lanes, sprint and resume guards, the trick stick,
     # the pause rows' steps (finding 141)
     run('touch', [HLE / 'touch.c', HLE / 'test_touch.c'])
+    # how the run before ended on iOS, every way (port/ios/host/run_record.c, finding 227)
+    run('run-record', [ROOT / 'port/ios/host/run_record.c', ROOT / 'port/ios/tests/test_run_record.c'])
+    # where iOS's guest memory goes in an address space shaped like an iPhone's (finding 258)
+    run('guest-place', [ROOT / 'port/host64/guest_place.c', ROOT / 'port/host64/test_guest_place.c'])
+    # and that no access of the core reaches what lies between and above its two parts (finding 258)
+    run('guest-access', [ROOT / 'port/host64/test_guest_access.c'], includes=[ROOT / 'port/host64', testprog.WABT / 'include'],
+        defines=['WASM_RT_MEMCHECK_BOUNDS_CHECK=1', 'WASM_RT_SKIP_BOUNDS_CHECKS=1'])
+    # the phones' update lookup, with the source Android's notice logs (finding 235)
+    run('phone-update', [ROOT / 'port/host/test_phone_update.c',
+                         ROOT / 'port/net/update_check.c', ROOT / 'port/net/json.c'])
+    # the launcher's link rule, shared by the desktop, Android and iOS bridges (finding 235)
+    run('launcher-link', [ROOT / 'port/host/test_launcher_link.c'])
+    # the phones' Share log file and launcher.log (finding 242)
+    bundle_dir = OUT / 'log-bundle'
+    for old in bundle_dir.glob('*'):
+        old.unlink()
+    bundle_dir.mkdir(exist_ok=True)
+    run('log-bundle', [ROOT / 'port/host/log_bundle.c', ROOT / 'port/host/test_log_bundle.c'], bundle_dir)
+    # the iOS launcher's calls with a fake page (finding 227)
+    calls_dir = OUT / 'launcher-calls'
+    calls_dir.mkdir(exist_ok=True)
+    run('launcher-calls', [ROOT / 'port/ios/host/launcher_calls.c', ROOT / 'port/net/json.c',
+                           ROOT / 'port/ios/tests/test_launcher_calls.c'], calls_dir, includes=[ROOT / 'port'])
+    # the settings' order: saves and PLAY on several threads, none lost (finding 227)
+    run('launcher-order', [ROOT / 'port/ios/host/launcher_calls.c', ROOT / 'port/net/json.c',
+                           ROOT / 'port/ios/tests/test_launcher_order.c'], calls_dir, includes=[ROOT / 'port'])
+    # the render gate a phone's background holds (port/gs/render_gate.h, finding 227)
+    run('render-gate', [GS / 'test_render_gate.c'])
+    # a phone's app back from the background: the came-back flag, the touch pause offline only, the
+    # snapshot clock standing once (port/host/app_away.c, finding 227)
+    run('app-away', [ROOT / 'port/host/app_away.c', HLE / 'touch.c', ROOT / 'port/host/test_app_away.c'])
+    # the disc image's own check every platform makes (port/host/disc_check.c, finding 227)
+    sys.path.insert(0, str(ROOT / 'port/host'))
+    from disc_fixtures import write as write_disc_fixtures
+    fixtures = OUT / 'disc-fixtures'
+    write_disc_fixtures(fixtures)
+    run('disc-check', [ROOT / 'port/host/disc_check.c', ROOT / 'port/host/test_disc_check.c'], str(fixtures))
+    # the phones' disc import rules, Android's and iOS's (port/host/disc_import.c, finding 242)
+    run('disc-import', [ROOT / 'port/host/disc_import.c', ROOT / 'port/host/disc_check.c',
+                        ROOT / 'port/host/test_disc_import.c'], defines=['DISC_PUBLISH_TEST_PAUSE'])
 
 
 def main():
@@ -136,7 +246,7 @@ def main():
     guest_tests()
     host_tests()
     scripts = ['test_rider_time', 'test_rider_interaction', 'test_npc_animation', 'test_rider_input', 'test_float',
-               'test_port_headers']
+               'test_port_headers', 'test_patch_guard', 'test_rustgs_key', 'test_fps', 'test_menu_pads']
     if os.environ.get('DHD_PCSX2_VU'):
         scripts += ['test_vu1_pcsx2', 'test_vu0_pcsx2']
     for script in scripts:

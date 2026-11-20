@@ -36,18 +36,35 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
 ## The port: how it is built
 
 - **One portable core:** `port/tools/build_wasm.py` compiles every `src/` unit (rewritten by
-  `port/tools/transform.py` with the patches of `port/patches*.py`), the asm-only functions
+  `port/tools/transform.py` with the patches of `port/patches*.py`; a patch in code the port
+  doesn't compile is refused, finding 165), the asm-only functions
   recompiled to C (`recomp.py`), the module-side runtime and HLE and the data image into one
   wasm32 module, `build/wasm/dhd_core.wasm` (findings 081, 082).
 - **One host build script:** `port/tools/build_host64.py --target win-x64|linux-x64|macos-arm64|
-  android-arm64` (wasm2c, the 64-bit host `port/host64` + `port/host`, the Rust library; finding
+  android-arm64|ios-arm64|ios-sim-arm64` (wasm2c, the 64-bit host `port/host64` + `port/host`, the Rust library; finding
   099). `port/tools/build.py` runs core + host in one command. Setup: `docs/BUILDING.md`; what
   each step costs and what is cached: its "Build times" section (finding 151).
 - **Browser:** `port/web/build.py build/wasm/dhd_core.wasm` (findings 083, 087).
 - **Android:** `port/android/build_apk.py` (debug, `--release` with the release key named by the
-  `DHD_ANDROID_*` variables; findings 091, 143).
+  `DHD_ANDROID_*` variables; findings 091, 143). Android 10 (API 29) and later: calls from newer
+  APIs are chosen at run time (finding 191).
+- **iOS:** `port/ios/build_ios.py` on a Mac (`--simulator`, or `--unsigned` for the device app and
+  its unsigned IPA), from the Windows build's wasm2c parts; the shared touch controls and settings
+  (Android's rows), the shared launcher as the app's entry (finding 227); every online mode, as Android
+  (finding 237; the port by Gustavo Ribeiro, finding 224). Its guest memory is reserved in two
+  parts, each at its own host address, so it fits the address space of a device with 3 GB
+  (findings 258, 267); the code is built for the A12 and the IPA audit refuses any instruction
+  above it (finding 267).
+- **Nintendo Switch (homebrew, not released):** `build_host64.py --target switch-arm64` makes an NRO
+  for a modded console (devkitA64 and libnx, a deko3d renderer in C, `port/nx`; findings 272, 270).
+  Title, menus and a race run on the console at about 45-53 fields/s; EXIT GAME returns to the
+  Homebrew Menu. Its draw shaders are a pinned copy of 0.7.6's (uam miscompiles main's); no online,
+  texture packs, button rebinding or Native VU there yet.
 - **Launcher:** `port/launcher` (Tauri; settings, rider name, updates, disc choice; finding 093;
-  native window buttons on macOS, finding 150).
+  native window buttons on macOS, finding 150). Its page (`port/launcher/ui`) is the one launcher
+  UI of every platform: Android shows it in a WebView (`LauncherActivity`, the app's entry) through
+  the bridge in `port/launcher/BRIDGE.md`, and iOS in a WKWebView (`port/ios/app/launcher.m`,
+  finding 227); strings in `ui/lang` (finding 225).
 - **Releases:** `port/tools/package_release.py` builds, checks and packages each platform
   (`docs/BUILDING.md`, "Releases"; the `release` skill).
 - Retired, do not bring back: the 32-bit i686 build, the Direct3D 11 renderer, the C wgpu-native
@@ -58,63 +75,240 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
 - `port/hle/` replaces the PS2 system: EE kernel (threads as fibers, `port/host64/fiber.c`),
   crt0, SIF RPC, disc and file I/O, DMA, VIF0/VIF1, timers, pads, memory card, the sound driver
   (989snd replaced by `sound.c`, findings 022, 133), movies (`movie.c`, libmpeg2, finding 055).
+  A positional sound with no position (the rider screen's chatter) takes its angle from the
+  origin, as its distance already did (finding 222: it read address 0 and crashed there after a
+  race).
 - The game data image is read at start from the player's `SCUS_971.77` (SHA-1 checked,
   `game_data.c`); the executable holds only the words the port changes (finding 053).
+- Stack locals: the game's C code is compiled by clang, which lays out a function's locals as it
+  likes, while the retail code sometimes reads or writes past a local into what the EE frame puts
+  after it (a 16-byte store into a 4-byte float, a matrix read from four separate vectors). The
+  port's copy of each such function declares the object the EE frame really holds
+  (`port/patches_stack.py`, `port/patches.py`; `src/` keeps matching). `port/tools/stack_escapes.py`
+  finds them from the matching compiler's frames and fails `check.py port` on an unreviewed write
+  overrun (findings 094, 207, 213).
 - Inline asm runs on an emulated EE/FPU/VU0 register file (`port/runtime/ps2asm.c`,
   `ps2asm_aot.py`); EE float rounding follows PCSX2's (finding 026). VU0 microprograms are native
   or compiled (`vu0_micro.c`, `vu0_aot.py`); VU1 runs compiled blocks plus native kernels
-  (`vu1_aot.py`, `vu1_native_clip.py`), checked against PCSX2's interpreter (findings 030, 090).
+  (`vu1_aot.py`, `vu1_native_clip.py`), checked against PCSX2's interpreter (findings 030, 090),
+  and, with Native VU (the players' default on every platform, the browser included: findings
+  198, 199), the translated batch loops as GPU shaders instead (findings 164, 167, 194), their
+  near-bound triangles clipped on the VU thread as the loops' clipper does (finding 253), their
+  first batches through 06E0 and 3258 too, and programs 0030/0050 (kick the EE's packet) in C for
+  every renderer (finding 264). The emulated VU1 stays: the setup programs, overlay B's four quad
+  loops and overlay A run there, and the exact renderer, the state traces and the referee's GS
+  captures need its kicks (finding 264 lists what blocks the deletion).
 - GS: GS memory and registers in C (`port/gs/`); the Rust renderer (`port/render`, wgpu: DX12 or
   Vulkan on Windows, Metal on Apple, Vulkan on Linux and Android, WebGPU in the browser) behind
   the shared C front ends `gpu_exact.inc` (exact: the PS2's pixels, the reference) and
-  `native_core.inc` (native, upscaled, the player default). Findings 084-086, 088, 131.
+  `native_core.inc` (native, upscaled, the player default). Findings 084-086, 088, 131. A lost GPU
+  device ends the game with a message box instead of a frozen picture (desktop and Android; tried on
+  Direct3D 12; finding 171). Dual-source blending is off on Intel GPUs (`device::dual_source`;
+  `DHD_WGPU_DUAL_SOURCE=0|1` overrides; finding 188): an Ice Lake GPU hung on it (issue #58).
+  Upscaled bilinear sprites interpolate at output resolution (foliage and particles); only
+  nearest-filtered sprites retain GS-pixel snapping (finding 196). On Vulkan with timeline
+  semaphores every submit gives each semaphore a value (binary waits 0; vendored wgpu-hal
+  `vulkan/semaphore_list.rs`, finding 201), and dhd.log says which way submits signal. On
+  Direct3D 12 the shader cache keeps a copy of a compiled shader's bytecode, not FXC's blob that
+  threads shared (upstream wgpu#10547's fix backported into the vendored wgpu-hal, finding 223).
 - **The game clock:** one delta-time clock at every frame rate, 60 included and online: each
   paced frame steps by the real time since the last, between one step at the selected rate and two
   fields (finding 139, `port/hle/fps.c`, `port/hle/kernel.c`). Deterministic runs keep the
   original clock, so state traces are unchanged. Replays, the attract demo and ghosts run on a
-  field grid (finding 142).
+  field grid (finding 142). The track's actors (helicopters, birds, animals, walkers, crowds) step
+  by game time too (`port/patches_fps.py`, finding 193); a few steering loops are still up to
+  25 % off at 240 (issue #76). `port/tools/rate_sweep.py` compares every scene's state at 60 and
+  240 (finding 255: the title's pulse, the effects' matrix and the menus' age fixed there).
 - Host services: one code path on SDL3 for every platform (finding 099): `host_sdl.c` (files,
   clock, frame waits, display, threads, the error box), `sdl_host.c` (SDL's loop on the main
   thread, the game on its own thread), `present.c` (the window), `sound_out_sdl.c` (one sound
-  output), controllers through SDL only (findings 059, 134), touch controls on phones
-  (`port/hle/touch.c`, finding 141).
+  output), controllers through SDL only (findings 059, 134; Swap L1/L2 and R1/R2 per controller,
+  finding 189), touch controls on phones (`port/hle/touch.c`, finding 141; the game's codes from
+  the touch pause menu, finding 189; a SKIP button in the flight over the track, finding 209, and
+  in the movies and the title's attract demo, findings 214 and 218; a D-pad as a third touch
+  steering choice, finding 214, placed clear of the game's HUD, finding 218; MENU over a replay,
+  also above 60 updates a second, finding 218; per-control sizes 25-600 %, free placement, undo
+  and redo in the layout editor, tablet defaults, the editor alone for the launcher
+  (`DHD_TOUCH_EDITOR`), tilt on iOS, finding 226; Android's launcher row starts the editor alone and
+  shows again after its Done, iOS's opens the editor over the game's menus, finding 228; Button
+  Style: the PS2 symbols, the default, or pictures of each button's action with a badge of its
+  pad name, the pictures drawn as signed distances from `port/render/src/present/touch_icons.txt`,
+  and a steering area that no moved button can take away, finding 229).
+- A phone's app away from the screen (Android and iOS, `present.c`'s `app_away_wait`, finding 227):
+  the game waits, fingers are let go, the sound pauses, the freeze watch is quiet; at the return an
+  offline race is in the game's own pause (online it goes on, finding 215) and the core's clock
+  starts again from now (`host_service_host_came_back`: no game time is caught up). On a touch
+  screen the button names (icons, SETTINGS' Tabs line) are a controller's only once it has sent
+  input since the last touch (`touch_host_pad_prompts`). iOS has no system Back: a swipe in from
+  the left edge outside a race is Android's Back, and our pages' own legends (Back, Undo, Keep,
+  Clear) answer a tap on every platform (finding 227).
+- The disc image's own check is one for every platform (`port/host/disc_check.c`, from host.c's
+  `disc_problem`: ISO 9660, SYSTEM.CNF booting SCUS_971.77, the whole declared volume), then the
+  game's data check in the core. Desktop launcher uses a Rust file-reader FFI adapter; Android's
+  seekable document pre-check uses JNI and positional FileChannel reads; iOS uses `host_disc_check`
+  (findings 227, 234). Android's copy/import completeness policy is separate.
+- The game ends through `host_end` (`port/host/host_end.c`, finding 210), never `exit()`: the work
+  threads and the render thread stop, the closing log lines are written, open files are flushed,
+  and the process leaves without the C library's static destructors. New code that must run at the
+  end registers with `host_end_add`, not `atexit`. A named thread that ends keeps its CPU time and
+  is never asked for it by handle afterwards (`port/host/host_threads.c`, finding 217: the
+  Android abort at exit and after a movie), so the exit's `perf: session` lines stay whole.
 - dhd.log on every platform, with `perf:` lines on speed and what limits it (finding 129) and
   `net:` lines online (finding 135). What the game can detect goes in the log. Each start keeps
   the one before as dhd-previous.log; on Android the log says how the run before ended (Android's
-  exit record and tombstone), and a crash dialog and the icon's shortcut share it (finding 152).
+  exit record and tombstone; on Android 10 only the game's own crash report, finding 191), and a
+  crash dialog and the icon's shortcut share it (finding 152). A crash report names the disc
+  files the game looked up last, and a guest memory fault says whether it read or wrote
+  (finding 208).
+- The disc image's files are checked against the USA disc's once per image, from the main menu's
+  first frame (finding 098's `dhd_disc` check on a low-priority thread, cached in
+  `iso-check.txt`; not in timed, deterministic or traced runs): dhd.log says the answer
+  (`disc check:`), and an image that differs gets one notice in the main menu naming the first
+  file that differs, remembered per image in `disc-notice.txt` (`port/hle/disc_notice.c`,
+  finding 208).
 
 ## What players get
 
-- PC SETTINGS in the game's options, saved to dhd.ini (findings 064, 101): resolution scale
-  (capped by GPU memory and said so, finding 136), window mode, widescreen with the HUD anchored
-  and no 4:3 screens left (findings 056, 140), frame rate 60-240 or Monitor (findings 067, 139),
-  V-Sync, texture packs in PCSX2's format (finding 057), the sharp font (finding 058), movies,
-  vibration, stick dead zone and button icons (finding 134), FPS & Ping counter (finding 120),
-  Unlock All (finding 095), EXIT GAME. dhd.ini has one implementation, the Rust crate
-  `dhd_settings` (`port/render/settings`), used by the game, the launcher and the browser.
+- REVIVED SETTINGS at the top of the game's options, with Display, Graphics, Controls, Online
+  and Game tabs (finding 163), saved to dhd.ini (findings 064, 101): resolution scale
+  (capped by GPU memory and said so, finding 136), window mode, widescreen with the HUD anchored,
+  no 4:3 screens left and VU1 sprites at their 4:3 shape (findings 056, 140, 192), frame rate 60-240 or Monitor (findings 067, 139),
+  V-Sync, texture packs in PCSX2's format (finding 057), the sharp font (finding 058), a
+  Performance group (shadows and sun glow, lens flare, particles; finding 183), Native VU
+  (on by default: VU1 programs as GPU shaders, falls back to the emulated VU when
+  the GPU can't; findings 164, 167, 194, 198, 199), movies,
+  vibration, stick dead zone and button icons (finding 134; also over a texture pack's font,
+  finding 200), the keys and controller buttons for
+  the PS2 pad's buttons, per player (four controllers, finding 251), in the game and the launcher (Controls, finding 157), FPS &
+  Ping counter (findings 120, 169), online name size (finding 163), Unlock All (finding 095;
+  applied at once, finding 200),
+  EXIT GAME. dhd.ini has one implementation, the Rust crate `dhd_settings`
+  (`port/render/settings`), used by the game, the launcher and the browser.
 - The launcher holds settings, rider name and updates on every desktop platform, decides the one
   data folder (`DHD_SETTINGS`, `DHD_MEMCARD_DIR`, `DHD_DATA_DIR`), updates from `latest.json`
-  with a backup through the server's `/v1/latest` (findings 093, 125, 138). A phone has no
-  launcher: the game checks once a day and shows a notice (finding 143).
+  with a backup through the server's `/v1/latest` (findings 093, 125, 138). On Android the same
+  launcher page opens at every start (unless the `launcher` setting is off): the disc import, the
+  settings that are hard to change in the game, the update line (the game's own check; a direct
+  start keeps the in-game notice, finding 143), Help with Share log (finding 225). iOS opens into the
+  same page with the same calls (finding 227); a direct start there has no in-game update notice.
+  On iOS the disc also comes in without the picker: any `.iso` in the app's Files folder (or its
+  Inbox) is found when the launcher opens and at each return, and "Open in" hands one over; every
+  step is in `launcher.log`, which Share log carries (finding 240).
 - Discord Rich Presence on the desktop (finding 106). The mouse works in the port's pages and the
   game's popups (finding 092).
 
 ## Online play
 
-- Offered on Windows, macOS and Linux; not on Android or in the browser
-  (`host_service_net_offered`, finding 143).
+- SFU rooms (public, private, Quick Race) on Windows, macOS, Linux, Android and iOS (phones since
+  finding 237); P2P rooms there and in the browser, which offers nothing else
+  (`host_service_net_offered`, findings 143, 180, 186).
+- A lost link comes back on its own: the race link gets a new SFU session after about 5 s dead and
+  the room connection rejoins ("Connection lost, reconnecting..."); a refused TURN leaves the UDP
+  attempt running (finding 246). An absence over about 30 s in a race ends it ("Connection lost").
 - **State sync, never lockstep:** each PC runs its own one-player race at its own frame rate and
-  shows the others, and on guests the host's AI riders, as puppet riders moved from snapshots
-  (`port/hle/puppet.c`, findings 044, 047, 114). Hits are events; each game times its own finish.
+  shows the others, and on guests the host's AI riders, as puppet riders (`port/hle/puppet.c`,
+  findings 044, 047, 114): each rides on this game's own physics with its owner's pad (an AI
+  rider's on this game's AI controller too, on its owner's racing line) and is steered toward its
+  owner's snapshots, each one compared with where the puppet itself was at that snapshot's moment
+  (`port/hle/puppet_sync.h`, finding 202). The puppet bench (`port/tools/puppet_bench.py`) measures how they look through a
+  bad link. Hits are events; each game times its own finish.
   Track pickups are shared events (finding 144); a player who leaves becomes an AI rider.
+- A member in the room while a race runs can WATCH it (SFU rooms, not a scored arena round):
+  every rider is a puppet, finding 122's camera from the countdown, no rider of its own, back to
+  the room with the results (finding 269).
 - Server: `online/server/` (Cloudflare Workers + Durable Objects) at `wss://dhd.skuza.app`, the
   game's default (dhd.ini `server =` or `DHD_NET_SERVER` override it). Rooms of up to 10
-  (finding 123) that live across races (findings 118, 119), Ready for the next race and MOSH by
-  the host's pick (finding 128), rooms placed near their creator (finding 135), rejoin by token
-  (finding 137). Protocol: `docs/online-protocol.md`; steps: `online/server/README.md`.
-- Client: `port/net/` over `port/net/ws.h`, the Rust crate `dhd_net` (`port/render/net`,
-  tungstenite over rustls, webpki roots; no OS certificate store).
+  (finding 123) that live across races (findings 118, 119), 25 tracks with Salt City MX and TD
+  (finding 166) listed in Super Career order (finding 190), Ready for the next race and MOSH by
+  the host's pick (finding 128), rooms placed where their creator picks (ONLINE's Room Region row,
+  dhd.ini `room_region`) or, on Auto, by the Cloudflare location the creator reached, from measured
+  round trips (findings 135, 181), rejoin by token
+  (finding 137); a room connection lost in a race no longer ends it: the game races on over the
+  SFU and rejoins, the seat is kept 20 s (finding 175); a game tries again every 2 s while nothing reaches the
+  server and backs off when the server answers (finding 254), and one back too late for its seat
+  says CONNECTION LOST. A room runs at most 5 Realtime calls at
+  once and a timed-out call is an unknown outcome, not a failure (finding 182). A deploy
+  (`online/server/tools/deploy.mjs`: a watched 10 % canary, then 100 % or a rollback) restarts
+  rooms for the new code only in the lobby or at results; games rejoin in about 2 s (finding 184).
+  Protocol: `docs/online-protocol.md`; steps: `online/server/README.md`.
+- Abuse guard (finding 161): a kill switch in the moderation database (`moderate.mjs online
+  off`), limits per address, caps per member, and
+  bans by address hash or install id with a 14-day moderation log in D1, worked from
+  `online/server/tools/moderate.mjs` (no admin endpoint). In an SFU room no player gets another's address, its
+  hash or install id.
+- START in a race (finding 215): with another human still racing, the room's menu (RESUME, BACK
+  TO THE ROOM, END THE RACE, LEAVE THE ROOM) is drawn over the running race and nothing stops; the
+  rider coasts on a neutral pad (`port/hle/race_menu.h`, `online.c` `race_menu_pad`). Alone (every
+  other human finished or left) it is the game's own pause. A real pause's time is never given
+  back: the race clock stays behind by it, and the stamps carry that (finding 220,
+  `sync_clock_stood`): the others' snapshots land at this game's present, its own at theirs.
+- Why a race closed is said on every screen for 2 s and logged (`race closed: back to the room
+  (WHY: ...)`): RACE OVER, TIME UP - DNF, THE HOST ENDED THE RACE, CONNECTION LOST and the rest,
+  from the room's `ended` message by one rule (`port/hle/online_end.h`, finding 211).
+- The room page on a phone (finding 218): READY by tap is logged (`READY on by tap` / `by pad`) and
+  answered (`the room has this player ready`); a READY the room does not show within 4 s puts
+  `READY DIDN'T REACH THE ROOM: TRY AGAIN` on the page, and the room's errors show as a note.
+  ONLINE takes taps again after a room that was open over the rider screen. The cause of the one
+  dead READY a phone check saw is unproven.
+- P2P rooms (findings 180, 186): the creator's choice beside SFU rooms, private, by code (7
+  characters). A server room like any other (its rules, results, rejoin, region) whose race frames
+  travel over WebRTC data channels in a star around one member, the hub, which the room picks (the
+  creator, the next one when it leaves or can't do its work) and which forwards the others'
+  frames; a member who can't reach it directly races over the room's SFU, bridged by the hub. The
+  game warns that the room's players can see your network address. One send thread and one star
+  router (`port/render/star`) for the native games and the browser page. Windows and macOS tested; Android
+  builds it but was not run; the browser joins and races on the star (no SFU fallback there yet).
+- Race frames (findings 158, 177): over Cloudflare Realtime SFU DataChannels, STATE unordered with
+  no retransmissions and EVENT reliable (Cloudflare forwards STATE ordered and reliable anyway; the
+  client's vendored sctp-proto delivers it unordered, finding 173). One Realtime session per member
+  per room stay (finding 177): made when the member joins, kept across races with its
+  publications and subscriptions (a member who sits a race out loses its subscriptions at that
+  race's start and gets them back at its next grid); a race's missing pairs are subscribed at the
+  grid's lock, during the countdown, so a connected room is released as soon as its games
+  acknowledge the start. The room passes each member only its own SFU answer, channels and TURN
+  credentials, never a session id. If UDP doesn't connect in 2 s, Cloudflare TURN over TLS on 443
+  with credentials minted for that member, renewed between races once 35 minutes old. A racer
+  whose Realtime never connects leaves the race 10 s after its start message and the others race
+  on (finding 175); failed subscription closes are retried and a rejoin's channel list replaces
+  recycled channel ids (finding 179). A session on which the room closed subscriptions its game
+  never had has dead stream ids on Cloudflare's side (finding 187): the room replaces it once that
+  costs no race anything. A game whose race link brings nothing from the others 8 s after its
+  release tells the room, which gives it a new session in its race or takes it out of the race;
+  the host's start moment also goes over the room, and a game with no moment 75 s after loading
+  leaves the race instead of starting alone.
+- A race's frames travel after the room ends it, both ways and every racer's, until each game
+  leaves the race screen (`port/net/client.c`, `client_back`), on the SFU, the P2P star and the
+  browser alike, so the last seconds and every finish show on every screen (finding 216).
+- Protocol 4 (0.7.13, finding 169): a PC's riders of one tick go out bundled in STATE messages of
+  at most 1,000 bytes (one datagram), stamped with their moment on the server clock (the PONG
+  carries the server's time); each player's own rider 60 times a second, AI riders 30. Puppets are
+  drawn at the present by riding on this game's physics (finding 202, above): placed at once only
+  at their first snapshot, a respawn, a large error or a large one after silence
+  (`SYNC_PLACE_FAR`, `SYNC_PLACE_SILENCE` in `port/hle/puppet_sync.h`), otherwise caught up by
+  riding; through an outage (no snapshot for up to 3 s) a puppet that falls well below its owner's
+  last speed is eased back to it (finding 254); a game whose own thread stops says so (HOLD, from its
+  network thread) and the others hold its riders, until its snapshots have come again for 3 s.
+  Every record and HOLD from another game is checked whole before any of it is used (nodes, State,
+  numbers, stamps; `port/hle/puppet_record.h`, finding 220): a refused one is dropped and logged
+  once per rider and race. Hits are
+  decided on the puppet as drawn. In a room the FPS & Ping counter shows "SERVER N MS", the round
+  trip to the room's server, and "RACE N MS", the round trip to Cloudflare's race network (the SFU
+  association's ICE checks); in a race the second line is "RIDERS N MS", the other riders'
+  snapshot delay (findings 169, 181).
+- Client: `port/net/` over `port/net/ws.h`, the Rust crate `dhd_net` (`port/render/net`:
+  tungstenite over rustls for the lobby, str0m for the SFU with a vendored RustCrypto adapter,
+  its own TURN client; webpki roots, no OS certificate store).
 - Online needs the USA disc's game files (a hash of every ISO 9660 file, `dhd_disc`; finding 098).
+- MOSH PIT starts online since finding 203 (it loads the arena's own loading bar, `LMOSH`), and an
+  online race there is the game's Mosh Bowl round (finding 204): two minutes on each game's own
+  clock, the game's points per hit (made by the game that runs the attacker, sent as reliable
+  events), then COMBAT RESULTS with the same table on every game and the room ranked by the same
+  scores. Only with a server whose welcome lists the `score` feature (`online/server/src/room.ts`;
+  a finish may carry `score`); with an older one the arena races as before, a race with no end of
+  its own. So a release with it must deploy the server too. The server ranks by score only a race
+  on the arena track and ignores `score` elsewhere; a rider's own player's final beats a takeover
+  final whatever their order; the table a game publishes is a copy that later scores do not change
+  (finding 221).
 - Releases with online or pacing changes need a real race between two different machines both
   ways (single-PC tests have hidden bugs before).
 
@@ -126,7 +320,17 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
   the game runs their code (finding 104). Renderer: `test_gs_wgpu.py`, replay goldens recorded
   locally (`gs_golden.py`), `test_native_transfers.py`. Game state: per-field state traces
   (`port/hle/state_trace.c`, `state_trace_run.py`, `state_diff.py`), `test_fps_race.py`,
-  `rate_drift.py`, `slow_race.py`, `replay_check.py`. Server: `npm test` in `online/server`.
+  `rate_drift.py`, `slow_race.py`, `replay_check.py`. The seven recipes (`boot`, `race`, `race2`
+  to `race6`, which ones a change runs: `docs/TESTING.md`) are the merge gate again: since finding
+  205 the trace does not depend on the core's layout there (`state_trace_layout_test.py` proves
+  it), and a reference trace must be of the same format (2) and code-pointer list. `split` and
+  `memcard` still see the core's layout (finding 205's Result). Since finding 213 (main
+  524948ba) the race recipes' references are of that build: it changed every race's game state on
+  purpose. Stack locals: `stack_escapes.py --check` in `check.py port` (the static inventory and
+  its reviewed list; it fails on a unit it could not compile and proves each reviewed fix on the
+  patched source, finding 219); `DHD_CORE_REDZONE=1` / `redzone_walk.py` a test-only game with red zones
+  around every address-taken local, walked through the recipes and OPTIONS (finding 213). Server:
+  `npm test` in `online/server`.
   Online: `port/net/build_tests.py`, `port/tools/online_race.py`. Retail comparisons with PCSX2:
   `compare_pcsx2.py`, `race_compare.py` (finding 024). Everything, with setup variables:
   `docs/TESTING.md`.
@@ -134,8 +338,43 @@ in `online/server/wrangler.jsonc`, player defaults are `port/render/settings/src
 ## Open
 
 - Phones: on the low-end profile (Realme RMX3930 (Unisoc T612), reproduced on a throttled Mi 11i)
-  2x races hold 60 with the profile-guided build and reach about 59.5 at the race start without
-  it; 4x does not hold 60 at the race start (GPU-bound). Findings 127, 146-149 say what is left.
+  2x races hold 60 with the profile-guided build; finding 195 added 5.6-17 % over the route
+  (t612 2x 64.4 -> 68.0 fields/s, 4x 55.5 -> 64.5; more with Native VU on) and finding 197 another
+  7 % with Native VU off (race start 61.5 -> 65.9, the route 67.7 -> 72.4; on: +1 %); the release
+  APK needs a profile recorded with its file-name keys (`docs/BUILDING.md`; finding 197's is
+  `dhd-197.profdata`). 4x does not hold 60 at the race start (GPU-bound). Findings 127, 146-149,
+  195, 197 say what is left (197: the VU thread alone limits now); finding 156 says where a
+  frame's time goes on the phone and the desktops.
+- Slow frames on weak phones (finding 256, throttled Mi 11i at 4x): the draw pipelines a device
+  built are listed in `pipelines.txt` beside dhd.log and built ahead on a worker thread at the
+  next start, the sharp font is made once a session and the touch controls' pipeline ahead. From
+  the second run on a race has no frame over 100 ms (4 before; worst 1 % 39 -> 32 ms) and the
+  route loses 0.9-1.0 s over 50 ms instead of 8.3-8.6 s. A first run still compiles at first use.
+  The Redmi 9: no race frame over 100 ms from the second run (finding 259). The list also holds
+  the pipelines the game's crash handler saw the driver die building in an earlier run, which are
+  not built again on that GPU, driver and shaders; a run closed or killed during a build only
+  makes the key a suspect, built again alone (`pipelines-building.txt`, finding 260).
+- PowerVR GE8320 phones start since finding 170 and no longer close in the Bike Shop (finding 176:
+  a blend that keeps the colour is drawn unblended, a pipeline the driver refuses skips its draws);
+  not yet confirmed by the reporters (issues #56, #60).
+- The PowerVR GE8322 (driver 1.18) closed at the first picture's submit (finding 201: wait values
+  the driver reads unchecked); fixed by the Vulkan submit rule above, not yet confirmed by the
+  reporter (issue #82).
+- The Mali-G52 (Redmi 9) at 2x: about 49.5 fields/s with every effect on (finding 174's
+  barriers), about 60 with the shadows, sun glow, lens flare and fog cut by a diagnostic build;
+  Performance Mode (finding 183) cuts those but fog. 60 at 2x with every effect on is not reached.
+- Native VU is the players' default (finding 198), and it is slower where the GPU limits: the
+  Redmi 9 at 2x 50.6 -> 48.7 fields/s over the route (the race 47.3 -> 44.8), the integrated
+  Radeon at 4x 122.1 -> 118.2; it gains where the CPU limits (finding 194). Finding 249 cut that cost on the
+  throttled Mi 11i at 4x from 6.2 % to 1.6 % of the race (61.3 -> 64.3 fields/s, off 65.4). On
+  the Redmi 9 at 2x Native VU on is now the faster one (finding 260: race 50.9 against 50.2 fields/s,
+  route 55.1 against 54.3); 0.8.6 crashed there at the title (its mesh vertex stage, fixed in
+  finding 260, and a draw pipeline the driver died building is no longer built again). Finding 253 took the last batches of the translated loops off the emulated VU
+  (11 % of the route's; race 64.5 -> 65.0, off 65.3) and lists what else still runs there. No driver that refuses it has run it. Finding 264's census of nine scenes cut the drawing runs left on the emulated VU by 52-95 % (0.9-3.8 million setup runs a scene remain) and says why the emulated path cannot be deleted yet.
+- On Mali GPUs a picture stays in one encoder (finding 198): finding 195's encoder cut lost the
+  device on the Redmi 9's Mali-G52 in every full route, so 0.7.15 is expected to lose it there
+  (fixed in 0.7.16).
+  Why the driver fails, and other Malis, are not known.
 - Browser speed is below 60 in races (finding 087).
 - High-rate handling differs a little from 60 by the race's own chaos, with no trend (finding
   139, after finding 067's limits).

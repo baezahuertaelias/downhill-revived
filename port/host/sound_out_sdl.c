@@ -36,6 +36,7 @@
 #include <string.h>
 #include <SDL3/SDL.h>
 #include "host_api.h"
+#include "host_end.h"
 #include "../hle/hle.h"
 
 #define SND_RATE HOST_SOUND_RATE
@@ -345,6 +346,20 @@ static void SDLCALL host_callback(void *unused, SDL_AudioStream *stream, int add
     SDL_PutAudioStreamData(stream, buf, (int)(made * 4));
 }
 
+/* The open stream, for host_stop. */
+static SDL_AudioStream *host_stream;
+
+/* At the end of the process (host_end.h, the devices stage): the stream closes, which stops SDL's
+   device thread. exit() with the device thread still in the callback crashed on Android, in its
+   AudioTrack thread (#56, a Helio G35 phone; Android recorded a normal exit; finding 210 is the
+   render thread's turn of the same). */
+static void host_stop(void)
+{
+    SDL_AudioStream *stream = host_stream;
+    host_stream = NULL;
+    if (stream) SDL_DestroyAudioStream(stream);
+}
+
 static void host_start(void)
 {
     SDL_AudioSpec spec;
@@ -388,7 +403,10 @@ static void host_start(void)
                 SND_RATE, SDL_GetCurrentAudioDriver() ? SDL_GetCurrentAudioDriver() : "?",
                 device.freq, device.channels, frames);
     }
-    /* The stream lives as long as the process; SDL_Quit (or the process end) closes it. */
+    /* The stream lives as long as the process; host_stop closes it at the end (host_end; a
+       host_exit, _exit, ends the process without it). */
+    host_stream = stream;
+    host_end_add(HOST_END_DEVICES, "audio", host_stop);
 }
 
 /* ---- the interface (host_api.h, "sound output") ---- */
@@ -405,6 +423,18 @@ void host_sound_open(void)
 void host_sound_write(const int16_t *stereo, int frames)
 {
     ring_push(stereo, frames);
+}
+
+void host_sound_away(int away)
+{
+    SDL_AudioStream *stream = host_stream;
+    if (!stream) return;
+    if (away) {
+        SDL_PauseAudioStreamDevice(stream);
+    } else {
+        SDL_ClearAudioStream(stream);
+        SDL_ResumeAudioStreamDevice(stream);
+    }
 }
 
 void host_sound_reset(void)

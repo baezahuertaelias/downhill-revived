@@ -28,7 +28,9 @@ import { startRenderer, renderImports, definesSharedMemory, shareSafeDecoding, Q
 
 const post = (type, data) => postMessage({ type, ...data });
 const say = text => post('log', { text });
-onmessage = e => { if (e.data.type === 'start') start(e.data).catch(err => { post('error', { text: String(err?.stack || err) }); }); };
+let resumeCapture = null;   // DHD_CAPTURE_FIELDS (below): the page's 'resume' after its screenshot
+onmessage = e => { if (e.data.type === 'start') start(e.data).catch(err => { post('error', { text: String(err?.stack || err) }); });
+  else if (e.data.type === 'resume') { const r = resumeCapture; resumeCapture = null; r?.(); } };
 
 // ---- the disc: 1 MiB blocks, a few kept ----
 function discSource(m) {
@@ -145,6 +147,19 @@ async function start(m) {
   const channel = new MessageChannel(); let wake = null; channel.port1.onmessage = () => { const w = wake; wake = null; w?.(); };
   const yieldTask = () => new Promise(r => { wake = r; channel.port2.postMessage(0); });
   let period = 1000 / 59.94, due = performance.now(), shown = 0, lastReport = performance.now(), lastField = 0;
+  // DHD_CAPTURE_FIELDS (checks: port/web/check_browser.mjs --capture; present.c's variable natively,
+  // which writes each listed field's picture to a file): fields and first-last ranges, comma
+  // separated. Once a listed field's picture is shown, the game waits; the page gets 'capture' with
+  // the field, takes its screenshot of the canvas and sends 'resume'. The game's state is not
+  // touched (the core waits in its vsync, as for a slow present).
+  const captureFields = (env.DHD_CAPTURE_FIELDS ?? '').split(',').map(s => s.trim().split('-').map(Number))
+    .filter(r => r.length && r.every(Number.isInteger)).map(([a, b = a]) => [a, b]);
+  async function captureWait(shownBefore, shownNow) {
+    if (!captureFields.some(([a, b]) => field >= a && field <= b)) return;
+    for (const t0 = performance.now(); shownNow() <= shownBefore && performance.now() - t0 < 10000;) await new Promise(r => setTimeout(r, 5));
+    await new Promise(r => setTimeout(r, 100));   // the canvas's commit
+    await new Promise(r => { resumeCapture = r; post('capture', { field }); });
+  }
   let riding = 0, held = new Int8Array(KEYS.length);
   // host_pad_device: player `port` (0-3; played by hand the game opens four pads on a multitap,
   // pad.c) as hle.h's HostPad. connected: a gamepad for that player, player 1 always (the keyboard).
@@ -262,7 +277,12 @@ async function start(m) {
     host_service_host_setting_save: (k, v) => settings.save(str(k), str(v)),
     host_service_movie_update: () => 0, host_service_movie_playing: () => 0,
     host_service_host_poll_dump: () => 0,
+    host_service_host_came_back: () => 0,  // no background on the page: the tab keeps its own clock
     host_service_graphics_threaded: () => 1, host_service_texpack_available: () => 0, host_service_gs_scale: () => 0,
+    // Keys and controller bindings (finding 157): the browser keeps its own fixed layout (KEYS, main.js's GP)
+    // and shows no Controls row; DHD_KEYS and DHD_TEST_PAD play the defaults.
+    host_service_controls_layout: () => 0, host_service_controls_pad: () => 0, host_service_controls_change: () => 0,
+    host_service_controls_capture: () => -2,
     // The browser keeps the waiting store-image read (graphics.c): nothing is ever queued to settle.
     host_service_gs_store_image: () => 0, host_service_gs_store_settle: () => {},
     host_pacing_period: () => 1 / 60,
@@ -282,8 +302,9 @@ async function start(m) {
     host_service_gs_vsync: new WebAssembly.Suspending(async () => {
       let size, presented = 0, stats = null;
       if (threaded) {
+        const s = new Int32Array(memory.buffer, Q + 4 * QI.stats, 16), before = Atomics.load(s, STAT.shown);
         queue.web_q_vsync();
-        const s = new Int32Array(memory.buffer, Q + 4 * QI.stats, 16);
+        if (captureFields.length) await captureWait(before, () => Atomics.load(s, STAT.shown));
         size = s[STAT.size] >>> 0; shown = s[STAT.shown];
         stats = which => s[[STAT.draws, STAT.dispatches, STAT.reads, STAT.submits, STAT.scale][which]] >>> 0;
       } else {
@@ -294,6 +315,7 @@ async function start(m) {
         } finally { setCsr(saved); }
         if (presented === 1) shown++;
         stats = which => graphics.web_gpu_stats(which);
+        if (captureFields.length) await captureWait(shown - 1, () => shown);
       }
       const now = performance.now();
       if (now - lastReport >= 1000) {
@@ -315,7 +337,7 @@ host_service_movie_prepare host_service_movie_start host_service_movie_audio hos
 host_service_gs_pump_messages host_service_gs_window_title host_service_gs_native_view
 host_service_gs_window_apply host_service_gs_present_options_apply host_service_gs_window_close
 host_service_text_input_begin host_service_text_input_end host_service_host_backtrace host_service_presence host_service_touch_field
-host_service_net_get_lobby host_service_clipboard_set`.split(/\s+/);
+host_service_net_get_lobby host_service_clipboard_set host_service_controls_map`.split(/\s+/);
   for (const n of noops) impl[n] ??= () => {};
   for (const n of ['host_heartbeat_eip', 'host_service_launcher_open']) impl[n] = () => 0;
 
@@ -350,7 +372,7 @@ host_service_net_get_lobby host_service_clipboard_set`.split(/\s+/);
     post('exit', { status });
     return;
   }
-  const renderer = await startRenderer(memory, m.canvas, say);
+  const renderer = await startRenderer(memory, m.canvas, say, env);
   say(`WebGPU: ${renderer.adapter} (${renderer.version})`);
   // The reactor's WASI needs: its environment, stderr, nothing else. The environment is the core's
   // as it is now (the reactor reads it again when it makes the native renderer, after the core's

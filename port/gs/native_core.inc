@@ -43,14 +43,18 @@
 #include <math.h>
 #include <limits.h>
 #include "native_thread.h"  /* locks, the render thread, sleeps (SDL3; none in the browser) */
+#include "../host/host_end.h"  /* the render thread stops at the end of the process (finding 210) */
 #include "texpack.h"
 #include "font_sharp.h"
 #include "native_frontend.h"
-#include "perf_log.h"        /* the perf: lines' waits (finding 129; empty in the browser) */
+#include "gs_mesh.h"         /* translated VU1 mesh batches (native_mesh, finding 164) */
+#include "gs_strip.h"        /* the game's PACKED strips, read from the packet (native_strip, finding 197) */
+#include "perf_log.h"       /* the perf: lines' waits (finding 129; empty in the browser) */
 
 double host_wall_seconds(void); /* port/hle/host.c */
 
 enum { NATIVE_SURFACES = 48, NATIVE_TEXTURES = 4096, NATIVE_WATCH = 128, NATIVE_CONVERTS = 64 };
+enum { NATIVE_PALETTES = 512, NATIVE_PALETTE_PROBES = 8 };  /* a race goes round some 200 palettes a field */
 /* NATIVE_SCALE_MAX, the largest resolution scale (DHD_SCALE) the backend draws, is set by the
    backend (gpu_rust_native.inc, gpu_rust_web_native.inc) before it includes this file. */
 
@@ -68,11 +72,19 @@ typedef struct {
     int32_t tex_offset[2]; uint32_t tex_size[2];
     uint32_t wrap[4];
     uint32_t region[4];
+    /* A mesh draw (flag 4096, native_mesh), for native.wgsl's native_mesh_vertex: the draw offset
+       (GS 12.4 units), the largest Z and the Z scale; the loop's guard band (x, y and w offsets,
+       bound) and its fog (A, B, max). Zero for every other draw. */
+    float mesh_offset[4];
+    float mesh_clip[4];
+    float mesh_fog[4];
 } NativeConstants;
+enum { NATIVE_MESH = 4096, NATIVE_MESH_TWO_SIDED = 8192 };   /* constants.flags: a mesh draw (render.rs picks its
+                                                              pipeline), drawn without back-face culling */
 
 typedef struct {
     uint64_t key;
-    NATIVE_TEXTURE_GPU    /* texture and view; sharp: the game's font made sharp (font_sharp.c), or none */
+    NATIVE_TEXTURE_GPU    /* texture and view; sharp: the game's font made sharp, or with other button icons (font_sharp.c), or none */
     uint64_t used;        /* last field that drew with it */
     TexPackEntry *pack;   /* its replacement (texpack.c), once looked up (pack_checked) */
     int pack_checked;
@@ -127,6 +139,11 @@ typedef struct {
     NativeConvertConstants constants;
 } NativeConvert;
 
+/* A field's display_surface when PMODE has no read circuit on (after a GS reset, finding 160): the
+   picture is black, as the PS2 shows it (DhdrPicture.display_surface). -1: nothing to scan out,
+   the last picture stays. */
+#define NATIVE_DISPLAY_OFF (-2)
+
 typedef struct {
     NativeVertex *vertices;
     unsigned vertex_count, vertex_capacity;
@@ -136,7 +153,7 @@ typedef struct {
     unsigned command_count, command_capacity;
     NativeConvert *converts;
     unsigned convert_count, convert_capacity;
-    int display_surface;
+    int display_surface;             /* the displayed surface, -1 or NATIVE_DISPLAY_OFF */
     uint32_t display[12];
     uint32_t *movie;                 /* a movie's picture shown instead (gs_native_movie), when movie_on */
     unsigned movie_width, movie_height, movie_capacity;
@@ -150,6 +167,7 @@ typedef struct {
     int32_t *pair;                   /* DHD_INTERP: each segment's partner in the older field, or -1 */
     unsigned pair_capacity;
     unsigned path1;                  /* primitives VU1 drew (PATH1): 0 in a field of 2D only */
+    double output_aspect;             /* aspect of the game picture at handoff */
     unsigned flat_limit;             /* loading state at handoff, never read from the render thread */
     int card_2d;                     /* the game drew its 2D unmapped, for a 4:3 card (host_widescreen_card_drawn) */
 } NativeFrame;
@@ -216,6 +234,12 @@ typedef struct Native {
     /* native_palette: the 256 entries gs_palette converts for the last CPSM/CSA/TEXA, valid while
        the CLUT's entries stay (clut_writes); digest16/256 mix the first 16 or all of them. */
     struct { int valid, full; uint64_t writes, clut_key, texa, digest16, digest256; uint32_t entry[256]; } palette_memo;
+    /* native_palette_digest (finding 197): the digests of palettes met before, each found again by
+       the CLUT words it reads (palette_tags: a slot's tag, 0 when empty), and the last answer,
+       good while the CLUT's entries stay. */
+    uint32_t palette_tags[NATIVE_PALETTES];
+    struct { uint64_t texa, digest; uint32_t used; uint16_t count, cpsm; uint32_t words[256]; } palettes[NATIVE_PALETTES];
+    struct { int valid, full; uint64_t writes, clut_key, texa, digest; } palette_last;
     NativeVertex conv[2];
     int conv_fst;
     uint64_t conv_offset;
@@ -225,6 +249,7 @@ typedef struct Native {
        mix pairs and moves vertices by their recorded order) and with DHD_NATIVE_INDEXED=0. */
     int indexed;
     int skip;                        /* the current state draws nothing */
+    int mesh_open;                   /* the open draw is a mesh draw (native_mesh): no GS primitive joins it */
     int box[4];                      /* pixels the open draw has touched */
     unsigned target_psm, depth_psm;
     int passes;                      /* AFAIL second pass needed */
@@ -282,6 +307,7 @@ typedef struct Native {
     unsigned pending_count, free_count;
     uint64_t handed, rendered;
     int quit, resize;
+    int thread_exited;               /* the render thread has left its loop for good (queue_lock; native_stop) */
     NativeWindow window;
     float aspect;  /* the picture's shape in the window (DHD_ASPECT): width/height, 0 stretched, -1 its pixels */
     float wide;    /* widescreen's shape, or 0: fields of 2D only (loading screens) are shown 4:3 */
@@ -324,12 +350,15 @@ typedef struct Native {
 
 /* ---- backend: defined by the file that includes this one ---- */
 
-/* A decoded texture's GPU copy from w x h RGBA pixels, and its sharp font when sharp; 0 when it
-   failed (then nothing is left to release). GS worker. */
+/* A decoded texture's GPU copy from w x h RGBA pixels, and its sharp font when sharp (pack: the
+   pack's replacement of it, font_sharp_view's); 0 when it failed (then nothing is left to
+   release). GS worker. */
 static int native_texture_create(Native *n, NativeTexture *t, const uint32_t *pixels, unsigned w, unsigned h,
-                                 int sharp, uint64_t key);
+                                 int sharp, uint64_t key, TexPackEntry *pack);
 static void native_texture_release(NativeTexture *t);  /* all of it, any part may be missing */
-/* What a draw with this texture shows instead: its texture pack replacement, else its sharp font. */
+/* What a draw with this texture shows instead: its sharp font when it has one (with a pack's
+   replacement it has one only for the button icons, made from the pack's picture), else its
+   texture pack replacement. */
 static NativeView native_replacement_view(Native *n, NativeTexture *t);
 /* The surface's texture at its scale and at least want[] GS pixels, keeping what it holds. */
 static int native_surface_resources(Native *n, NativeSurface *s, const unsigned want[2]);
@@ -338,6 +367,9 @@ static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertic
 static void native_present(Native *n);  /* the last scanned-out picture again */
 /* The displayed picture (display_width x display_height) into pixels; 0 when there is none. */
 static int native_read_display(Native *n, uint32_t *pixels);
+/* GS pixels rect (x, y, w, h) of colour surface index into pixels (RGBA8, the mean of each pixel's
+   scaled texels), clipped to the texture: the clipped size in size; 0 when nothing was read. */
+static int native_read_surface(Native *n, int index, const uint32_t rect[4], uint32_t *pixels, uint32_t size[2]);
 static void native_present_options(Native *n);  /* the present filter; then native_aspect_options */
 
 /* ---- DHD_RSTAT: the render thread's per-picture budget (finding 108) ----
@@ -639,7 +671,66 @@ static const uint32_t *native_palette(Native *n, const Gs *g, uint64_t tex0, int
     return n->palette_memo.entry;
 }
 
-static NativeTexture *native_decode(Native *n, Gs *g, uint64_t tex0, unsigned w, unsigned h, uint64_t key)
+/* The CLUT words gs_palette reads for the first `count` entries of tex0's palette, as it reads
+   them (before gs_color). */
+static void native_palette_words(const Gs *g, uint64_t tex0, unsigned count, uint32_t *words)
+{
+    unsigned cpsm = (unsigned)(tex0 >> 51) & 15, csa = (unsigned)(tex0 >> 56) & 31;
+    if (cpsm & 2) {
+        for (unsigned i = 0; i < count; i++) words[i] = g->clut[(csa * 16 + i) & 511];
+        return;
+    }
+    for (unsigned row = 0; row < count; row += 16) {
+        unsigned group = (csa & 15) * 16 + row;
+        const uint16_t *low = &g->clut[group > 240 ? 240 : group], *high = low + 256;
+        for (unsigned i = 0; i < 16; i++) words[row + i] = low[i] | (uint32_t)high[i] << 16;
+    }
+}
+
+/* The digest native_palette gives the 16 or 256 converted entries of tex0's palette: the texture
+   key's part. The converted entries follow from the CLUT words read, CPSM and TEXA, so a palette
+   met before has its digest kept beside those words and is not converted again. (The entries'
+   memo above holds one palette; the game alternates between textures, each with its own CLUT, and
+   comes back to every one of them the next field.) A palette not met before is converted by
+   native_palette as before. */
+static uint64_t native_palette_digest(Native *n, const Gs *g, uint64_t tex0, int full)
+{
+    uint64_t clut_key = (tex0 >> 51 & 15) | (tex0 >> 56 & 31) << 4, texa = g->reg[GS_TEXA];   /* CPSM, CSA */
+    if (n->palette_last.valid && n->palette_last.writes == g->clut_writes && n->palette_last.clut_key == clut_key &&
+        n->palette_last.texa == texa && n->palette_last.full == full)
+        return n->palette_last.digest;
+    unsigned count = full ? 256 : 16, cpsm = (unsigned)clut_key & 15;
+    uint32_t words[256] PS2_NO_AUTO_INIT, tag = 0;  /* written for every entry read */
+    native_palette_words(g, tex0, count, words);
+    for (unsigned i = 0; i < count; i++) tag += words[i] * (2 * i + 1);
+    tag = ((tag ^ (uint32_t)texa ^ (uint32_t)(texa >> 32) * 31 ^ count ^ cpsm << 12) * 0x9E3779B1u) | 1;
+    unsigned first = (tag >> 16) % NATIVE_PALETTES, slot = NATIVE_PALETTES;
+    for (unsigned probe = 0; probe < NATIVE_PALETTE_PROBES && slot == NATIVE_PALETTES; probe++) {
+        unsigned at = (first + probe) % NATIVE_PALETTES;
+        if (n->palette_tags[at] == tag && n->palettes[at].count == count && n->palettes[at].cpsm == cpsm &&
+            n->palettes[at].texa == texa && !memcmp(n->palettes[at].words, words, count * 4))
+            slot = at;
+    }
+    if (slot == NATIVE_PALETTES) {
+        /* not met, or pushed out: converted, and kept in an empty slot or the one used longest ago */
+        slot = first;
+        for (unsigned probe = 0; probe < NATIVE_PALETTE_PROBES && n->palette_tags[slot]; probe++) {
+            unsigned at = (first + probe) % NATIVE_PALETTES;
+            if (!n->palette_tags[at] || (int32_t)(n->palettes[at].used - n->palettes[slot].used) < 0) slot = at;
+        }
+        native_palette(n, g, tex0, full);
+        n->palette_tags[slot] = tag;
+        n->palettes[slot].texa = texa; n->palettes[slot].count = (uint16_t)count; n->palettes[slot].cpsm = (uint16_t)cpsm;
+        n->palettes[slot].digest = full ? n->palette_memo.digest256 : n->palette_memo.digest16;
+        memcpy(n->palettes[slot].words, words, count * 4);
+    }
+    n->palettes[slot].used = (uint32_t)n->field;
+    n->palette_last.valid = 1; n->palette_last.full = full; n->palette_last.writes = g->clut_writes;
+    n->palette_last.clut_key = clut_key; n->palette_last.texa = texa; n->palette_last.digest = n->palettes[slot].digest;
+    return n->palette_last.digest;
+}
+
+static NativeTexture *native_decode(Native *n, Gs *g, unsigned ctxt, uint64_t tex0, unsigned w, unsigned h, uint64_t key)
 {
     unsigned slot = (unsigned)(key % NATIVE_TEXTURES);
     for (unsigned probe = 0; probe < 16; probe++) {
@@ -666,13 +757,30 @@ static NativeTexture *native_decode(Native *n, Gs *g, uint64_t tex0, unsigned w,
             uint32_t v = gs_image_pixel(g->vram, psm, tbp, tbw, x, y);
             pixels[y * w + x] = indexed ? palette[v & 255] : gs_color(v, psm, g->reg[GS_TEXA]);
         }
-    /* The text engine's font, made sharp for high resolutions (dhd.ini font, finding 058). */
+    /* The text engine's font, made sharp for high resolutions (dhd.ini font, finding 058), or with
+       other button icons: over a pack's replacement of it when there is one (finding 200), so its
+       replacement is looked up here. */
     int sharp = indexed && n->replace_on && font_sharp_active() && font_sharp_match(tex0);
-    int made = native_texture_create(n, victim, pixels, w, h, sharp, key);
+    TexPackEntry *pack = sharp && n->texpack ? texpack_find(g, ctxt) : NULL;
+#ifdef __SWITCH__
+    {   /* A fixed heap (dhd_render_nx.c), where the PC has its video memory: the textures unused the
+           longest go when it runs low. Their memory comes back once the GPU is past them. */
+        int dhdr_nx_heap_low(void);
+        for (uint64_t age = 1200; dhdr_nx_heap_low() && age >= 8; age /= 4)
+            for (unsigned i = 0; i < NATIVE_TEXTURES; i++) {
+                NativeTexture *t = &n->textures[i];
+                if (t != victim && t->texture && t->used + age < n->field) {
+                    native_texture_release(t);
+                    t->key = 0, t->pack = NULL, t->pack_checked = 0;
+                }
+            }
+    }
+#endif
+    int made = native_texture_create(n, victim, pixels, w, h, sharp, key, pack);
     free(pixels);
     if (!made) return NULL;
     victim->key = key; victim->used = n->field;
-    victim->pack = NULL; victim->pack_checked = 0;
+    victim->pack = pack; victim->pack_checked = sharp && n->texpack;
     n->stats.decoded++; n->stats.decoded_texels += (uint64_t)w * h;
     return victim;
 }
@@ -699,7 +807,7 @@ static int native_page_source(Native *n, Gs *g, unsigned page, unsigned psm)
    read as a 4-bit texture (the haze), part of a texture page drawn over (the loading screen). The
    GPU rebuilds it just before the draw: the CPU copy decoded as usual, with the drawn pages read
    from their surfaces (native.wgsl's native_convert). */
-static int native_convert_texture(Native *n, Gs *g, uint64_t tex0, unsigned w, unsigned h, const uint32_t pages[16],
+static int native_convert_texture(Native *n, Gs *g, unsigned ctxt, uint64_t tex0, unsigned w, unsigned h, const uint32_t pages[16],
                                   uint64_t key, NativeCommand *c)
 {
     unsigned psm = (unsigned)(tex0 >> 20) & 63, tbp = (unsigned)tex0 & 0x3FFF, tbw = (unsigned)(tex0 >> 14) & 63;
@@ -732,7 +840,7 @@ static int native_convert_texture(Native *n, Gs *g, uint64_t tex0, unsigned w, u
         v->constants.pages[p] = (uint8_t)(1 + slot);
     }
     if (!slots) return 0;
-    v->base = native_decode(n, g, tex0, w, h, key);
+    v->base = native_decode(n, g, ctxt, tex0, w, h, key);
     uint64_t texa = g->reg[GS_TEXA];
     v->constants.tex[0] = psm; v->constants.tex[1] = tbp; v->constants.tex[2] = tbw;
     v->constants.size[0] = w; v->constants.size[1] = h;
@@ -752,7 +860,8 @@ static int native_convert_texture(Native *n, Gs *g, uint64_t tex0, unsigned w, u
 }
 
 /* A texture pack's replacement for a decoded texture (texpack.c): looked up once per decode,
-   drawn once its loader has it. Else the sharp font (font_sharp.c), so a pack's own font wins.
+   drawn once its loader has it. Or the sharp font (font_sharp.c): a pack's own font wins, unless
+   other button icons are chosen, when the copy is the pack's font with them (finding 200).
    Region repeat (an address mask) stays the original's. */
 static void native_replace(Native *n, Gs *g, unsigned ctxt, NativeCommand *c)
 {
@@ -813,20 +922,18 @@ static void native_texture(Native *n, Gs *g, unsigned ctxt, NativeCommand *c)
         }
     if (psm == GS_PSMT8 || psm == GS_PSMT4 || psm == GS_PSMT8H || psm == GS_PSMT4HL || psm == GS_PSMT4HH) {
         /* the digest of the 16 or 256 converted entries (native_palette, finding 148) */
-        int full = psm == GS_PSMT8 || psm == GS_PSMT8H;
-        native_palette(n, g, tex0, full);
-        key = native_mix(key, full ? n->palette_memo.digest256 : n->palette_memo.digest16);
+        key = native_mix(key, native_palette_digest(n, g, tex0, psm == GS_PSMT8 || psm == GS_PSMT8H));
     }
     if (gpu_pages) {
         /* The menus' font lives in a depth buffer's top bytes; the sharp one is drawn from the
            CPU copy, which holds the font as the game uploaded it. */
         if (n->replace_on && font_sharp_active() && font_sharp_match(tex0)) {
-            c->texture = native_decode(n, g, tex0, w, h, key);
-            if (c->texture && c->texture->sharp) native_replace(n, g, ctxt, c);
+            c->texture = native_decode(n, g, ctxt, tex0, w, h, key);
+            if (c->texture && (c->texture->sharp || c->texture->pack)) native_replace(n, g, ctxt, c);
             if (c->replacement) return;
             c->texture = NULL;
         }
-        if (native_convert_texture(n, g, tex0, w, h, pages, key, c)) return;
+        if (native_convert_texture(n, g, ctxt, tex0, w, h, pages, key, c)) return;
         /* Drawn over, but the CPU copy holds it (a Z24 buffer's top byte), or out of reach. */
         if (owner >= 0) {
             const NativeSurface *s = &n->surfaces[owner];
@@ -843,7 +950,7 @@ static void native_texture(Native *n, Gs *g, unsigned ctxt, NativeCommand *c)
             fprintf(n->texlog, "%llu,gpu_pages,%u,%u,%u,%u,%u,%u,%u,,,\n", (unsigned long long)n->field, gpu_pages, psm, tbp,
                     tbw, w, h, gpu_page);
     }
-    c->texture = native_decode(n, g, tex0, w, h, key);
+    c->texture = native_decode(n, g, ctxt, tex0, w, h, key);
     if (c->texture && (n->texpack || c->texture->sharp)) native_replace(n, g, ctxt, c);
     if (!c->texture) {
         k->flags &= ~1u;
@@ -925,7 +1032,7 @@ static void native_state(Native *n, Gs *g, unsigned prim, unsigned ctxt)
     n->zscale = zpsm == GS_PSMZ32 ? (float)(1.0 / 4294967296.0) : (zpsm & 7) == 1 ? 1.0f / 16777216 : 1.0f / 65536;
     NativeConstants *k = &c->constants;
     k->target[0] = k->target[1] = 2048;
-    if ((prim & 7) == 6) k->flags |= 1024;   /* a sprite: whole pixels when upscaled */
+    if ((prim & 7) == 6) k->flags |= 1024;   /* a sprite: snap only nearest-filtered draws when upscaled (finding 196) */
     if (prim & 16) native_texture(n, g, ctxt, c);
     /* GS dimensions are powers of two (native_texture); a missing texture uses 1.
        Scaling by their reciprocal is exact, including the fixed-point UV shift. */
@@ -1177,11 +1284,12 @@ static void native_record(Native *n, Gs *g, unsigned type, const GsVertex *v, un
     }
     n->recording->path1 += g->source_path == 1;
     if (n->state_version != g->state_version || n->state_ctxt != ctxt || n->state_prim != prim ||
-        ((prim & 16) && n->written != g->pixels_written) || !n->current_valid) {
+        ((prim & 16) && n->written != g->pixels_written) || !n->current_valid || n->mesh_open) {
         native_close(n, g);
         native_state(n, g, prim, ctxt);
         n->state_version = g->state_version; n->state_ctxt = ctxt; n->state_prim = prim;
         n->written = g->pixels_written;
+        n->mesh_open = 0;
         if (n->skip) return;
         native_open(n);
     }
@@ -1849,6 +1957,64 @@ static void native_stage_pages(Gs *g, const uint32_t want[16], uint32_t staged[1
     stage_pages(g, want, staged);
 }
 
+/* gs.c's read_image: a local-to-host read of colour pages a native surface drew (finding 250;
+   Poster Maker reads its 512 x 224 frame back, func_0019C220, and its preview and saved poster are
+   that picture). The native renderer draws only on the GPU, so GS memory never held those pixels
+   (issue #102: a black poster). The pictures handed so far are drawn first (as native_picture_read
+   waits for them), then the surface's pixels (each the mean of its scaled texels) are written into
+   GS memory, which the transfer packs: so the read sees what the screen showed. Reads in another
+   layout than the surface's, pages no colour surface owns, and DHD_EXACT_PROBE runs (the exact
+   device answers there) keep GS memory as it is. */
+static void native_colour_read(Gs *g)
+{
+    NativeExact *gpu = g->backend;
+    Native *n = gpu->native;
+    uint64_t blt = g->reg[GS_BITBLTBUF], pos = g->reg[GS_TRXPOS], size = g->reg[GS_TRXREG];
+    unsigned psm = (unsigned)(blt >> 24) & 63, sbp = (unsigned)blt & 0x3FFF, sbw = (unsigned)(blt >> 16) & 63;
+    unsigned x0 = (unsigned)pos & 2047, y0 = (unsigned)(pos >> 16) & 2047;
+    unsigned w = (unsigned)size & 4095, h = (unsigned)(size >> 32) & 4095;
+    if (n->exact_probe || !psm_color(psm) || sbp % 32 || !w || !h) return;
+    n->stats.color_reads++;
+    int index = native_owner(n, g, sbp / 32), ox, oy;
+    const NativeSurface *s = index >= 0 ? &n->surfaces[index] : NULL;
+    if (!s || s->depth || s->bw != (sbw ? sbw : 1) || s->wide != psm_wide(psm) || !native_page_origin(s, sbp / 32, &ox, &oy))
+        return;
+    native_close(n, g);  /* the pending draw into the recording */
+    unsigned drawn = 0;  /* this field's commands into the surface: not on the GPU yet, so not read */
+    for (unsigned i = 0; i < n->recording->command_count; i++)
+        drawn += n->recording->commands[i].target == index;
+    uint32_t *pixels = malloc((size_t)w * h * 4), got[2] = {0, 0};
+    if (!pixels) native_oom("colour read");
+    native_mutex_lock(&n->queue_lock);
+    while (n->rendered < n->handed) native_cond_wait(&n->queue_changed, &n->queue_lock);
+    native_mutex_unlock(&n->queue_lock);
+    const uint32_t rect[4] = {(uint32_t)ox + x0, (uint32_t)oy + y0, w, h};
+    native_mutex_lock(&n->context_lock);
+    int ok = native_read_surface(n, index, rect, pixels, got);
+    native_mutex_unlock(&n->context_lock);
+    static unsigned logged;
+    if (logged < 8) {
+        logged++;
+        fprintf(stderr, "gs native: colour read field %llu psm %#x bp %#x bw %u %u,%u %ux%u from surface %d: %s %ux%u"
+                "%s\n", (unsigned long long)n->field, psm, sbp, sbw, x0, y0, w, h, index, ok ? "read" : "nothing read",
+                got[0], got[1], drawn ? " (this field's draws into it are not in it)" : "");
+    }
+    for (unsigned y = 0; ok && y < got[1]; y++)
+        for (unsigned x = 0; x < got[0]; x++) {
+            uint32_t v = pixels[y * got[0] + x];
+            uint32_t at = gs_pixel_address(psm, sbp, sbw, (x0 + x) & 2047, (y0 + y) & 2047);
+            uint32_t *word = &g->vram[(at / 32) & (GS_VRAM_SIZE / 4 - 1)];
+            if (psm == GS_PSMCT32) *word = v;
+            else if (psm == GS_PSMCT24) *word = (*word & 0xFF000000u) | (v & 0xFFFFFFu);
+            else {  /* 16 bits: 5:5:5 and the alpha bit, as a 16-bit draw leaves it (native_import_page's TEXA) */
+                uint32_t c = (v >> 3 & 0x1F) | (v >> 11 & 0x1F) << 5 | (v >> 19 & 0x1F) << 10 | (v >> 24 >= 0x40) << 15;
+                unsigned shift = at & 16;
+                *word = (*word & ~(0xFFFFu << shift)) | c << shift;
+            }
+        }
+    free(pixels);
+}
+
 /* ---- GS hooks ---- */
 
 static void native_draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
@@ -1859,6 +2025,7 @@ static void native_draw(Gs *g, unsigned type, const GsVertex *v, unsigned count)
                     ((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) & 0x7F8));
     unsigned ctxt = prim >> 9 & 1;
     native_exact(n, g, type, v, count, prim, ctxt);
+    if (gs_vu_shadow) return;   /* a shadow batch's packet: its mesh item draws it (native_mesh) */
     native_record(n, g, type, v, count, prim, ctxt);
     n->stats.draws++;
 }
@@ -1878,6 +2045,10 @@ static void native_draw_strip(Gs *g, unsigned type, const GsVertex *list, unsign
     unsigned end = count - 2, i = 0;   /* triangle k is list[k..k+2], k < end */
     while (i < end && !drawn[i]) i++;
     if (i == end) return;
+    if (gs_vu_shadow) {   /* a shadow batch's packet: the exact path only (native_draw) */
+        for (; i < end; i++) if (drawn[i]) native_draw(g, type, &list[i], 3);
+        return;
+    }
     native_draw(g, type, &list[i], 3);
     unsigned prim = (unsigned)((g->reg[GS_PRIM] & 7) |
                     ((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) & 0x7F8));
@@ -1961,6 +2132,238 @@ static void native_draw_strip(Gs *g, unsigned type, const GsVertex *list, unsign
     n->stats.draws += recorded;
 }
 
+/* A strip vertex of the game's layout (gs_strip.h) as native_set converts the vertex those three
+   qwords write (gs_strip_vertex) with its own colour, ST not FST; its pixel in *px, *py. */
+static inline __attribute__((always_inline)) void native_strip_set(NativeVertex *o, const uint32_t *w, int ofx, int ofy,
+                                                                   uint32_t zmax, float zscale, const float *fog,
+                                                                   int *px, int *py)
+{
+    float x = (float)((int)(w[8] & 65535) - ofx) * 0.0625f + 0.5f;
+    float y = (float)((int)(w[9] & 65535) - ofy) * 0.0625f + 0.5f;
+    uint32_t z = w[10] >> 4 & 0xFFFFFF;
+    if (z > zmax) z = zmax;
+    *px = (int)x; *py = (int)y;
+    o->x = x; o->y = y; o->z = (float)z * zscale;
+    memcpy(&o->s, w, 12);   /* s, t, q */
+    o->fog = fog[w[11] >> 4 & 255];
+    o->rgba = (w[4] & 255) | (w[5] & 255) << 8 | (w[6] & 255) << 16 | (w[7] & 255) << 24;
+}
+
+/* native_strip's loop over triangles first..end-1 of the packet (triangle k is vertices k..k+2):
+   each drawn one recorded as native_record records it. exact: the exact probe is on, and each
+   takes native_exact first, as in native_draw. A constant in each of the two functions below, so
+   the usual loop has no call in it, and a function of its own, so its values have the registers
+   to themselves. Returns how many it recorded; *last is the latest, or UINT32_MAX. */
+static inline __attribute__((always_inline)) unsigned native_strip_loop(
+    Native *n, Gs *g, NativeFrame *f, const uint32_t *w, const GsVertex *before, unsigned first, unsigned end,
+    unsigned prim, unsigned ctxt, int ofx, int ofy, const int exact, unsigned *last)
+{
+    const uint32_t zmax = n->zmax;
+    const float zscale = n->zscale, *fog = n->vertex_fog;
+    int left = n->box[0], top = n->box[1], right = n->box[2], bottom = n->box[3];
+    NativeVertex *vertices = f->vertices;
+    uint32_t *const indices = f->indices, *o = indices + f->index_count, vertex_count = f->vertex_count;
+    unsigned recorded = 0, latest = UINT32_MAX;
+    int follows = 0;   /* the triangle right before was recorded in this loop */
+    int px, py;
+#define NATIVE_STRIP_BOX() do { \
+    if (px - 1 < left) left = px - 1; \
+    if (py - 1 < top) top = py - 1; \
+    if (px + 1 > right) right = px + 1; \
+    if (py + 1 > bottom) bottom = py + 1; \
+} while (0)
+    for (unsigned k = first; k < end; k++) {
+        const uint32_t *p = w + (k + 2) * GS_STRIP_WORDS;   /* the triangle's third vertex */
+        if (gs_strip_adc(p)) { follows = 0; continue; }
+        if (exact) {
+            GsVertex tri[3];
+            for (unsigned j = 0; j < 3; j++) gs_strip_vertex(p - (2 - j) * GS_STRIP_WORDS, before, &tri[j]);
+            native_exact(n, g, 4, tri, 3, prim, ctxt);
+        }
+        if (follows) {
+            /* Its first two vertices are the bytes of the previous triangle's last two: only the
+               third is new, and only it can move the box (the box only grows). */
+            native_strip_set(&vertices[vertex_count], p, ofx, ofy, zmax, zscale, fog, &px, &py);
+            NATIVE_STRIP_BOX();
+            o[0] = o[-2]; o[1] = o[-1]; o[2] = vertex_count++;
+        } else {
+            NativeVertex t[3];
+            for (unsigned j = 0; j < 3; j++) {
+                native_strip_set(&t[j], p - (2 - j) * GS_STRIP_WORDS, ofx, ofy, zmax, zscale, fog, &px, &py);
+                NATIVE_STRIP_BOX();
+            }
+            /* native_triangle_indexed for a strip: each of the first two is drawn from the
+               triangle before (whatever recorded it) when its bytes are the same */
+            uint32_t a = UINT32_MAX, b = UINT32_MAX;
+            if (o - indices >= 3) a = o[-2], b = o[-1];
+            if (a != UINT32_MAX && native_same_vertex(&vertices[a], &t[0])) o[0] = a;
+            else { vertices[vertex_count] = t[0]; o[0] = vertex_count++; }
+            if (b != UINT32_MAX && native_same_vertex(&vertices[b], &t[1])) o[1] = b;
+            else { vertices[vertex_count] = t[1]; o[1] = vertex_count++; }
+            vertices[vertex_count] = t[2]; o[2] = vertex_count++;
+        }
+        o += 3;
+        follows = 1; latest = k;
+        recorded++;
+    }
+#undef NATIVE_STRIP_BOX
+    f->vertex_count = vertex_count;
+    f->index_count = (unsigned)(o - indices);
+    n->box[0] = left; n->box[1] = top; n->box[2] = right; n->box[3] = bottom;
+    *last = latest;
+    return recorded;
+}
+
+static __attribute__((noinline)) unsigned native_strip_triangles(Native *n, NativeFrame *f, const uint32_t *w,
+                                                                 unsigned first, unsigned end, int ofx, int ofy,
+                                                                 unsigned *last)
+{
+    return native_strip_loop(n, NULL, f, w, NULL, first, end, 0, 0, ofx, ofy, 0, last);
+}
+
+static __attribute__((noinline)) unsigned native_strip_triangles_exact(
+    Native *n, Gs *g, NativeFrame *f, const uint32_t *w, const GsVertex *before, unsigned first, unsigned end,
+    unsigned prim, unsigned ctxt, int ofx, int ofy, unsigned *last)
+{
+    return native_strip_loop(n, g, f, w, before, first, end, prim, ctxt, ofx, ofy, 1, last);
+}
+
+/* gs.c's strips in the game's own layout (gs_strip_hook, finding 197): the drawn triangles of the
+   packet's vertices, as native_draw would draw each in turn, decoded and recorded in one pass.
+   The first goes through native_draw (it may change the state); the state then holds for the rest
+   (native_draw_strip says why). A triangle right after a recorded one adds its third vertex,
+   converted where the frame keeps it, and takes the other two indices from that triangle; one
+   after a skipped triangle converts all three and goes through native_triangle_indexed's steps.
+   A vertex no drawn triangle has is never converted. Box, vertices, indices, counts and the
+   conversion cache end as native_record leaves them. What the game's strips never are (a field
+   that is not indexed, flat shading, FST), a per-primitive diagnostic and a state that draws
+   nothing go through native_draw, triangle by triangle. */
+static void native_strip(Gs *g, const uint32_t *w, unsigned count)
+{
+    NativeExact *gpu = g->backend;
+    Native *n = gpu->native;
+    unsigned end = count - 2, i = 0;   /* triangle k is vertices k..k+2, k < end */
+    while (i < end && gs_strip_adc(w + (i + 2) * GS_STRIP_WORDS)) i++;
+    if (i == end) return;
+    const GsVertex before = g->vertex;   /* its u and v: the strip writes neither */
+    GsVertex tri[3];
+#define NATIVE_STRIP_DRAW_REST(k) do { \
+    for (; (k) < end; (k)++) \
+        if (!gs_strip_adc(w + ((k) + 2) * GS_STRIP_WORDS)) { \
+            for (unsigned j_ = 0; j_ < 3; j_++) gs_strip_vertex(w + ((k) + j_) * GS_STRIP_WORDS, &before, &tri[j_]); \
+            native_draw(g, 4, tri, 3); \
+        } \
+} while (0)
+    if (gs_vu_shadow) {   /* a shadow batch's packet: the exact path only (native_draw) */
+        NATIVE_STRIP_DRAW_REST(i);
+        return;
+    }
+    for (unsigned j = 0; j < 3; j++) gs_strip_vertex(w + (i + j) * GS_STRIP_WORDS, &before, &tri[j]);
+    native_draw(g, 4, tri, 3);
+    unsigned prim = (unsigned)((g->reg[GS_PRIM] & 7) |
+                    ((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) & 0x7F8));
+    unsigned ctxt = prim >> 9 & 1;
+    i++;
+    if (n->interp || n->field_trace_on || n->skip || !n->current_valid || !n->indexed ||
+        n->state_version != g->state_version || n->state_ctxt != ctxt || n->state_prim != prim ||
+        ((prim & 16) && n->written != g->pixels_written) || (prim >> 8 & 1) || !(prim >> 3 & 1)) {
+        NATIVE_STRIP_DRAW_REST(i);
+        return;
+    }
+#undef NATIVE_STRIP_DRAW_REST
+    NativeFrame *f = n->recording;
+    uint64_t offset = native_offset(g, ctxt);
+    const int ofx = (int)(offset & 65535), ofy = (int)(offset >> 32 & 65535);
+    native_reserve(f, 3 * (end - i));
+    native_reserve_indices(f, 3 * (end - i));
+    unsigned last, recorded;
+    if (n->exact_probe) recorded = native_strip_triangles_exact(n, g, f, w, &before, i, end, prim, ctxt, ofx, ofy, &last);
+    else recorded = native_strip_triangles(n, f, w, i, end, ofx, ofy, &last);
+    /* native_record's conversion cache after the last triangle recorded: its second and third
+       vertex, each with its own colour */
+    if (last != UINT32_MAX) {
+        for (unsigned j = 0; j < 2; j++) {
+            const uint32_t *p = w + (last + 1 + j) * GS_STRIP_WORDS;
+            int px, py;
+            gs_strip_vertex(p, &before, &n->conv_gs[j]);
+            native_strip_set(&n->conv[j], p, ofx, ofy, n->zmax, n->zscale, n->vertex_fog, &px, &py);
+        }
+    }
+    if (g->source_path == 1) f->path1 += recorded;
+    n->stats.primitives += recorded;
+    n->stats.draws += recorded;
+}
+
+/* A translated VU1 mesh batch (gs_mesh.h; gs_mesh made the register writes its packet would make):
+   draws of their own (flag NATIVE_MESH) whose vertices are the batch's clip-space ones and whose
+   indices are the triangles its strip draws, for native.wgsl's native_mesh_vertex. The vertices
+   carry everything of their object (its matrix is in their positions, its colour scale in their
+   colours), so consecutive batches under one draw state join one command whatever object they
+   belong to (finding 168); the loop's guard band and fog are the draw's constants (the guard band
+   is one for a whole race, the fog changes within a draw state about twice a field: finding 249).
+   Where its pixels land is not known here, so the draw claims its whole scissor.
+   Nothing of it reaches the exact path: with DHD_EXACT_PROBE the batch runs on the VU too (shadow)
+   and its packet goes there. */
+_Static_assert(sizeof(GsMeshVertex) == sizeof(NativeVertex), "a mesh vertex is stored as a NativeVertex");
+
+static void native_mesh_constants(NativeConstants *k, const GsMeshHeader *h, const float offset[2], const Native *n)
+{
+    k->flags |= NATIVE_MESH | (h->flags & GS_MESH_TWO_SIDED ? NATIVE_MESH_TWO_SIDED : 0);
+    k->mesh_offset[0] = offset[0]; k->mesh_offset[1] = offset[1];
+    k->mesh_offset[2] = (float)n->zmax; k->mesh_offset[3] = n->zscale;
+    memcpy(k->mesh_clip, h->clip, sizeof k->mesh_clip);
+    memcpy(k->mesh_fog, h->fog, sizeof k->mesh_fog);
+}
+
+static void native_mesh(Gs *g, const uint32_t *words, size_t count)
+{
+    NativeExact *gpu = g->backend;
+    Native *n = gpu->native;
+    const GsMeshHeader *h = (const GsMeshHeader *)words;
+    if (!n->indexed || h->vertices > GS_MESH_MAX_ITEM_VERTICES ||
+        count * 4 < sizeof *h + h->vertices * sizeof(GsMeshVertex) + h->indices * 2) return;
+    unsigned prim = (unsigned)((g->reg[GS_PRIM] & 7) |
+                    ((g->reg[GS_PRMODECONT] & 1 ? g->reg[GS_PRIM] : g->reg[GS_PRMODE]) & 0x7F8));
+    unsigned ctxt = prim >> 9 & 1;
+    /* native_exact's bookkeeping of the Z buffer's width (and the band's place), with no vertices:
+       nothing of a mesh is drawn or logged exactly */
+    if (!(h->flags & GS_MESH_SHADOW)) native_exact(n, g, 4, NULL, 0, prim, ctxt);
+    uint64_t xy = native_offset(g, ctxt);
+    const float offset[2] = {(float)(xy & 65535), (float)(xy >> 32 & 65535)};
+    const NativeConstants *k = &n->current.constants;
+    int same = n->current_valid && n->mesh_open && n->state_version == g->state_version && n->state_ctxt == ctxt &&
+               n->state_prim == prim && !((prim & 16) && n->written != g->pixels_written) &&
+               k->mesh_offset[0] == offset[0] && k->mesh_offset[1] == offset[1] &&
+               !(k->flags & NATIVE_MESH_TWO_SIDED) == !(h->flags & GS_MESH_TWO_SIDED) &&
+               !memcmp(k->mesh_clip, h->clip, sizeof k->mesh_clip) && !memcmp(k->mesh_fog, h->fog, sizeof k->mesh_fog);
+    if (!same) {
+        native_close(n, g);
+        native_state(n, g, prim, ctxt);
+        n->state_version = g->state_version; n->state_ctxt = ctxt; n->state_prim = prim;
+        n->written = g->pixels_written;
+        n->mesh_open = 1;
+        if (n->skip) return;
+        native_mesh_constants(&n->current.constants, h, offset, n);
+        if (n->passes) native_mesh_constants(&n->second.constants, h, offset, n);
+        native_open(n);
+    }
+    if (n->skip || !h->indices) return;
+    NativeFrame *f = n->recording;
+    n->box[0] = n->box[1] = -4096; n->box[2] = n->box[3] = 4096;   /* native_close clips it to the scissor */
+    native_reserve(f, h->vertices);
+    native_reserve_indices(f, h->indices);
+    const GsMeshVertex *v = (const GsMeshVertex *)(h + 1);
+    const uint16_t *index = (const uint16_t *)(v + h->vertices);
+    uint32_t base = f->vertex_count, *o = f->indices + f->index_count;
+    memcpy(f->vertices + base, v, h->vertices * sizeof *v);
+    f->vertex_count += h->vertices;
+    for (unsigned i = 0; i < h->indices; i++) o[i] = base + index[i];
+    f->index_count += h->indices;
+    f->path1 += h->indices / 3;
+    n->stats.primitives += h->indices / 3;
+    n->stats.draws++;
+}
+
 /* A host upload must not become the starting content of an earlier pending draw. */
 static void native_flush_draw(Gs *g)
 {
@@ -2038,6 +2441,7 @@ void pacing_present(double due, double began);
    goggles transition has more geometry than the later tiled card. Race, results
    and countdown views never use a primitive-count heuristic. */
 #define NATIVE_FLAT_FIELDS 8
+double host_widescreen_aspect(void);
 int host_widescreen_flat_limit(void);  /* port/hle/widescreen.c */
 int host_widescreen_card_drawn(void);  /* port/hle/host.c: the field's 2D was drawn for a card */
 
@@ -2098,7 +2502,12 @@ static void native_prepare_surfaces(Native *n, const NativeFrame *f)
    field's VU1 primitives and the limit of its menu state. */
 static void native_note_flat(Native *n, const NativeFrame *f)
 {
+#ifdef DHD_IOS_RENDER
+    /* A field with no new PATH1 packets can still show the previous 3D race picture. */
+    int flat = f->flat_limit > 0 && f->path1 < f->flat_limit;
+#else
     int flat = !f->path1 || (n->wide && f->path1 < f->flat_limit);
+#endif
     n->flat_fields = flat ? n->flat_fields + 1 : 0;
     native_card_now = n->wide && n->flat_fields >= NATIVE_FLAT_FIELDS;
 #ifdef NATIVE_NO_CARD_MODE
@@ -2397,6 +2806,12 @@ static int native_drawn_surface(Native *n, const NativeFrame *f)
     return -1;
 }
 
+/* A phone's app away from the screen (finding 227; the rules: render_gate.h): every piece of GPU
+   work this thread records, submits or presents passes native_gate, under queue_lock. */
+#include "render_gate.h"
+static RenderGate native_gate;      /* queue_lock (render_gate.h) */
+static Native *native_reported;     /* (a tentative definition: it is set where the renderer starts) */
+
 /* Android: the exact renderer's submits run on the render thread (dhdr_exact_set_submitter,
    port/render/src/exact/encoder.rs). On the Adreno 660 (driver 512) exact compute work recorded
    and submitted from the GS worker while this thread recorded its passes crashed this thread
@@ -2428,9 +2843,14 @@ static void native_exact_run(void (*call)(void *), void *arg, void *context)
 static void native_serve_call(Native *n)
 {
     if (!native_call.posted || native_call.done) return;
+    /* GPU work: deferred while the app is away (the poster waits; served at the return, or at the
+       quit so no poster hangs) */
+    if (!render_gate_may_start(&native_gate, n->quit)) return;
+    render_gate_begin(&native_gate);
     native_mutex_unlock(&n->queue_lock);
     native_call.call(native_call.arg);
     native_mutex_lock(&n->queue_lock);
+    render_gate_end(&native_gate);
     native_call.done = 1;
     native_cond_broadcast(&n->queue_changed);
 }
@@ -2496,32 +2916,9 @@ static void native_interp_thread(Native *n)
     }
 }
 
-void host_thread_name(const char *name);  /* port/hle/host.c */
+void host_thread_name(const char *name);  /* port/host/host_threads.c */
 
-/* DHD_ZREAD_FOLD and DHD_GPU_OVERLAP (finding 111): off unless set; 0 turns one off, any other
-   value on. They save Adreno CPU time but cost about 10% at 2x on Metal, and their probe timing is
-   not proven exact, so no platform has them on by default yet. zread.rs reads them the same way. */
-static int native_gpu_switch(const char *name)
-{
-    const char *s = getenv(name);
-    return s && strcmp(s, "0") != 0;
-}
-
-/* The experiment has no interpolation/browser publication hook. */
-static int native_fold_probe(const Native *n)
-{
-#ifdef NATIVE_INLINE
-    (void)n;
-    return 0;
-#else
-    static int on = -1;
-    if (on < 0) on = native_gpu_switch("DHD_ZREAD_FOLD");
-    return on && !n->interp;
-#endif
-}
-
-/* Experimental same-picture probe: request it before encoding, take at the old publication
-   point, and exclude the current tag in Rust. Disabled until the native-read exactness gate. */
+/* Start a copy of the probe requested by the EE from the picture just drawn. */
 static void native_zread_start_picture(Native *n)
 {
     if (n->exact_probe == 1) return;
@@ -2543,8 +2940,7 @@ static void native_zread_start_picture(Native *n)
    copy of what the EE's probe asks for now, from the Z surface just drawn (finding 097). */
 static void native_zread_after(Native *n)
 {
-    /* Even with the exact probe, a skipped batched present must flush the picture. */
-    if (n->exact_probe == 1 && !(native_fold_probe(n) && native_gpu_switch("DHD_GPU_OVERLAP"))) return;
+    if (n->exact_probe == 1) return;
     uint32_t rect[4];
     uint64_t tag;
     if (dhdr_native_zread_take(n->r, n->zread_bits, 64 * 64, rect, &tag)) {
@@ -2565,18 +2961,92 @@ static void native_zread_after(Native *n)
                     (unsigned)(tag >> 32), rect[0], rect[1], rect[2], rect[3], lo, hi);
         }
     }
-    if (!native_fold_probe(n)) native_zread_start_picture(n);
+    native_zread_start_picture(n);
 
 }
 
 /* The next handed field drawn and its frame recycled; 0 once told to quit. The render thread's
    loop, or with NATIVE_INLINE the field's own vsync (the field is already pending, so no wait). */
+/* The platform's callback and the game's return (render_gate.h, finding 227): the render thread
+   finishes the GPU work under way, starts none while the app is away, and leaves the fields queued
+   for the return (dropping them would drop their uploads). What that guarantees: no new GPU work or
+   present from this thread after gs_render_quiet says so; work submitted before may still run on
+   the GPU (iOS lets that finish; it forbids new work from the background). Not covered: the GS
+   worker's own exact Z-probe submits on iOS (they don't come through this thread; the worker blocks
+   on the held queue within two fields). Desktops never set the hold: only a phone's background
+   event (present.c's lifecycle watch) and the iOS app's callbacks do. */
+static void gate_lock(Native *n, int on)
+{
+    if (!n) return;
+    if (on) native_mutex_lock(&n->queue_lock);
+    else native_mutex_unlock(&n->queue_lock);
+}
+
+unsigned gs_render_leave(void)
+{
+    Native *n = native_reported;
+    gate_lock(n, 1);
+    unsigned generation = render_gate_leave(&native_gate);
+    gate_lock(n, 0);
+    return generation;
+}
+
+unsigned gs_render_generation(void)
+{
+    Native *n = native_reported;
+    gate_lock(n, 1);
+    unsigned generation = native_gate.generation;
+    native_gate.hold = 1;   /* the game's own wait holds too (its callback may still come) */
+    gate_lock(n, 0);
+    return generation;
+}
+
+unsigned gs_render_current(void)
+{
+    Native *n = native_reported;
+    gate_lock(n, 1);
+    unsigned generation = native_gate.generation;
+    gate_lock(n, 0);
+    return generation;
+}
+
+int gs_render_release(unsigned generation)
+{
+    Native *n = native_reported;
+    gate_lock(n, 1);
+    int released = render_gate_release(&native_gate, generation), held = native_gate.held;
+    if (released) {
+        native_gate.held = 0;
+        if (n) native_cond_broadcast(&n->queue_changed);   /* a deferred call or a held field goes now */
+    }
+    gate_lock(n, 0);
+    if (released && held) fprintf(stderr, "gs: the renderer held %d fields while the app was away; it draws them now\n", held);
+    return released;
+}
+
+int gs_render_quiet(void)
+{
+    Native *n = native_reported;
+    gate_lock(n, 1);
+    int quiet = render_gate_quiet(&native_gate);
+    gate_lock(n, 0);
+    return quiet;
+}
+
 static int native_render_next(Native *n)
 {
     double rs_wait = native_rstat_start(), waited = perf_log_on() ? host_wall_seconds() : 0;
     native_mutex_lock(&n->queue_lock);
-    NATIVE_WAIT(n, !n->pending_count && !n->quit);
-    if (n->quit) { native_mutex_unlock(&n->queue_lock); return 0; }
+    for (;;) {
+        NATIVE_WAIT(n, !n->pending_count && !n->quit);
+        if (n->quit) { native_mutex_unlock(&n->queue_lock); return 0; }
+        if (render_gate_may_start(&native_gate, n->quit)) break;
+        native_gate.held = n->pending_count;   /* held: the field stays queued */
+        native_mutex_unlock(&n->queue_lock);
+        native_sleep_ns(5000000);
+        native_mutex_lock(&n->queue_lock);
+    }
+    render_gate_begin(&native_gate);   /* the picture: GPU work under way (gs_render_quiet) */
     NativeFrame *f = n->pending[0];
     n->pending[0] = n->pending[1];
     n->pending_count--;
@@ -2605,6 +3075,7 @@ static int native_render_next(Native *n)
     native_rstat_end();
     native_recycle(f);
     native_mutex_lock(&n->queue_lock);
+    render_gate_end(&native_gate);
     n->free_frames[n->free_count++] = f;
     n->rendered = f->field;
     native_cond_broadcast(&n->queue_changed);
@@ -2626,9 +3097,41 @@ static int SDLCALL native_thread(void *argument)
     dhdr_exact_set_submitter(native_exact_run, n);
     fprintf(stderr, "gs: exact submits run on the render thread\n");
 #endif
-    if (n->interp) { native_interp_thread(n); return 0; }
-    while (native_render_next(n)) {}
+    if (n->interp) native_interp_thread(n);
+    else while (native_render_next(n)) {}
+    /* Left for good (native_stop): from here this thread touches nothing of the renderer's. A call
+       the exact renderer posted meanwhile is run by its poster from now on (native_call.live). */
+    native_mutex_lock(&n->queue_lock);
+#ifdef NATIVE_EXACT_ON_RENDER
+    native_call.live = 0;
+    native_serve_call(n);
+#endif
+    n->thread_exited = 1;
+    native_cond_broadcast(&n->queue_changed);
+    native_mutex_unlock(&n->queue_lock);
     return 0;
+}
+
+/* The end of the process (host_end.h, the render stage): the render thread finishes the picture it
+   is drawing and leaves; waits for it 1 s at most (a present stuck in the driver), then goes on
+   without it. Finding 210: exit() with this thread alive let the GPU driver's static destructors
+   destroy a mutex it then locked (bionic aborts on that). */
+static void native_stop(void)
+{
+    Native *n = native_reported;
+    if (!n) return;
+    native_mutex_lock(&n->queue_lock);
+    if (!n->thread) { native_mutex_unlock(&n->queue_lock); return; }
+    n->quit = 1;
+    native_cond_broadcast(&n->queue_changed);
+    for (int waited = 0; !n->thread_exited && waited < 1000; waited++) {
+        native_mutex_unlock(&n->queue_lock);
+        native_sleep_ns(1000000);
+        native_mutex_lock(&n->queue_lock);
+    }
+    int exited = n->thread_exited;
+    native_mutex_unlock(&n->queue_lock);
+    if (!exited) fprintf(stderr, "gs native: the render thread did not stop within 1 s; the process leaves without it\n");
 }
 #endif
 
@@ -2660,11 +3163,12 @@ void gs_native_vsync(Gs *g, unsigned *width, unsigned *height, int resize)
 {
     double due, began;
     pacing_handed(&due, &began);
-    gs_native_vsync_handed(g, width, height, resize, due, began, host_widescreen_flat_limit(), host_widescreen_card_drawn());
+    gs_native_vsync_handed(g, width, height, resize, due, began, host_widescreen_flat_limit(), host_widescreen_card_drawn(),
+                           host_widescreen_aspect());
 }
 
 void gs_native_vsync_handed(Gs *g, unsigned *width, unsigned *height, int resize, double due, double began,
-                            int flat_limit, int card_2d)
+                            int flat_limit, int card_2d, double output_aspect)
 {
     FILE *trace = native_field_trace("registers");
     if (trace) {
@@ -2700,7 +3204,8 @@ void gs_native_vsync_handed(Gs *g, unsigned *width, unsigned *height, int resize
     /* scanout reads display_state[0] = d[0..3] and [1] = d[4..7] with b.x = DBY etc. */
     uint32_t packed[12] = {d[0], d[1] / 32, d[2], d[3], d[4], d[5], d[6], d[7]};
     f->display_surface = -1;
-    if ((pmode & 3) && d[2] && d[5] && d[6] && d[5] <= 1024 && d[6] <= 1024 && psm_color(d[0])) {
+    if (!(pmode & 3)) f->display_surface = NATIVE_DISPLAY_OFF;  /* no read circuit on: a black screen */
+    else if (d[2] && d[5] && d[6] && d[5] <= 1024 && d[6] <= 1024 && psm_color(d[0])) {
         f->display_surface = native_surface(n, (unsigned)fb & 511, d[2], d[0], 0);
         if (f->display_surface >= 0) {
             native_claim(n, g, f->display_surface, d[0], (int)d[3], (int)d[4], (int)(d[3] + d[5] - 1),
@@ -2711,6 +3216,7 @@ void gs_native_vsync_handed(Gs *g, unsigned *width, unsigned *height, int resize
     } else n->stats.display_missing++;
     memcpy(f->display, packed, sizeof packed);
     f->flat_limit = (unsigned)flat_limit;
+    f->output_aspect = output_aspect;
     f->card_2d = card_2d;
     f->field = ++n->field;
     if (n->texpack) texpack_field(n->field);
@@ -2921,7 +3427,9 @@ static void native_profile(Native *n)
 }
 
 static void native_exit_report(void);
+#ifdef NATIVE_INLINE
 static Native *native_reported;
+#endif
 static void native_exit_report(void) { if (native_reported) native_profile(native_reported); }
 
 /* DHD_ASPECT: 4:3 (a television's picture, the default), 16:9 or any W:H, stretch, pixels, or
@@ -2933,6 +3441,7 @@ static void native_aspect_options(Native *n)
     unsigned aw = 4, ah = 3;
     double host_widescreen_aspect(void);
     n->wide = (float)host_widescreen_aspect();
+    /* iOS's game-thread widescreen update follows the active output, including hotplug. */
     if (aspect && !strcmp(aspect, "wide")) n->aspect = n->wide ? n->wide : 4.0f / 3;
     else if (aspect && !strcmp(aspect, "stretch")) n->aspect = 0;
     else if (aspect && !strcmp(aspect, "pixels")) n->aspect = -1;
@@ -2956,6 +3465,11 @@ static Native *native_create(NativeExact *exact)
     for (unsigned i = 1; i < NATIVE_FRAMES; i++) n->free_frames[n->free_count++] = &n->frames[i];
     const char *interp = getenv("DHD_INTERP"), *hz = getenv("DHD_INTERP_HZ");
     n->interp = interp && atoi(interp) != 0;
+#if defined(__ANDROID__) || defined(DHD_IOS_RENDER)
+    /* its own picture loop doesn't pass the render gate a phone's background needs (finding 227) */
+    if (n->interp) fprintf(stderr, "gs: DHD_INTERP is not offered on a phone; ignored\n");
+    n->interp = 0;
+#endif
 #ifdef NATIVE_INLINE
     n->interp = 0;  /* its pictures come between fields, from a thread of their own */
 #endif
@@ -3000,13 +3514,18 @@ static void native_install(Gs *g, NativeExact *exact, Native *n, const char *api
     exact->e.upload_lazily = 1;  /* the probe's draws need only the uploaded pages they touch */
     g->draw = native_draw;
     g->draw_strip = native_draw_strip;
+    gs_strip_hook = native_strip;
     g->local_copy = native_local_copy;
     g->flush_draw = native_flush_draw;
     g->write_high = native_write_high;
     g->stage_pages = native_stage_pages;
     g->fetch_pages = native_fetch_pages;
+    g->read_image = native_colour_read;
     const char *exact_probe = getenv("DHD_EXACT_PROBE");
     n->exact_probe = exact_probe ? atoi(exact_probe) : 0;
+    gs_mesh_hook = native_mesh;   /* DHD_NATIVE_VU1 (port/hle/vu1_mesh.inc, finding 164) */
+    /* none where the GPU can't draw meshes (the renderer said why; Native VU, finding 194) */
+    __atomic_store_n(&gs_mesh_mode, !n->indexed || !dhdr_native_meshes() ? 0 : n->exact_probe ? 2 : 1, __ATOMIC_RELAXED);
     n->trace_probes = getenv("DHD_NATIVE_PROBES") != NULL;
     if (getenv("DHD_NATIVE_SURFACES") && !(n->usage = calloc(NATIVE_SURFACES, sizeof *n->usage))) native_oom("usage");
     const char *texlog = getenv("DHD_NATIVE_TEXLOG");
@@ -3026,7 +3545,10 @@ static void native_install(Gs *g, NativeExact *exact, Native *n, const char *api
             fputs("field,t,cpu_ms,gpu_ms,draws,self_copies,self_copy_px,copies,copy_px,imports,import_px\n", n->trace_pictures);
     }
     native_reported = n;
-    atexit(native_exit_report);
+#ifndef NATIVE_INLINE
+    host_end_add(HOST_END_RENDER, "render thread", native_stop);
+#endif
+    host_end_add(HOST_END_REPORT, "native report", native_exit_report);
     fprintf(stderr, "gs: native renderer (DHD_RENDER=native); exact GS only for the Z probe\n");
     fprintf(stderr, "gs: native renderer on %s\n", api);
     /* what was asked (the scale in use: "gs native: resolution scale" at the first picture) */

@@ -105,6 +105,14 @@ pub const SETTINGS: &[Setting] = &[
     // controller's kind (player 1's; the PS2's own without one). The tools' runs keep the PS2's.
     choice("prompts", "DHD_PROMPTS", &[c("auto", "Auto"), c("playstation", "PlayStation"), c("xbox", "Xbox"),
                                        c("nintendo", "Nintendo")], "auto", "playstation"),
+    // The keys and controller buttons for the PS2 pad's buttons (finding 157, controls.rs): the
+    // keyboard's layout and each of the four players' controllers' (finding 251); empty, the game's
+    // own layouts.
+    text("keyboard", "DHD_KEYBOARD"),
+    text("pad1", "DHD_PAD1"),
+    text("pad2", "DHD_PAD2"),
+    text("pad3", "DHD_PAD3"),
+    text("pad4", "DHD_PAD4"),
     // A PCSX2 texture pack: texture_pack its folder (empty: textures/SCUS-97177/replacements in the
     // folder of dhd.ini and the saves, else beside the game), textures = off the game's own textures.
     switch("textures", "DHD_TEXTURES", TOGGLE, "on", "on"),
@@ -112,6 +120,19 @@ pub const SETTINGS: &[Setting] = &[
     text("texture_cache_mb", "DHD_TEXTURE_CACHE_MB"),
     // sharp: the game's font with clean edges at any resolution; original: as the PS2 draws it.
     switch("font", "DHD_FONT", &[c("original", "Original"), c("sharp", "Sharp")], "sharp", "sharp"),
+    // The optional effects (finding 183, port/patches_effects.py): the riders' shadows and the sun's
+    // glow, the lens flare's ghosts, the particle system's effects. Off: not drawn, for speed; the
+    // game itself runs the same (allowed online). PC SETTINGS' Performance Mode turns all three off.
+    switch("shadows", "DHD_SHADOWS", SWITCH, "1", "1"),
+    switch("lens_flare", "DHD_LENS_FLARE", SWITCH, "1", "1"),
+    switch("particles", "DHD_PARTICLES", SWITCH, "1", "1"),
+    // Native VU (findings 164, 167, 194, 198, port/hle/vu1_mesh.inc): the VU1 programs' batch loops
+    // drawn by the native renderer's shaders instead of run on the emulated VU. Drawing only (the
+    // game runs the same, so allowed online); live. The player's default since finding 198 (off:
+    // troubleshooting, while the emulated path exists); the tools' runs, without dhd.ini, keep the
+    // emulated VU unless they set the variable. In the browser too since finding 199 (settings.js's
+    // rows). DHD_NATIVE_VU1 also takes a list of loops with flags for tests ("0170,1708:skip").
+    switch("native_vu", "DHD_NATIVE_VU1", TOGGLE, "on", "off"),
     // Simulation steps a second (findings 067, 114), offline and online.
     choice("fps", "DHD_FPS", &[c("60", "60 fps"), c("120", "120 fps"), c("144", "144 fps"), c("165", "165 fps"),
                                c("240", "240 fps"), c("monitor", "Monitor")], "60", "60"),
@@ -119,14 +140,15 @@ pub const SETTINGS: &[Setting] = &[
     switch("perf_counter", "DHD_PERF_COUNTER", SWITCH, "0", "0"),
     switch("unlock_all", "DHD_UNLOCK_ALL", SWITCH, "0", "0"),
     // The touch controls on phones (finding 141, port/hle/touch.c; the TOUCH CONTROLS pages): the
-    // preset, the hand (left mirrors the controls and the HUD), stick or tilt steering, the size (auto:
+    // preset, the hand (left mirrors the controls and the HUD), steering by the stick, by tilt or by
+    // a four-button D-pad (finding 214; an older dhd.ini has no line and keeps the stick), the size (auto:
     // the screen height's rule, 100% at most) and the opacity, the steering stick (floating or fixed)
     // and its range, the trick stick's size, the trick labels, the attacks (flick off PEDAL or
     // buttons), vibration, whether a controller hides the overlay, tilt's strength and centre (degrees),
     // the hints already shown (a number) and the layout editor's changes.
     choice("touch_preset", "DHD_TOUCH_PRESET", &[c("thumb", "Thumb zones"), c("classic", "Classic pad")], "classic", "classic"),  // the full pad by default
     choice("touch_hand", "DHD_TOUCH_HAND", &[c("right", "Right"), c("left", "Left")], "right", "right"),
-    choice("touch_steer", "DHD_TOUCH_STEER", &[c("stick", "Stick"), c("tilt", "Tilt")], "stick", "stick"),
+    choice("touch_steer", "DHD_TOUCH_STEER", &[c("stick", "Stick"), c("tilt", "Tilt"), c("dpad", "D-pad")], "stick", "stick"),
     choice("touch_size", "DHD_TOUCH_SIZE", &[c("auto", "Auto"), c("70", "70%"), c("75", "75%"), c("80", "80%"), c("85", "85%"),
                                              c("90", "90%"), c("95", "95%"), c("100", "100%"), c("105", "105%")], "auto", "auto"),
     choice("touch_opacity", "DHD_TOUCH_OPACITY", &[c("25", "25%"), c("30", "30%"), c("35", "35%"), c("40", "40%"), c("45", "45%"),
@@ -140,6 +162,10 @@ pub const SETTINGS: &[Setting] = &[
                                                            c("37", "37 mm")], "31", "31"),
     choice("touch_labels", "DHD_TOUCH_LABELS", &[c("auto", "Auto"), c("always", "Always"), c("off", "Off")], "auto", "auto"),
     choice("touch_attacks", "DHD_TOUCH_ATTACKS", &[c("flick", "Flick"), c("buttons", "Buttons")], "flick", "flick"),
+    // Button Style (finding 229): Actions shows what each button does with the pad's name in a badge,
+    // Symbols the PS2 pad's symbols alone (the look before, the default until players have chosen;
+    // an older dhd.ini has no line).
+    choice("touch_style", "DHD_TOUCH_STYLE", &[c("actions", "Actions"), c("symbols", "Symbols")], "symbols", "symbols"),
     switch("touch_vibration", "DHD_TOUCH_VIBRATION", &[c("0", "Off"), c("1", "On")], "1", "1"),
     choice("touch_with_pad", "DHD_TOUCH_WITH_PAD", &[c("hide", "Hide"), c("show", "Show")], "hide", "hide"),
     choice("touch_tilt_strength", "DHD_TOUCH_TILT_STRENGTH", &[c("0", "0%"), c("10", "10%"), c("20", "20%"), c("30", "30%"),
@@ -152,10 +178,21 @@ pub const SETTINGS: &[Setting] = &[
     text("sound_latency_ms", "DHD_SND_LATENCY_MS"),
     Setting { default: OFFICIAL_SERVER, builtin: OFFICIAL_SERVER, always: true, ..text("server", "DHD_NET_SERVER") },
     text("name", "DHD_NET_NAME"),
+    choice("names", "DHD_NAMES", &[c("off", "Off"), c("small", "Small"), c("medium", "Medium"), c("large", "Large")], "small", "small"),
     text("rider", "DHD_NET_RIDER"),
+    // Where the rooms this player creates run (ONLINE's Room Region row, finding 181): Auto (the
+    // server picks by the Cloudflare location this PC reaches) or a Durable Object location hint.
+    choice("room_region", "DHD_NET_ROOM_REGION", &[c("auto", "Auto"), c("weur", "EU West"), c("eeur", "EU East"),
+                                                   c("enam", "NA East"), c("wnam", "NA West"), c("apac-ne", "Asia NE"),
+                                                   c("apac-se", "Asia SE"), c("oc", "Oceania")], "auto", "auto"),
     // The launcher's: whether it looks for a newer release, and where (empty: the official releases).
     choice("auto_update", "", &[c("ask", "Ask"), c("on", "Automatic"), c("off", "Off")], "ask", "ask"),
     text("update_url", "DHD_UPDATE_URL"),
+    // A phone's launcher (finding 225): whether it opens at every start (off: PLAY at once, the
+    // desktop's --play); the game's SETTINGS on a phone shows it, so the launcher can come back.
+    switch("launcher", "DHD_LAUNCHER_AT_START", SWITCH, "1", "1"),
+    // The launcher's language (port/launcher/ui/lang): a language file's code; empty, the system's.
+    text("language", ""),
     // Discord Rich Presence (port/render/presence): the game shows what is played on the player's
     // Discord profile. Off without dhd.ini, so the tools' runs never reach the PC's Discord.
     switch("discord", "DHD_DISCORD", TOGGLE, "on", "off"),

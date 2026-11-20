@@ -1,11 +1,13 @@
 /* keyboard.c: the layout, menus versus riding, the steering ramp, latching and merging
-   (finding 059). Built and run by port/tools/test_runtime.py. */
+   (finding 059), and a player's own layout (finding 157). Built and run by port/tools/test_runtime.py. */
 #include "hle.h"
+#include "controls_table.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
 static uint8_t down[256];
+static const ControlsLayout *layout;  /* NULL: the default one */
 static int input_rate=60;
 
 static HostPad neutral(void)
@@ -19,7 +21,7 @@ static HostPad neutral(void)
 static HostPad pad(int riding, double now)
 {
     HostPad p = neutral();
-    keyboard_pad(down, riding, now, &p);
+    keyboard_pad(layout, down, riding, now, &p);
     return p;
 }
 
@@ -116,18 +118,18 @@ int main(void)
     c.left_x = 40;
     c.pressure[9] = 255;
     down['Q'] = 1;
-    keyboard_pad(down, 1, 6, &c);
+    keyboard_pad(NULL, down, 1, 6, &c);
     assert(c.buttons == (PAD_R1 | PAD_L2) && c.left_x == 40 && c.pressure[10] == 255 && c.pressure[9] == 255);
     down['Q'] = 0;
 
     /* the rest of the layout */
-    static const struct { int key; uint16_t button; } layout[] = {
+    static const struct { int key; uint16_t button; } table[] = {
         {'S', PAD_TRIANGLE}, {'Z', PAD_SQUARE}, {'C', PAD_CIRCLE}, {'A', PAD_L1}, {'D', PAD_R1}, {'Q', PAD_L2},
         {'E', PAD_R2}, {'W', PAD_R3}, {'F', PAD_L3}, {0x09, PAD_SELECT}};
-    for (unsigned i = 0; i < sizeof layout / sizeof *layout; i++) {
-        down[layout[i].key] = 1;
-        assert(pad(0, 7).buttons == layout[i].button && pad(1, 7).buttons == layout[i].button);
-        down[layout[i].key] = 0;
+    for (unsigned i = 0; i < sizeof table / sizeof *table; i++) {
+        down[table[i].key] = 1;
+        assert(pad(0, 7).buttons == table[i].button && pad(1, 7).buttons == table[i].button);
+        down[table[i].key] = 0;
         pad(0, 7);
     }
 
@@ -144,7 +146,81 @@ int main(void)
         double got=steering(pad(1,i/144.0).left_x);
         assert(got>expected-.03 && got<expected+.03);
     }
-    puts("test_keyboard: ok (60 and 144 Hz ramps)");
+    input_rate = 60;
+
+    /* the default layout is keyboard.c's old table: every key it read, Esc first */
+    uint8_t keys[CONTROL_TARGETS * CONTROL_SLOTS + 1];
+    assert(keyboard_keys(NULL, keys) == 19 && keys[0] == 0x1B);
+
+    /* a layout of the player's: Cross on J and Space, X on Square, the d-pad on WASD (still the
+       ramp while riding), a left stick key, the right stick up on I */
+    ControlsLayout mine = control_defaults[CONTROL_KEYBOARD];
+    mine.input[0][0] = 'J', mine.input[0][1] = ' ';        /* cross */
+    mine.input[2][0] = 'X', mine.input[2][1] = 0;          /* square */
+    mine.input[3][0] = 0x08, mine.input[3][1] = 0;         /* triangle: Backspace only (S is the d-pad's) */
+    mine.input[12][0] = 'W', mine.input[13][0] = 'S', mine.input[14][0] = 'A', mine.input[15][0] = 'D';
+    mine.input[4][0] = 'Q', mine.input[5][0] = 'E', mine.input[6][0] = 0, mine.input[7][0] = 0;  /* l1 r1; l2 r2 none */
+    mine.input[9][0] = 0;                                  /* r3: none (W is up) */
+    mine.input[18][0] = 'K';                               /* lstick_left */
+    mine.input[20][0] = 'I';                               /* rstick_up */
+    layout = &mine;
+    keyboard_reset();
+    memset(down, 0, sizeof down);
+    down['J'] = 1;
+    assert(pad(0, 10).buttons == PAD_CROSS && pad(0, 10).pressure[6] == 255);
+    down['J'] = 0, down['X'] = 1;
+    assert(pad(0, 10).buttons == PAD_SQUARE);
+    down['X'] = 0, down['Z'] = 1;
+    assert(pad(0, 10).buttons == 0);                       /* Z is no button now */
+    down['Z'] = 0, down['W'] = 1;
+    assert(pad(0, 10).buttons == PAD_UP);                  /* menus: the d-pad */
+    down['W'] = 0;
+    pad(0, 10.1);
+    down['A'] = 1;
+    p = pad(1, 11);
+    assert(p.buttons == 0 && steering(p.left_x) < 0);      /* riding: the d-pad's keys steer, ramped */
+    assert(steering(p.left_x) > -0.3);
+    assert(steering(pad(1, 11.2).left_x) <= -0.99);
+    down['A'] = 0;
+    pad(1, 11.3);
+    down['K'] = 1;
+    p = pad(0, 12);
+    assert(p.buttons == 0 && steering(p.left_x) < 0);      /* a stick key moves the stick in menus too */
+    down['K'] = 0, down['I'] = 1;
+    p = pad(1, 13);
+    assert(p.right_y < 128 && p.left_x == 128 && p.buttons == 0);
+    down['I'] = 0;
+    pad(1, 13.1);
+    down[0x1B] = 1;                                        /* Esc is no key of the layout: always back / pause */
+    assert(pad(0, 14).buttons == PAD_TRIANGLE);
+    down[0x1B] = 0;
+    pad(0, 14.1);
+    assert(keyboard_keys(&mine, keys) == 17);
+    layout = NULL;
+
+    /* a tap shorter than a field (finding 262): pressed and let go between two reads, it is gone
+       from the held keys but the next read still takes it, once; losing the window drops it */
+    uint8_t taps[256];
+    keyboard_focus(1);
+    keyboard_taps_take(taps);
+    keyboard_key('X', 'X', 1);
+    keyboard_key('X', 'X', 0);
+    assert(!keyboard_position_down('X'));
+    keyboard_taps_take(taps);
+    assert(taps['X'] == 1 && taps[' '] == 0);
+    keyboard_taps_take(taps);
+    assert(taps['X'] == 0);
+    keyboard_key(' ', ' ', 1);   /* held across reads: down, and a tap only on the read after the press */
+    keyboard_taps_take(taps);
+    assert(taps[' '] == 1 && keyboard_position_down(' '));
+    keyboard_taps_take(taps);
+    assert(taps[' '] == 0 && keyboard_position_down(' '));
+    keyboard_key(' ', ' ', 0);
+    keyboard_key(0x0D, 0x0D, 1);
+    keyboard_focus(0);
+    keyboard_taps_take(taps);
+    assert(taps[0x0D] == 0 && !keyboard_position_down(0x0D));
+    puts("test_keyboard: ok (60 and 144 Hz ramps, a player's layout, a tap between two reads)");
     return 0;
 }
 /* Standalone keyboard tests retain the original 60-Hz input interval. */

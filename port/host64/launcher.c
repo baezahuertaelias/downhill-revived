@@ -1,6 +1,8 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__SWITCH__)
+#include <unistd.h>
 #else
 #include "../host/backtrace_posix.h"  /* <execinfo.h>, or Android's own (API < 33) */
 #include <unistd.h>
@@ -32,11 +34,20 @@ void host64_trap(wasm_rt_trap_t code) {
         WriteFile(err,text,(DWORD)k,&written,NULL);
     }
     TerminateProcess(GetCurrentProcess(),0x7700u+(UINT)code);
+#elif defined(__SWITCH__)
+    fprintf(stderr,"host64 trap: %s (EE fiber %d, wasm depth %u)\n",
+            wasm_rt_strerror(code),host64_fiber_id(),wasm_rt_call_stack_depth);
+    fflush(stderr);
+    *(volatile int *)0=0;  /* the crash report names where */
 #else
     void *frames[48]; int n=backtrace(frames,48);
     dprintf(STDERR_FILENO,"host64 trap: %s (EE fiber %d, wasm depth %u)\n",
             wasm_rt_strerror(code),host64_fiber_id(),wasm_rt_call_stack_depth);
     backtrace_symbols_fd(frames,n,STDERR_FILENO);
+    {
+        void host_log_drain(void) __attribute__((weak));
+        if (host_log_drain) host_log_drain();
+    }
     _exit(0x7700u+(unsigned)code);
 #endif
     for (;;) {}
@@ -83,6 +94,10 @@ static int game(void *start) {
     return code;
 }
 int sdl_host_main(int (*game)(void *),void *arg);  /* port/host/sdl_host.c */
+void touch_host_args(int argc,char **argv);  /* port/host/touch_host.c: --touch-editor (finding 226) */
+#ifndef HOST64_FAKE_MODULE
+#include "../host/host_end.h"
+#endif
 int main(int argc,char **argv) {
 #ifdef _WIN32
     SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);
@@ -91,6 +106,15 @@ int main(int argc,char **argv) {
 #ifdef HOST64_FAKE_MODULE
     return game(&args);  /* the boundary fixture: no window, no SDL */
 #else
-    return sdl_host_main(game,&args);
+    touch_host_args(argc,argv);
+    int code=sdl_host_main(game,&args);
+#if defined(__ANDROID__)
+    return code;  /* android_main.c logs it and ends the same way */
+#elif defined(__SWITCH__)
+    return code;  /* EXIT GAME ran the handlers on the game's thread; the process leaves from main
+                     (nx_host.c), and host_end here would wait for that thread forever (finding 270) */
+#else
+    host_end(code);  /* the game returned: the same end as EXIT GAME (finding 210) */
+#endif
 #endif
 }

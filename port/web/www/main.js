@@ -2,6 +2,7 @@
 // mouse (or touch) and sound through SharedArrayBuffers (the worker never returns to its event loop mid-field, so
 // messages would wait). Needs a cross-origin isolated page: serve.mjs sends COOP/COEP.
 import { startSettings } from './settings.js';
+import { createP2pBridge } from './p2p.js';
 const $ = id => document.getElementById(id);
 const status = $('status'), log = $('log'), canvas = $('screen');
 const params = new URLSearchParams(location.search);
@@ -130,13 +131,18 @@ async function start(source) {
   // After the sound, which needs the Start click; read again at each start, as the game reads it.
   if (await shape(source.env ?? {})) { canvas.width = 1708; canvas.height = 960; }
   const worker = new Worker('worker.js', { type: 'module' });
+  const network = await createP2pBridge(worker);
   const offscreen = canvas.transferControlToOffscreen();
   worker.onmessage = e => { const m = e.data;
+    if (m.type === 'net') { network(m).catch(e => addLog('P2P: ' + e)); return; }
     if (m.type === 'log') addLog(m.text);
     else if (m.type === 'error') { addLog('ERROR ' + m.text); status.textContent = 'stopped: ' + m.text.split('\n')[0];
       $('logPanel').hidden = false; }
     else if (m.type === 'running') status.textContent = 'running';
     else if (m.type === 'exit') status.textContent = `game exited (${m.status})`;
+    // DHD_CAPTURE_FIELDS (worker.js): the game waits at this field until dhdResume (check_browser.mjs --capture)
+    else if (m.type === 'capture') { window.dhdCapture = m.field;
+      window.dhdResume = () => { window.dhdCapture = null; worker.postMessage({ type: 'resume' }); }; }
     else if (m.type === 'status') { status.textContent = `field ${m.field}  ${m.fps.toFixed(1)} fields/s  picture ${m.size}  draws ${m.draws}  batches ${m.dispatches}  readbacks ${m.reads}  sound ${m.sound} s${m.riding ? '  riding' : ''}`;
       document.title = `DHD ${m.fps.toFixed(1)} fps (field ${m.field})`; window.dhdStatus = m; (window.dhdHistory ??= []).push([m.field, +m.fps.toFixed(2), m.draws]); }
   };

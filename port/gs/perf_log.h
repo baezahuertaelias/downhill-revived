@@ -35,12 +35,14 @@ void perf_present_wait(double seconds);
 void perf_render_size(const char *renderer, unsigned scale, unsigned pw, unsigned ph, unsigned ww, unsigned wh,
                       unsigned vw, unsigned vh);
 int perf_log_on(void);  /* 0 with DHD_PERF_LOG=0 */
-/* host.c's host_thread_name: which of the counted threads this is (game, vu, gs, native). */
+/* host_threads.c's host_thread_name: which of the counted threads this is (game, vu, gs, native). */
 void perf_thread(const char *name);
 /* present.c: whether the window is in front (focus, not minimised), with the display's refresh
    (Hz, 0 unknown); and every field, whether a race is being ridden. */
 void perf_window(int front, double refresh_hz);
 void perf_field(int riding);
+/* DHD_TIMELINE: the render thread's waits and its present time so far, in seconds. */
+void perf_render_waits(double out[2]);
 #endif
 
 #endif

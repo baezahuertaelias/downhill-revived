@@ -310,11 +310,16 @@ PATCHES = {
     'unsorted/0011A100.c': [
         ('text', 'extern void func_0011A938(Race *);',
          'extern void func_0011A938(Race *);\n'
-         'extern int hle_puppet_input(Rider *), hle_puppet_physics(Rider *);\nextern void hle_puppet_field(void);'),
+         'extern int hle_puppet_input(Rider *), hle_puppet_physics(Rider *), hle_puppet_both_remote(Rider *, Rider *);\n'
+         'extern void hle_puppet_field(void);'),
         ('text', '        func_0012C8B0(&race->riders[i]);',
          '        if (!hle_puppet_input(&race->riders[i])) func_0012C8B0(&race->riders[i]);'),
         ('text', '        func_0012D360(&race->riders[i]);',
          '        if (!hle_puppet_physics(&race->riders[i])) func_0012D360(&race->riders[i]);'),
+        # Two riders another game runs don't collide here: their bump happened there and arrives in
+        # their snapshots; this game's own rider still bumps into them (finding 202)
+        ('text', '                if (race->riders[j].x7A5C) {',
+         '                if (race->riders[j].x7A5C && !hle_puppet_both_remote(&race->riders[i], &race->riders[j])) {'),
         ('text', '    func_0011A938(race);\n}', '    func_0011A938(race);\n    hle_puppet_field();\n}')],
     # A puppet's crashes and hits come from its own PC (snapshots, events), never from here.
     'unsorted/0012E940.c': [
@@ -414,12 +419,22 @@ PATCHES['unsorted/0016B8C8.cpp'] = [('text', 'int func_00238F10(void);', 'int fu
                                    ('text', 'func_0023D8D8(0, 277.0f, sp4);', 'func_0023D8D8(0, 277.0f * port_fov_x, sp4);')]
 # Widescreen (DHD_WIDESCREEN, port/hle/host.c host_widescreen_init): the X field of view of the
 # 1P race, replay, bike shop and menu calls, scaled by port_fov_x (1 normally, 3/4 for 16:9) as
-# the PCSX2 widescreen patch for this disc changes them (finding 043). The view table and tree
-# widths are data, changed at boot.
+# the PCSX2 widescreen patch for this disc changes them (finding 043). The view table and the VU1
+# sprite widths are data, changed at boot (finding 192). The bike shop scales its own zoom
+# (port_ws_set_focal), so the setter's 688 check leaves it.
 PATCHES['unsorted/001A8A48.c'] = [('text', 'func_0023D8D8(0, 277.0f, y);', 'func_0023D8D8(0, 277.0f * port_fov_x, y);')]
-PATCHES['unsorted/001F84A8.c'] = [('text', 'func_0023D8D8(0, f, b);', 'func_0023D8D8(0, f * port_fov_x, b);')]
+PATCHES['unsorted/001F84A8.c'] = [('text', 'func_0023D8D8(0, f, b);', 'port_ws_set_focal(0, f, b);')]
 # 688 is the title (func_001B6708, recompiled from asm) and shell menus' X field of view.
-PATCHES['unsorted/0023D8D8.c'] = [('text', '    view->x0 = dist;', '    if (dist == 688.0f) dist *= port_fov_x;\n    view->x0 = dist;')]
+PATCHES['unsorted/0023D8D8.c'] = [('text', '    view->x0 = dist;', '    dist = port_ws_menu_focal(dist);\n    view->x0 = dist;')]
+# The game's file loader (func_0020D958: a path in the game's own table of the disc, read 128 KB
+# at a time) notes each file it starts, found or not, for the crash report's "disc files looked
+# up last" (port/hle/cdvd.c hle_disc_lookup; finding 208). The HLE window only: no game state.
+PATCHES['unsorted/0020D958.c'] = [
+    ('text', 'extern void func_0020D028(char *,...);',
+     'extern void func_0020D028(char *,...);\nextern void hle_disc_lookup(const char *path, int found);'),
+    ('text', ' if(!func_0020E520(&info,arg0)) {func_0020D028(D_00297FA8,arg0);return 0;}',
+     ' {int found=func_0020E520(&info,arg0); if(!arg2) hle_disc_lookup(arg0,found);\n'
+     '  if(!found) {func_0020D028(D_00297FA8,arg0);return 0;}}')]
 # func_00202760 passes its fourth argument (a3, the callers' result buffer such as &D_0029E168)
 # through to func_00247D28, which reads it; the source names only three, which matches retail only
 # because a3 is never touched. Natively the pointer was dropped and the memory card code read stack
@@ -452,6 +467,21 @@ PATCHES['unsorted/00226D08.c'] = [('text', '    obj->x2830=cursor+0x40;',
 # next slot's guard page at 0x06040000 and the 64-bit game crashed on every non-advancing finish.
 PATCHES['unsorted/0017A678.cpp'] = PATCHES.get('unsorted/0017A678.cpp', []) + [
     ('text', '    char buf[0x20];', '    char buf[0x40];')]
+# OPTIONS > POSTERS (finding 207, public issue #87): func_0019E550 builds a menu on its stack through
+# func_00184940(empty), a constructor that writes a 0x10-byte header and then the whole 0x4FC-byte
+# menu at empty+0x10. The matching source declares `empty` as `int sp60[4]` and the menu `player`
+# as `Small sp70`: on the EE the two sit back to back (sp60 + 0x10 == sp70), so the constructor
+# builds the menu in `player` itself. The wasm core's clang lays the two locals out on the shadow
+# stack as it likes, `empty` being the topmost, so the 0x4FC bytes ran off the top of the main
+# fiber's slot into the next slot's guard page (0x06040478): the game closed at once. The port's copy
+# declares them as the one object they are: a header followed by the menu.
+PATCHES['unsorted/0019E550.c'] = PATCHES.get('unsorted/0019E550.c', []) + [
+    ('text', 'struct Large {char pad0[0xC94]; unsigned char xC94; char padC95[0xB];};\n',
+     'struct Large {char pad0[0xC94]; unsigned char xC94; char padC95[0xB];};\n'
+     'struct Framed {int x0; void *x4; char pad8[8]; struct Small player;};\n'),
+    ('text', '    int sp60[4];\n    struct Small sp70;\n', '    struct Framed frame;\n'),
+    ('text', 'empty=&sp60;player=&sp70;large=&sp680;', 'empty=&frame;player=&frame.player;large=&sp680;'),
+    ('text', '        sp70.x0 = -1;\n', '        frame.player.x0 = -1;\n')]
 # Tracks at 3-4 players (public issue #1): the PS2 offered only a fixed five (mask 0x020001C2:
 # MOAB, ALPINEMX, MOABMX, JUNGLEMX, BCTDX), whatever the save had unlocked, most likely for its
 # frame rate with four views; every track loads the same "2" level files at 2-4 players (CITYMX
@@ -553,9 +583,9 @@ PATCHES['unsorted/001EB1D8.cpp'] += [
     ('text', '        PlayMenuBackLegacy(&D_004C6D98_M);\n',
      '        PlayMenuBackLegacy(&D_004C6D98_M);\n        port_options_row = 0;\n'),
     ('text', 'func_001F5EE8_M(1,0,0,530,90 + index * 10,D_0029E070_M[index+1],192);',
-     'func_001F5EE8_M(1,0,0,530,90 + index * 10,port_options_label(D_0029E070_M[index+1],index),192);'),
+     'func_001F5EE8_M(1,0,0,530,90 + index * 10,port_options_label(D_0029E070_M[index ? index : 10],index),192);'),
     ('text', 'func_001F5EE8_M(1,selected,style,530,90 + index * 10,D_0029E070_M[index+1],255);',
-     'func_001F5EE8_M(1,selected,style,530,90 + index * 10,port_options_label(D_0029E070_M[index+1],index),255);'),
+     'func_001F5EE8_M(1,selected,style,530,90 + index * 10,port_options_label(D_0029E070_M[index ? index : 10],index),255);'),
     ('text', '(u128)0x5F5245544E455F53UL);\n            }\n            break;\n        }\n',
      '(u128)0x5F5245544E455F53UL);\n            }\n            break;\n'
      '        case 9:\n'
@@ -566,6 +596,9 @@ PATCHES['unsorted/001EB1D8.cpp'] += [
      '            func_001F57D0_M(9001,1);\n'
      '            break;\n'
      '        }\n'),
+    ('text', 'if (D_004225A0_M.x12198 == 0) disabled[5] = 1;', 'if (D_004225A0_M.x12198 == 0) disabled[6] = 1;'),
+    ('text', 'if (D_004225A0_M.x1219F == 0) disabled[4] = 1;', 'if (D_004225A0_M.x1219F == 0) disabled[5] = 1;'),
+    ('text', 'switch (D_004C6D98_M.x10)', 'switch (D_004C6D98_M.x10 ? D_004C6D98_M.x10 - 1 : 9)'),
     # the page's left/right sounds, as the front end's other value rows play them
     ('text', '        func_001F76B8_M(&D_004C6D98_M);\n    }\n}\n\nextern "C" {\ntypedef struct { char bytes[48]; } LocalItems__w1;',
      '        func_001F76B8_M(&D_004C6D98_M);\n    }\n}\n'
@@ -653,6 +686,10 @@ import patches_unlock  # PC SETTINGS Unlock All: the unlock readers (finding 095
 patches_unlock.add(PATCHES)
 import patches_online_flow  # the race's pause menu in an online room (finding 118)
 patches_online_flow.add(PATCHES)
+import patches_effects  # REVIVED SETTINGS' shadows and sun glow, lens flare, particles (finding 183)
+patches_effects.add(PATCHES)
+import patches_stack  # stack locals the EE frame makes one object (finding 213)
+patches_stack.add(PATCHES)
 
 # Online's retail preview flow (finding 065). These hooks return immediately offline.
 _ONLINE_SELECT_BEGIN = r"""
@@ -793,6 +830,14 @@ PATCHES['unsorted/0013BA60.cpp'] = PATCHES.get('unsorted/0013BA60.cpp', []) + [
 # rider's default: online_menu.c shop_prepare), as the career's shop does (func_0013A270), not on
 # the list's first: a pro who changes nothing keeps the pro's own bike (finding 128).
 PATCHES['unsorted/00139BF8.c'] = PATCHES.get('unsorted/00139BF8.c', []) + [
+    ('text', '    D_0029C470 = 1;', '    D_0029C470 = 1;\n    port_ws_inventory_enter();'),
+    ('text', 'extern unsigned char D_0029C470;',
+     'extern unsigned char D_0029C470;\nextern void port_ws_inventory_enter(void);\nextern int port_ws_live_aspect(void);'),
+    # With the live aspect (iOS), publish the inventory's final projection before building the
+    # combined camera matrices; every other platform keeps the game's order (finding 224).
+    ('text', 'func_0023C8D8(5,0);func_0023CB00(0);\n func_0023D898(0,&coords[0],&coords[1]);InitSize(0,coords[1]);',
+     'func_0023C8D8(5,0);if (!port_ws_live_aspect()) func_0023CB00(0);\n func_0023D898(0,&coords[0],&coords[1]);'
+     'InitSize(0,coords[1]);if (port_ws_live_aspect()) func_0023CB00(0);'),
     ('text', '        func_0013CDB0(&D_00365800);\n    }\n',
      '        func_0013CDB0(&D_00365800);\n        if (port_online_single_race()) func_0013A270();\n    }\n'),
     ('text', 'extern void func_0013A270(void);\n',
@@ -827,6 +872,18 @@ PATCHES['unsorted/001EB1D8.cpp'] += [
         ('void func_001F5EE8__c34(int index,int row,int col,int x,int y,int z,int target)', 2, 'index', '(unsigned long)(unsigned)z'))
 ]
 
+# Online, the load screen (menu 9, func_001F43C0) holds its count, and the shell stays on it, until
+# the rides are exchanged (port/hle/online.c exchange_step, hle_online_load_hold; finding 238): the
+# screen goes on being drawn while a game waits for a slower one. Offline the hold is never on.
+PATCHES['unsorted/001EB1D8.cpp'] += [
+    ('text', 'extern void func_001F43C0__c17(void) asm("func_001F43C0");\nvoid func_001F43C0__c17(void) {',
+     'extern "C" int hle_online_load_hold(void);\n'
+     'extern void func_001F43C0__c17(void) asm("func_001F43C0");\nvoid func_001F43C0__c17(void) {'),
+    ('text', '    if (index < D_0029DF40__c17) {\n        D_0029DF44__c17 = ++index;\n',
+     '    if (index < D_0029DF40__c17 || hle_online_load_hold()) {\n'
+     '        if (!hle_online_load_hold()) D_0029DF44__c17 = ++index;\n'),
+]
+
 # Online, the countdown's timer holds until every PC may start (port/hle/online.c, start_step), the
 # game drawing meanwhile, and the HUD says who it waits for.
 PATCHES['unsorted/0019EE98.c'] = PATCHES.get('unsorted/0019EE98.c', []) + [
@@ -847,6 +904,17 @@ PATCHES['unsorted/001B4618.c'] = PATCHES.get('unsorted/001B4618.c', []) + [
      'do { extern void hle_render_wait(void); hle_render_wait(); } while(D_0029E1C8 | D_0029E1CC | D_0029E1E4);'),
 ]
 
+# The race's loading bar (func_00182330, finding 203): a Single Event style race on the Mosh Pit
+# arena (track 23), as every online race is, loads the arena's own bar, LMOSH, as its mode (15)
+# does. The game builds a Single Event bar's name from the track's short name (L%sSE), which for
+# the arena is LMOSSE, not on the disc (LOADBAR has LMOSH, and LMOSHSE, a preview card); the load
+# then reads whatever is in the bar's buffer as a texture list, and the game faults (issue #84).
+# Only that name changes, so only loads of a missing file change: Single Event itself skips the
+# arena (func_001E3810), and every other mode keeps its bar.
+PATCHES['unsorted/00182330.c'] = [
+    ('text', 'single:\n  func_00254D68(D_003C6350,D_0029CCE8,D_0026EF60[a]);',
+     'single:\n  if(a==23) return D_0029CCD8;\n  func_00254D68(D_003C6350,D_0029CCE8,D_0026EF60[a]);')]
+
 # wasm32: size_t is unsigned long there and unsigned int on i686 (the same type as the game's).
 PATCHES['unsorted/00235488.cpp'] = [('text', 'operator new[](unsigned int size)', 'operator new[](__SIZE_TYPE__ size)')]
 
@@ -856,8 +924,16 @@ PATCHES['unsorted/00148BE8.c'] = PATCHES.get('unsorted/00148BE8.c', []) + [
      'extern void hle_online_watch_camera(void *);\nvoid func_00148BE8(Object *s,int arg1) {\n hle_online_watch_camera(s);'),
 ]
 
-# The pause menu runs outside the race loop; its builder marks it paused until re-entry.
-PATCHES['unsorted/001B40A0.c'] = PATCHES.get('unsorted/001B40A0.c', []) + [
-    ('text', 'int func_001B40A0(Obj *arg0)\n{',
-     'extern void hle_online_watch_resume(void);\nint func_001B40A0(Obj *arg0)\n{\n    hle_online_watch_resume();'),
+# A race runs (fps.h port_loop_frame, finding 159): the race world's update, every unpaused frame of
+# the race's loop and in its load (func_0019C868); the shell's frame clears it. (func_001B40A0 itself
+# is NONMATCHING C: the core runs its recompiled asm, so a patch there never runs; finding 165.)
+# Online rooms (online.c hle_online_loop_frame, finding 165): START ends the race loop and the pause
+# menu runs in the front end; the loop's first frame after RESUME lets the watching camera go
+# (finding 122) and repeats a leave that came while the menu was up.
+PATCHES['unsorted/0016C0C8.c'] = PATCHES.get('unsorted/0016C0C8.c', []) + [
+    ('text', 'void func_0016C0C8(Obj *obj)\n{',
+     'extern void port_loop_frame(int);\nextern void hle_online_loop_frame(void);\n'
+     'void func_0016C0C8(Obj *obj)\n{\n    port_loop_frame(1);\n    hle_online_loop_frame();'),
 ]
+import patches_sound  # the streamed sound slots: a positional sound with no emitter (finding 222)
+patches_sound.add(PATCHES)

@@ -1,8 +1,10 @@
 /* touch.c: the touch controls' rules (finding 141): scaling, the flick lanes, the sprint and
-   resume guards, the trick stick and the pause rows' ↓ + ✕ sequences. Built and run by
+   resume guards, the trick stick and the pause rows' ↓ + ✕ sequences, and the CODES page's
+   codes through a model of the game's code reader (finding 189). Built and run by
    port/tools/test_runtime.py (a host program). */
 #include "touch.h"
 #include "hle.h"
+#include "../include/fps.h"
 
 #include <assert.h>
 #include <math.h>
@@ -611,6 +613,293 @@ static void test_restart_clock(void)
     field();
 }
 
+/* Issue #54 (finding 159): a career continued from a save races with the shell's screen id still
+   22 (CONTINUE SAVED GAME), not 9 (GET READY), so the race test (port_race_rule, fps.h) does not read
+   the screen: a race's loop ran since the front end's last frame, not the attract demo (mode 10),
+   the race phase from first_phase (1 the countdown for the overlay) to 4. The continued career's
+   own modes (0-5, func_001EE2A0) count. After a race the phase stays (3 on the title after QUIT),
+   so the front end's frame is what ends it. The overlay then shows as in any race. */
+static void test_race_running(void)
+{
+    for (int mode = 0; mode <= 5; mode++) {
+        CHECK(port_race_rule(1, mode, 1, 1));
+        CHECK(port_race_rule(1, mode, 3, 1));
+        CHECK(port_race_rule(1, mode, 4, 1));
+        CHECK(!port_race_rule(1, mode, 1, 2));   /* the countdown, for a test from GO */
+        CHECK(!port_race_rule(1, mode, 5, 1));   /* the load and the flight over the track */
+        CHECK(!port_race_rule(0, mode, 3, 1));   /* the menus after a race: the phase left at 3 */
+    }
+    CHECK(!port_race_rule(1, PORT_MODE_ATTRACT, 3, 1));
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    game.race_hud = 0;
+    wait_ms(500);
+    CHECK(!touch_visible(t));
+    game.race_hud = port_race_rule(1, 3, 2, 1);   /* touch_field: the HUD hook in a continued career's race */
+    field();
+    CHECK(touch_visible(t));
+}
+
+/* The flight over the track (issue #89, finding 209): the race HUD is not drawn, START skips the
+   flight on a pad, so the overlay shows a SKIP button that sends START and nothing else. */
+static void test_flyover(void)
+{
+    for (int preset = 0; preset < 2; preset++) {
+        float sx, sy, x, y;
+        TouchShape shapes[TOUCH_SHAPES];
+        start(preset, TOUCH_ATTACK_FLICK);
+        game.race_hud = 0;
+        game.clock_moving = 0;
+        wait_ms(500);
+        CHECK(!touch_visible(t) && !touch_owns_touches(t) && touch_shapes(t, shapes, TOUCH_SHAPES) == 0);   /* the load */
+        /* a finger already down when the flight begins is never SKIP's, also when it slides onto it */
+        assert(touch_target(t, TOUCH_TARGET_SKIP, 0, &sx, &sy));
+        touch_down(t, 9, 20, 20, now);
+        game.flyover = 1;
+        fields(2);
+        CHECK(touch_visible(t) && touch_owns_touches(t));
+        CHECK(touch_shapes(t, shapes, TOUCH_SHAPES) > 0);
+        touch_move(t, 9, sx, sy, now);
+        touch_up(t, 9, sx, sy, now);
+        fields(5);
+        CHECK(!(buttons() & PAD_START));
+        /* a tap on the race controls' places does nothing: no PEDAL, no pause */
+        at(preset == TOUCH_CLASSIC ? TC_CROSS : TC_PEDAL, &x, &y);
+        touch_down(t, 1, x, y, now);
+        fields(3);
+        CHECK(!buttons());
+        touch_up(t, 1, x, y, now);
+        at(TC_PAUSE, &x, &y);
+        touch_down(t, 2, x, y, now);
+        fields(2);
+        touch_up(t, 2, x, y, now);
+        fields(8);
+        CHECK(!buttons());
+        /* a tap on SKIP sends START on the lift, for three fields, once */
+        touch_down(t, 3, sx, sy, now);
+        fields(3);
+        CHECK(!(buttons() & PAD_START));
+        touch_up(t, 3, sx, sy, now);
+        field();
+        CHECK(buttons() & PAD_START);
+        fields(4);
+        CHECK(!(buttons() & PAD_START));
+        /* a drag off the button cancels the tap */
+        touch_down(t, 4, sx, sy, now);
+        touch_move(t, 4, sx, sy - 30, now);
+        touch_up(t, 4, sx, sy - 30, now);
+        fields(4);
+        CHECK(!(buttons() & PAD_START));
+        /* the flight ends right after the tap: the countdown never sees START */
+        touch_down(t, 6, sx, sy, now);
+        field();
+        touch_up(t, 6, sx, sy, now);
+        field();
+        CHECK(buttons() & PAD_START);
+        game.flyover = 0;
+        game.race_hud = 1;
+        game.clock_moving = 1;
+        field();
+        CHECK(!(buttons() & PAD_START));
+        fields(5);
+        CHECK(!(buttons() & PAD_START));
+        /* a finger on SKIP when the flight ends does not skip the countdown */
+        game.flyover = 1;
+        game.race_hud = 0;
+        game.clock_moving = 0;
+        fields(3);
+        touch_down(t, 7, sx, sy, now);
+        fields(2);
+        game.flyover = 0;
+        game.race_hud = 1;
+        game.clock_moving = 1;
+        fields(2);
+        touch_up(t, 7, sx, sy, now);
+        fields(6);
+        CHECK(!(buttons() & PAD_START));
+        /* a controller: the overlay hides, the touch that brings it back sends nothing */
+        game.flyover = 1;
+        game.race_hud = 0;
+        game.clock_moving = 0;
+        fields(3);
+        touch_pad_used(t, now);
+        field();
+        CHECK(!touch_visible(t));
+        CHECK(touch_owns_touches(t));
+        touch_down(t, 8, sx, sy, now);
+        touch_up(t, 8, sx, sy, now);
+        fields(6);
+        CHECK(!(buttons() & PAD_START));
+        CHECK(touch_visible(t));
+        game.flyover = 0;
+    }
+}
+
+/* The movies (finding 214: the startup movies, the attract movie, VIDEO CLIPS): a pad skips them
+   with START (or Cross), and no menu is up for a tap, so the same SKIP button shows in both
+   presets, in every setting, sends START on the lift and is taken back when the movie ends. */
+static void test_movie_skip(void)
+{
+    for (int preset = 0; preset < 2; preset++)
+        for (int dpad = 0; dpad < 2; dpad++) {
+            float sx, sy;
+            TouchShape shapes[TOUCH_SHAPES];
+            start(preset, TOUCH_ATTACK_FLICK);
+            TouchSettings s = *touch_settings(t);
+            s.dpad = dpad;
+            touch_configure(t, &s, NULL);
+            game.race_hud = 0;
+            game.clock_moving = 0;
+            wait_ms(500);
+            CHECK(!touch_visible(t));   /* the menus: nothing */
+            game.movie = 1;
+            fields(2);
+            CHECK(touch_visible(t) && touch_owns_touches(t) && touch_shapes(t, shapes, TOUCH_SHAPES) > 0);
+            assert(touch_target(t, TOUCH_TARGET_SKIP, 0, &sx, &sy));
+            /* a finger already down is not SKIP's; a tap elsewhere does nothing */
+            touch_down(t, 1, 20, 20, now);
+            touch_move(t, 1, sx, sy, now);
+            touch_up(t, 1, sx, sy, now);
+            fields(5);
+            CHECK(!buttons());
+            touch_down(t, 2, 20, 20, now);
+            fields(2);
+            touch_up(t, 2, 20, 20, now);
+            fields(5);
+            CHECK(!buttons());
+            /* SKIP: START on the lift for three fields */
+            touch_down(t, 3, sx, sy, now);
+            fields(3);
+            CHECK(!buttons());
+            touch_up(t, 3, sx, sy, now);
+            field();
+            CHECK(buttons() == PAD_START);
+            fields(4);
+            CHECK(!buttons());
+            /* the movie ends right after: the screen after it never sees START */
+            touch_down(t, 4, sx, sy, now);
+            touch_up(t, 4, sx, sy, now);
+            field();
+            CHECK(buttons() == PAD_START);
+            game.movie = 0;
+            field();
+            CHECK(!buttons());
+            fields(5);
+            CHECK(!buttons() && !touch_visible(t));
+            game.movie = 0;
+        }
+}
+
+/* A race's replay and the title's attract demo (finding 214): the pad is the recording's or the
+   demo's, so the race controls do nothing; one button, MENU (START opens the replay's menu) or SKIP
+   (any button ends the demo). While the replay's menu is up (its clock stopped) the overlay stands
+   aside so the popup takes the taps; CONTINUE brings the button back. */
+static void test_replay_attract(void)
+{
+    for (int preset = 0; preset < 2; preset++) {
+        float sx, sy, x, y;
+        TouchShape shapes[TOUCH_SHAPES];
+        start(preset, TOUCH_ATTACK_FLICK);
+        game.replay = 1;
+        fields(3);
+        CHECK(touch_visible(t) && touch_owns_touches(t) && touch_hud_mode(t) == 0);
+        int n = touch_shapes(t, shapes, TOUCH_SHAPES);
+        CHECK(n > 0 && n < 8);   /* the one button and its label, none of the race controls */
+        assert(touch_target(t, TOUCH_TARGET_SKIP, 0, &sx, &sy));
+        at(preset == TOUCH_CLASSIC ? TC_CROSS : TC_PEDAL, &x, &y);
+        touch_down(t, 1, x, y, now);
+        fields(3);
+        CHECK(!buttons());   /* the race controls send nothing: the pad is the recording's */
+        touch_up(t, 1, x, y, now);
+        touch_down(t, 2, sx, sy, now);
+        touch_up(t, 2, sx, sy, now);
+        field();
+        CHECK(buttons() == PAD_START);
+        fields(1);
+        game.clock_moving = 0;   /* the replay's menu opened: RE-START, SAVE, QUIT, CONTINUE */
+        game.menu_up = 1;        /* (the popup manager's page, finding 218) */
+        field();
+        CHECK(!buttons() && !touch_visible(t) && !touch_owns_touches(t));
+        touch_down(t, 3, sx, sy, now);
+        touch_up(t, 3, sx, sy, now);
+        fields(5);
+        CHECK(!buttons());   /* the tap is the menu's (the mouse layer), not START again */
+        game.clock_moving = 1;   /* CONTINUE */
+        game.menu_up = 0;
+        fields(2);
+        CHECK(touch_visible(t));
+        game.replay = 0;
+        game.race_hud = 0;
+        game.clock_moving = 0;
+        wait_ms(500);
+        CHECK(!touch_visible(t));
+        /* the attract demo: SKIP, any button ends it; the demo is no race for the overlay */
+        game.attract = 1;
+        fields(3);
+        CHECK(touch_visible(t) && touch_owns_touches(t));
+        touch_down(t, 4, sx, sy, now);
+        touch_up(t, 4, sx, sy, now);
+        field();
+        CHECK(buttons() == PAD_START);
+        game.attract = 0;
+        fields(6);
+        CHECK(!buttons() && !touch_visible(t));
+    }
+}
+
+/* Finding 218: a replay at a high rate (120 updates a second): most updates advance no whole field,
+   so one update's clock delta says "stopped" every other update while the replay plays. MENU stays,
+   a finger held on it stays its press, and its START goes once; only the popup (menu_up) puts the
+   overlay aside. */
+static void test_replay_high_rate(void)
+{
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    game.fps = 120;
+    game.replay = 1;
+    game.clock_moving = 0;   /* the replay's load and countdown: nothing shows yet */
+    fields(3);
+    CHECK(!touch_visible(t));
+    float sx, sy;
+    int visible = 0, updates = 0, starts = 0, was_start = 0;
+    for (int i = 0; i < 12; i++) {   /* 120 a second: half a field each update */
+        now += 1000.0 / 120;
+        game.vsync++;
+        game.clock_moving = i % 2 == 0;
+        touch_update(t, &game, now);
+    }
+    assert(touch_target(t, TOUCH_TARGET_SKIP, 0, &sx, &sy));
+    touch_down(t, 1, sx, sy, now);   /* held across the updates */
+    for (int i = 0; i < 24; i++) {
+        now += 1000.0 / 120;
+        game.vsync++;
+        game.clock_moving = i % 2 == 0;   /* what an update-by-update delta gave before this finding */
+        touch_update(t, &game, now);
+        visible += touch_visible(t) && touch_owns_touches(t);
+        updates++;
+        int start_now = (buttons() & PAD_START) != 0;
+        if (start_now && !was_start) starts++;
+        was_start = start_now;
+    }
+    touch_up(t, 1, sx, sy, now);
+    for (int i = 0; i < 12; i++) {
+        now += 1000.0 / 120;
+        game.vsync++;
+        game.clock_moving = i % 2 == 0;
+        touch_update(t, &game, now);
+        int start_now = (buttons() & PAD_START) != 0;
+        if (start_now && !was_start) starts++;
+        was_start = start_now;
+    }
+    CHECK(visible == updates);   /* MENU on every update */
+    CHECK(starts == 1);          /* the held tap went once, never withdrawn and sent again */
+    game.menu_up = 1;            /* the replay's menu: the overlay stands aside */
+    now += 1000.0 / 120, game.vsync++;
+    touch_update(t, &game, now);
+    CHECK(!touch_visible(t) && !touch_owns_touches(t));
+    game.menu_up = 0;
+    game.fps = 60;
+    game.replay = 0;
+}
+
 /* The trick-stick hint: it holds the game until a push, and when the hold ends without one (5 s)
    the hint goes too. */
 static void test_trick_hint(void)
@@ -662,15 +951,16 @@ static void test_editor_bar(void)
             for (int c = TC_CAMERA; c <= TC_PAUSE; c++) {
                 float cx, cy, cr;
                 CHECK(touch_control(t, c, &cx, &cy, &cr));
-                static const float half_w[6] = {9, 7, 5, 5, 8, 8};   /* GROUND AIR - + RESET DONE */
-                for (int b = 0; b < 6; b++) {
+                static const float half_w[8] = {7, 5, 4.5f, 4.5f, 6, 6, 7, 7};   /* GROUND AIR - + UNDO REDO RESET DONE */
+                for (int b = 0; b < 8; b++) {
                     float bx, by;
                     CHECK(touch_target(t, TOUCH_TARGET_EDITOR, b, &bx, &by));
                     CHECK(fabsf(bx - cx) >= half_w[b] + cr || fabsf(by - cy) >= 4.5f + cr);   /* no overlap */
                 }
             }
             /* a drop in open space stays (Thumb zones: BRAKE 6 mm up, clear of the flick lanes;
-               Classic: L3 10 mm inward); onto PEDAL / ✕ it snaps back */
+               Classic: L3 10 mm inward); onto PEDAL / ✕ it stays at the last place on the way where
+               it fitted (finding 226; before, it went back to its start): never over the target */
             int moved = preset ? TC_L3 : TC_BRAKE;
             float bx, by, br, nx, ny;
             touch_control(t, moved, &bx, &by, &br);
@@ -688,9 +978,10 @@ static void test_editor_bar(void)
             touch_up(t, 8, px, py, now);
             field();
             touch_control(t, moved, &bx, &by, &br);
-            CHECK(fabsf(bx - nx) < 0.2f && fabsf(by - ny) < 0.2f);
+            CHECK(hypotf(bx - px, by - py) >= br + pr - 0.01f);                 /* not over PEDAL / ✕ */
+            CHECK(hypotf(bx - px, by - py) <= hypotf(nx - px, ny - py) + 0.01f);   /* no further than its start */
             float dx, dy;
-            touch_target(t, TOUCH_TARGET_EDITOR, 5, &dx, &dy);   /* DONE */
+            touch_target(t, TOUCH_TARGET_EDITOR, 7, &dx, &dy);   /* DONE */
             touch_down(t, 9, dx, dy, now);
             touch_up(t, 9, dx, dy, now);
             field();
@@ -1068,8 +1359,1509 @@ static void test_layout_text(void)
                   fabsf(back.edit[p][c].size - s.edit[p][c].size) < 0.01f);
 }
 
+/* ---- the game's codes on touch (finding 189) ----
+   The game's code reader as the decomp has it (func_001E6F58 with func_001E72A8, func_001E7160,
+   func_001E72F0, func_001E73B0, func_001E7440; finding 117), once a frame from the pad's
+   buttons (its stick part is dead code: always 0), and a few rows of its code table
+   (D_00272448). It says which code the frames typed, as the game would. */
+enum { READER_FRAMES = 300, READER_GROUP_GAP = 2 /* D_0029D7D0 */, READER_QUIET = 20 /* D_0029D7D4 */,
+       READER_CLOSE_ALL = 2 /* D_0029D744 */ };
+typedef struct {
+    int buttons[READER_FRAMES], frame;
+    int x4, x8, active, in_group;
+    int groups[20], ngroups;
+    int history[20], nhistory;
+    int code;   /* the last code read (0 none) */
+} Reader;
+
+static const struct { int id; uint16_t press[8]; } CODES[] = {
+    {1, {PAD_UP, PAD_TRIANGLE, PAD_DOWN, PAD_CROSS, PAD_LEFT, PAD_CIRCLE, PAD_RIGHT, PAD_SQUARE}},  /* Codes (finding 117) */
+    {4, {PAD_UP, PAD_CROSS, PAD_LEFT, PAD_SQUARE, PAD_UP}},                                          /* Super Bunny Hop */
+    {19, {PAD_DOWN, PAD_SQUARE, PAD_SQUARE, PAD_LEFT, PAD_CIRCLE}},                                  /* Always Stoked */
+};
+
+static void reader_close(Reader *r, int all)
+{
+    if (!r->in_group || !r->active) return;
+    int mask = 0, index = r->frame - 1;
+    for (int n = all ? READER_CLOSE_ALL : r->x8; n > 0; n--, index--) mask |= r->buttons[(index + READER_FRAMES) % READER_FRAMES];
+    if (mask) {
+        r->groups[r->ngroups] = mask;
+        r->ngroups = (r->ngroups + 1) % 20;
+        r->in_group = 0;
+        r->x8 = 0;
+    }
+}
+
+static int reader_match_groups(const Reader *r)
+{
+    for (unsigned c = 0; c < sizeof CODES / sizeof *CODES && r->ngroups; c++) {
+        int ok = 1, i;
+        for (i = 0; i < r->ngroups; i++) if (i >= 8 || r->groups[i] != CODES[c].press[i]) ok = 0;
+        if (i < 8 && CODES[c].press[i]) ok = 0;
+        if (ok) return CODES[c].id;
+    }
+    return 0;
+}
+
+static int reader_match_history(const Reader *r)
+{
+    for (unsigned c = 0; c < sizeof CODES / sizeof *CODES; c++) {
+        int ok = 1, idx = r->nhistory - 1;
+        for (int i = 7; i >= 0; i--) {
+            if (r->history[(idx + 20) % 20] != CODES[c].press[i]) ok = 0;
+            idx--;
+        }
+        if (ok) return CODES[c].id;
+    }
+    return 0;
+}
+
+static void reader_frame(Reader *r, uint16_t b)
+{
+    int old = r->frame;
+    r->frame = (r->frame + 1) % READER_FRAMES;
+    r->buttons[r->frame] = b;
+    int changed = r->buttons[old] ^ b;
+    if (b && changed) {
+        r->active = 1;
+        r->x4 = 0;
+        if (changed & b) {
+            if (!r->in_group) r->in_group = 1, r->x8 = 0;
+        } else if (r->in_group) reader_close(r, 0);
+        int pressed = changed & 0xF0F0 & b;   /* func_001E72A8: the d-pad and face buttons newly down */
+        if (pressed) r->history[r->nhistory] = pressed, r->nhistory = (r->nhistory + 1) % 20;
+    } else {
+        if (b) r->active = 1;
+        if (r->in_group) r->x8++;
+        r->x4++;
+    }
+    if (r->x8 > READER_GROUP_GAP) reader_close(r, 1);
+    int code = 0;
+    if (r->active) {
+        if (r->x4 > READER_QUIET) code = reader_match_groups(r);
+        if (!code) code = reader_match_history(r);
+    }
+    if (code) r->code = code;
+    if (code || r->x4 > READER_QUIET) r->frame = 0, r->ngroups = 0, r->x8 = 0, r->x4 = 0, r->active = 0, r->in_group = 0;
+}
+
+/* The CODES page's button for a press. */
+static int code_button(uint16_t press)
+{
+    static const uint16_t order[8] = {PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT, PAD_TRIANGLE, PAD_CIRCLE, PAD_CROSS, PAD_SQUARE};
+    for (int i = 0; i < 8; i++) if (order[i] == press) return i;
+    return -1;
+}
+
+static void tap_code_button(long long id, int b)
+{
+    float x, y;
+    CHECK(touch_target(t, TOUCH_TARGET_CODES, b, &x, &y));
+    touch_down(t, id, x, y, now);
+    field();
+    touch_up(t, id, x, y, now);
+    field();
+}
+
+/* Pause, CODES, type code c, ENTER; the race resumes when the game has its ✕; then frames until
+   the presses are done and the reader's quiet time is over: the code the reader read. While the
+   race runs every touch_update is a game frame (game.vsync counts them), so the reader sees each. */
+static int type_code(unsigned c, int hold_pedal)
+{
+    uint16_t edges[32];
+    float x, y;
+    if (hold_pedal) {
+        at(touch_settings(t)->preset == TOUCH_CLASSIC ? TC_CROSS : TC_PEDAL, &x, &y);
+        touch_down(t, 50, x, y, now);
+        field();
+    }
+    touch_back(t, now);   /* pause: START (its press lasts 3 fields of VBLANKs at the game's rate) */
+    record(edges, 32, 24);
+    game.clock_moving = 0;
+    fields(3);
+    float rx, ry;
+    CHECK(touch_target(t, TOUCH_TARGET_PAUSE, 5, &rx, &ry));   /* CODES */
+    touch_down(t, 1, rx, ry, now);
+    touch_up(t, 1, rx, ry, now);
+    field();
+    for (int i = 0; i < 8 && CODES[c].press[i]; i++) tap_code_button(10 + i, code_button(CODES[c].press[i]));
+    CHECK(!buttons());   /* typing sends nothing: the game is paused */
+    tap_code_button(30, 10);   /* ENTER */
+    Reader r;
+    memset(&r, 0, sizeof r);
+    for (int i = 0; i < 400; i++) {
+        uint16_t b = buttons();
+        if (!game.clock_moving && (b & PAD_CROSS)) game.clock_moving = 1;   /* the game's menu takes ✕: the race goes on */
+        if (game.clock_moving) reader_frame(&r, b);
+        if (r.code) break;
+        field();
+    }
+    if (hold_pedal) touch_up(t, 50, x, y, now), field();
+    fields(60);
+    return r.code;
+}
+
+static void test_codes(void)
+{
+    static const int presets[2] = {TOUCH_THUMB_ZONES, TOUCH_CLASSIC};
+    static const int rates[2] = {60, 144};
+    for (int p = 0; p < 2; p++)
+        for (int f = 0; f < 2; f++)
+            for (unsigned c = 0; c < sizeof CODES / sizeof *CODES; c++) {
+                start(presets[p], TOUCH_ATTACK_FLICK);
+                game.fps = rates[f];
+                int got = type_code(c, c == 2);   /* PEDAL held through the pause for Always Stoked */
+                if (got != CODES[c].id) fprintf(stderr, "test_touch: preset %d, %d fps, code %d read as %d\n", presets[p], rates[f], CODES[c].id, got);
+                CHECK(got == CODES[c].id);
+            }
+    /* the reader itself: typed by a pad at its own pace (5 frames down, 5 up) it reads the code;
+       with ✕ held through it (pedalling) none is read: ✕ is in every group, and no ✕ press is new */
+    for (int held = 0; held < 2; held++)
+        for (unsigned c = 0; c < sizeof CODES / sizeof *CODES; c++) {
+            Reader r;
+            memset(&r, 0, sizeof r);
+            uint16_t extra = held ? PAD_CROSS : 0;
+            for (int i = 0; i < 8 && CODES[c].press[i]; i++) {
+                for (int k = 0; k < 5; k++) reader_frame(&r, (uint16_t)(CODES[c].press[i] | extra));
+                for (int k = 0; k < 5; k++) reader_frame(&r, extra);
+            }
+            for (int k = 0; k < 30 && !r.code; k++) reader_frame(&r, extra);
+            CHECK(r.code == (held ? 0 : CODES[c].id));   /* a held ✕: no new ✕ press, and ✕ in every group */
+        }
+    /* CLEAR and BACK: nothing typed goes; BACK on the page is Android's Back too */
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    touch_back(t, now);
+    record(NULL, 0, 8);
+    game.clock_moving = 0;
+    fields(3);
+    float rx, ry;
+    touch_target(t, TOUCH_TARGET_PAUSE, 5, &rx, &ry);
+    touch_down(t, 1, rx, ry, now);
+    touch_up(t, 1, rx, ry, now);
+    field();
+    tap_code_button(2, 0);
+    tap_code_button(3, 8);    /* CLEAR */
+    tap_code_button(4, 10);   /* ENTER with nothing typed: nothing */
+    CHECK(record(NULL, 0, 30) == 0);
+    tap_code_button(5, 4);
+    touch_back(t, now);       /* back to the rows; then Back resumes: ✕ alone, no △ */
+    uint16_t edges[8];
+    CHECK(record(edges, 8, 30) == 0);
+    touch_back(t, now);
+    CHECK(record(edges, 8, 60) == 1 && edges[0] == PAD_CROSS);
+    TouchShape shapes[TOUCH_SHAPES];
+    CHECK(touch_shapes(t, shapes, TOUCH_SHAPES) > 0);
+    /* the CONTROLS and CODES halves of their row don't overlap; the page's buttons fit the screen */
+    float cx, cy;
+    touch_target(t, TOUCH_TARGET_PAUSE, 3, &cx, &cy);
+    touch_target(t, TOUCH_TARGET_PAUSE, 5, &rx, &ry);
+    CHECK(cy == ry && rx - cx > 20);
+    for (int b = 0; b < 11; b++) {
+        float bx, by;
+        touch_target(t, TOUCH_TARGET_CODES, b, &bx, &by);
+        CHECK(bx - 9 > 0 && bx + 9 < 154.5f && by + 4.5f < 69.5f && by - 4.5f > 15);
+    }
+}
+
+/* ---- the D-pad (finding 214) ---- */
+
+enum { ARM_UP, ARM_DOWN, ARM_LEFT, ARM_RIGHT };
+#define DPAD_BITS (PAD_UP | PAD_DOWN | PAD_LEFT | PAD_RIGHT)
+
+/* A race with the D-pad steering: preset, hand, the Size setting (0 auto) and the screen. */
+static void start_dpad(int preset, int left, int size, float width, float height)
+{
+    start(preset ? TOUCH_CLASSIC : TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    TouchSettings s = *touch_settings(t);
+    s.dpad = 1;
+    s.left_handed = left;
+    s.size = size;
+    TouchScreen screen = {width, height, 0, 0, 0, 0, 0, 0, 0, 0};
+    touch_configure(t, &s, &screen);
+    field();
+}
+
+static uint16_t pad_dirs(void) { return buttons() & DPAD_BITS; }
+
+static void arm_at(int arm, float *x, float *y) { assert(touch_target(t, TOUCH_TARGET_DPAD, arm, x, y)); }
+
+/* The gap between two boxes (hw, hh half sizes), as the editor measures it. */
+static float box_gap(float ax, float ay, float ahw, float ahh, float bx, float by, float bhw, float bhh)
+{
+    return fmaxf(fabsf(ax - bx) - ahw - bhw, fabsf(ay - by) - ahh - bhh);
+}
+
+/* Both presets, both hands, the Size setting's limits and two screens: the arms are on the screen,
+   at least 9 mm square at full size, the same gap apart as the other buttons (3 mm), and clear of
+   every other control by that gap; the pad sits on the steering side. */
+static void test_dpad_layout(void)
+{
+    static const int sizes[] = {0, 50, 70, 85, 100, 105, 150};
+    static const float screens[2][2] = {{154.5f, 69.5f}, {132.0f, 62.0f}};
+    for (int preset = 0; preset < 2; preset++)
+        for (int left = 0; left < 2; left++)
+            for (unsigned si = 0; si < sizeof sizes / sizeof *sizes; si++)
+                for (int sc = 0; sc < 2; sc++) {
+                    float W = screens[sc][0], H = screens[sc][1];
+                    start_dpad(preset, left, sizes[si], W, H);
+                    float cx, cy, cr;
+                    CHECK(touch_control(t, TC_STICK, &cx, &cy, &cr));
+                    CHECK(left ? cx > W / 2 : cx < W / 2);
+                    float ax[4], ay[4];
+                    for (int a = 0; a < 4; a++) arm_at(a, &ax[a], &ay[a]);
+                    float off = (ay[ARM_DOWN] - ay[ARM_UP]) / 2;       /* an arm's centre from the rest point */
+                    float size = (off - 3.0f) / 2;                     /* off = 2 * half + 3: the arm's half size */
+                    CHECK(fabsf(ax[ARM_LEFT] - (cx - off)) < 0.01f && fabsf(ax[ARM_RIGHT] - (cx + off)) < 0.01f);
+                    CHECK(fabsf(ay[ARM_UP] - (cy - off)) < 0.01f && fabsf(ay[ARM_LEFT] - cy) < 0.01f);
+                    CHECK(fabsf(cr - (off + size)) < 0.01f);           /* the control's radius is the pad's half extent */
+                    /* the panels' 9 mm targets; Classic's arms shrink to fit between the game's track bar
+                       and L3 (finding 218): 7.9 mm on the reference phone */
+                    if (sc == 0 && (sizes[si] == 0 || sizes[si] >= 100)) CHECK(2 * size >= (preset ? 7.5f : 8.99f));
+                    /* the game's track bar and place number at the steering side's edge (finding 218,
+                       measured on the reference phone: from 52.2 % of the height down, 4.6 % of the height
+                       in at its top, leaning out 0.297 mm per mm down), by the 3 mm gap */
+                    for (int a = 0; a < 4; a++) {
+                        float bottom = ay[a] + size + 3.0f, v = fminf(bottom, H) / H;
+                        float reach = v < 0.522f ? 0 : H * (0.046f + (v - 0.522f) * 0.297f);
+                        float inner = left ? W - (ax[a] + size) : ax[a] - size;
+                        if (v >= 0.522f && inner < reach + 3.0f - 0.01f)
+                            fprintf(stderr, "dpad layout: preset %d left %d size %d screen %d: arm %d on the HUD (%.1f < %.1f)\n",
+                                    preset, left, sizes[si], sc, a, inner, reach + 3.0f);
+                        CHECK(!(v >= 0.522f && inner < reach + 3.0f - 0.01f));
+                    }
+                    if (sizes[si] >= 70) CHECK(2 * size >= 5.0f);       /* even at Size 70 on a short screen (Size 50: 3.3 mm) */
+                    CHECK(cx - cr >= -0.01f && cx + cr <= W + 0.01f && cy - cr >= -0.01f && cy + cr <= H + 0.01f);
+                    for (int a = 0; a < 4; a++)
+                        for (int b = a + 1; b < 4; b++)
+                            CHECK(box_gap(ax[a], ay[a], size, size, ax[b], ay[b], size, size) >= 3.0f - 0.01f);
+                    for (int c = 0; c < TC_COUNT; c++) {
+                        if (c == TC_STICK || c == TC_TRICK) continue;
+                        float ox, oy, orr, ohw, ohh;
+                        if (!touch_control(t, c, &ox, &oy, &orr) || !touch_control_size(t, c, &ohw, &ohh)) continue;
+                        for (int a = 0; a < 4; a++) {
+                            /* the other control, round or a box: the gap stays 3 mm (the editor's measure for boxes) */
+                            float gap = ohw == ohh ? hypotf(fmaxf(fabsf(ax[a] - ox) - size, 0), fmaxf(fabsf(ay[a] - oy) - size, 0)) - orr
+                                                   : box_gap(ax[a], ay[a], size, size, ox, oy, ohw, ohh);
+                            if (gap < 3.0f - 0.01f) fprintf(stderr, "dpad layout: preset %d left %d size %d screen %d: arm %d near control %d: %.2f\n",
+                                                            preset, left, sizes[si], sc, a, c, gap);
+                            CHECK(gap >= 3.0f - 0.01f);
+                        }
+                    }
+                }
+    /* Stick: no D-pad target; D-pad: no steering area needed */
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    float x, y;
+    CHECK(!touch_target(t, TOUCH_TARGET_DPAD, 0, &x, &y));
+}
+
+/* The directions by where a thumb is: an arm, between two arms, the rest point, a slide. */
+static void test_dpad_press(void)
+{
+    for (int preset = 0; preset < 2; preset++)
+        for (int left = 0; left < 2; left++) {
+            start_dpad(preset, left, 0, 154.5f, 69.5f);
+            float cx, cy, cr, ax[4], ay[4];
+            touch_control(t, TC_STICK, &cx, &cy, &cr);
+            for (int a = 0; a < 4; a++) arm_at(a, &ax[a], &ay[a]);
+            float off = ax[ARM_RIGHT] - cx;
+            static const uint16_t dir[4] = {PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT};
+            /* an arm's centre: that direction alone, nothing else changes (the game gets the pad's
+               d-pad buttons, the stick stays at rest) */
+            for (int a = 0; a < 4; a++) {
+                touch_down(t, 1, ax[a], ay[a], now);
+                field();
+                CHECK(pad_dirs() == dir[a]);
+                CHECK(stick_x() == 128);
+                touch_up(t, 1, ax[a], ay[a], now);
+                fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+                CHECK(pad_dirs() == 0);
+            }
+            /* between two arms: both neighbours, never opposite ones, whatever the angle */
+            static const int pairs[4][2] = {{ARM_UP, ARM_RIGHT}, {ARM_RIGHT, ARM_DOWN}, {ARM_DOWN, ARM_LEFT}, {ARM_LEFT, ARM_UP}};
+            for (int p = 0; p < 4; p++) {
+                float mx = (ax[pairs[p][0]] + ax[pairs[p][1]]) / 2, my = (ay[pairs[p][0]] + ay[pairs[p][1]]) / 2;
+                touch_down(t, 2, mx, my, now);
+                field();
+                CHECK(pad_dirs() == (dir[pairs[p][0]] | dir[pairs[p][1]]));
+                touch_up(t, 2, mx, my, now);
+                fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+            }
+            for (int deg = 0; deg < 360; deg += 5) {
+                float a = deg * 3.14159265f / 180, px = cx + cosf(a) * off, py = cy - sinf(a) * off;
+                touch_down(t, 3, px, py, now);
+                field();
+                uint16_t d = pad_dirs();
+                CHECK(d != 0);
+                CHECK(!((d & PAD_UP) && (d & PAD_DOWN)) && !((d & PAD_LEFT) && (d & PAD_RIGHT)));
+                if (deg % 90 == 0) CHECK(d == dir[deg == 0 ? ARM_RIGHT : deg == 90 ? ARM_UP : deg == 180 ? ARM_LEFT : ARM_DOWN]);
+                if (deg % 90 == 45) { int n = 0; for (int i = 0; i < 4; i++) n += (d & dir[i]) != 0; CHECK(n == 2); }
+                touch_up(t, 3, px, py, now);
+                fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+            }
+            /* the rest point: a thumb there presses nothing (down, or sliding back to it); just
+               outside the dead zone it does */
+            touch_down(t, 4, cx + 1.0f, cy, now);
+            field();
+            CHECK(pad_dirs() == 0);
+            touch_move(t, 4, cx + 7.0f, cy, now);
+            field();
+            CHECK(pad_dirs() == PAD_RIGHT);
+            touch_move(t, 4, cx + 1.0f, cy, now);
+            field();
+            CHECK(pad_dirs() == 0);
+            /* a slide from one arm to the next without a lift: right, right + up, up, up + left, left;
+               never a gap and never an opposite pair */
+            touch_move(t, 4, ax[ARM_RIGHT], ay[ARM_RIGHT], now);
+            field();
+            CHECK(pad_dirs() == PAD_RIGHT);
+            uint16_t seen[8];
+            int n = 0;
+            for (int deg = 0; deg <= 180; deg += 3) {
+                float a = deg * 3.14159265f / 180;
+                touch_move(t, 4, cx + cosf(a) * off, cy - sinf(a) * off, now);
+                field();
+                uint16_t d = pad_dirs();
+                CHECK(d != 0);
+                if (!n || seen[n - 1] != d) { if (n < 8) seen[n] = d; n++; }
+            }
+            CHECK(n == 5 && seen[0] == PAD_RIGHT && seen[1] == (PAD_RIGHT | PAD_UP) && seen[2] == PAD_UP &&
+                  seen[3] == (PAD_UP | PAD_LEFT) && seen[4] == PAD_LEFT);
+            /* far from the pad the thumb still presses by its angle (it drifted off the pad) */
+            touch_move(t, 4, cx + 45.0f, cy + 3.0f, now);
+            field();
+            CHECK(pad_dirs() == PAD_RIGHT);
+            touch_up(t, 4, cx + 45.0f, cy + 3.0f, now);
+            fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+            CHECK(pad_dirs() == 0);
+            /* a thumb that lands far from the pad is not the pad's; neither is a second one on it */
+            touch_down(t, 5, cx + 45.0f, cy, now);
+            field();
+            CHECK(pad_dirs() == 0);
+            touch_up(t, 5, cx + 45.0f, cy, now);
+            touch_down(t, 6, ax[ARM_LEFT], ay[ARM_LEFT], now);
+            touch_down(t, 7, ax[ARM_RIGHT], ay[ARM_RIGHT], now);
+            field();
+            CHECK(pad_dirs() == PAD_LEFT);
+            touch_up(t, 6, ax[ARM_LEFT], ay[ARM_LEFT], now);
+            fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+            CHECK(pad_dirs() == 0);
+            touch_up(t, 7, ax[ARM_RIGHT], ay[ARM_RIGHT], now);
+            fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+        }
+}
+
+/* A band's edge is sticky: a thumb resting on the edge between "one direction" and "two" keeps what
+   it had until it is a few degrees past. Also in the air, with PEDAL and a controller. */
+static void test_dpad_rules(void)
+{
+    for (int preset = 0; preset < 2; preset++) {
+        start_dpad(preset, 0, 0, 154.5f, 69.5f);
+        float cx, cy, cr;
+        touch_control(t, TC_STICK, &cx, &cy, &cr);
+        float r = 14.0f, rad = 3.14159265f / 180;
+        /* up joins right at 26.5° from right when coming from the right, and goes at 18.5° back */
+        touch_down(t, 1, cx + r * cosf(10 * rad), cy - r * sinf(10 * rad), now);
+        field();
+        CHECK(pad_dirs() == PAD_RIGHT);
+        touch_move(t, 1, cx + r * cosf(25.5f * rad), cy - r * sinf(25.5f * rad), now);
+        field();
+        CHECK(pad_dirs() == PAD_RIGHT);
+        touch_move(t, 1, cx + r * cosf(28 * rad), cy - r * sinf(28 * rad), now);
+        field();
+        CHECK(pad_dirs() == (PAD_RIGHT | PAD_UP));
+        touch_move(t, 1, cx + r * cosf(20 * rad), cy - r * sinf(20 * rad), now);
+        field();
+        CHECK(pad_dirs() == (PAD_RIGHT | PAD_UP));   /* sticky */
+        touch_move(t, 1, cx + r * cosf(17 * rad), cy - r * sinf(17 * rad), now);
+        field();
+        CHECK(pad_dirs() == PAD_RIGHT);
+        touch_up(t, 1, cx, cy, now);
+        fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+        /* PEDAL (Thumb zones) or ✕ (Classic) beside the D-pad; in the air the pad goes on steering */
+        float px, py;
+        at(preset ? TC_CROSS : TC_PEDAL, &px, &py);
+        touch_down(t, 2, cx + 14, cy, now);
+        touch_down(t, 3, px, py, now);
+        field();
+        CHECK((buttons() & (PAD_RIGHT | PAD_CROSS)) == (PAD_RIGHT | PAD_CROSS));
+        game.air = 1;
+        fields(15);
+        CHECK(pad_dirs() == PAD_RIGHT);
+        game.air = 0;
+        fields(2);
+        /* a controller takes over: the pad lets go; the touch that brings the overlay back is not sent */
+        touch_pad_used(t, now);
+        field();
+        CHECK(pad_dirs() == 0 && !(buttons() & PAD_CROSS));
+        touch_up(t, 2, cx + 14, cy, now);
+        touch_up(t, 3, px, py, now);
+        fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+        /* switched back to the stick while a thumb is down: it lets go; the stick is there again */
+        TouchSettings s = *touch_settings(t);
+        touch_down(t, 9, 100, 10, now);   /* the touch that brings the overlay back sends nothing */
+        field();
+        CHECK(pad_dirs() == 0);
+        touch_up(t, 9, 100, 10, now);
+        fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+        touch_down(t, 4, cx + 14, cy, now);
+        field();
+        CHECK(pad_dirs() == PAD_RIGHT);
+        s.dpad = 0;
+        touch_configure(t, &s, NULL);
+        field();
+        CHECK(pad_dirs() == 0);
+        touch_up(t, 4, cx + 14, cy, now);
+        fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+        float sx, sy, sr;
+        CHECK(touch_control(t, TC_STICK, &sx, &sy, &sr) && fabsf(sr - 11.6f) < 0.3f);   /* the stick's home again */
+        touch_down(t, 5, sx, sy, now);
+        touch_move(t, 5, sx + 12, sy, now);
+        field();
+        CHECK(stick_x() > 250 && pad_dirs() == 0);
+        touch_up(t, 5, sx + 12, sy, now);
+        fields(3);   /* a lifted press lasts PRESS_FIELDS (finding 218) */
+        /* pause: nothing is sent while the pause rows are up */
+        s.dpad = 1;
+        touch_configure(t, &s, NULL);
+        touch_control(t, TC_STICK, &cx, &cy, &cr);
+        touch_down(t, 6, cx + 14, cy, now);
+        field();
+        float qx, qy;
+        at(TC_PAUSE, &qx, &qy);
+        touch_down(t, 7, qx, qy, now);
+        touch_up(t, 7, qx, qy, now);
+        fields(10);
+        game.clock_moving = 0;   /* the game's menu is open */
+        fields(10);
+        CHECK(pad_dirs() == 0);
+        touch_up(t, 6, cx + 14, cy, now);
+        game.clock_moving = 1;
+        fields(40);
+    }
+}
+
+/* The pad's shapes: a pressed arm is drawn in the buttons' pressed colour, one box a direction. */
+/* The game's double tap (func_0017EDE8, one button): a new press with the button up the field before,
+   under 30 fields after the release, the first press not held past 60 fields. Fed one field's pad. */
+typedef struct { int was, up_fields, held_fields, long_hold, fired; } GameDouble;
+static void game_double(GameDouble *g, int down)
+{
+    if (down) {
+        if (!g->was && g->up_fields < 30 && !g->long_hold) g->fired++;
+        g->up_fields = 0;
+        g->held_fields++;
+        g->long_hold = g->held_fields > 60;
+    } else {
+        g->up_fields++;
+        g->held_fields = 0;
+        if (g->long_hold && g->up_fields > 30) g->long_hold = 0;
+    }
+    g->was = down;
+}
+
+/* Finding 218: a double tap on an arm is the game's powerslide. Each tap here is down and up between
+   two pad reads (a quick thumb, or a phone's tap tool): each must still reach the game, with a field
+   up between them, inside its 30-field window; a second tap while the first still shows too. */
+static void test_dpad_double_tap(void)
+{
+    for (int gap_fields = 0; gap_fields <= 6; gap_fields += 2) {
+        start_dpad(1, 0, 0, 154.5f, 69.5f);
+        float x, y;
+        arm_at(ARM_LEFT, &x, &y);
+        GameDouble g = {0, 1000, 0, 0, 0};
+        int pressed_fields = 0;
+        /* each field: the update, then the game reads the pad */
+        #define GAME_FIELD() do { field(); int d_ = (pad_dirs() & PAD_LEFT) != 0; pressed_fields += d_; game_double(&g, d_); } while (0)
+        touch_down(t, 1, x, y, now);
+        touch_up(t, 1, x, y, now);
+        for (int i = 0; i < 1 + gap_fields; i++) GAME_FIELD();
+        touch_down(t, 2, x, y, now);
+        touch_up(t, 2, x, y, now);
+        for (int i = 0; i < 10; i++) GAME_FIELD();
+        #undef GAME_FIELD
+        if (g.fired != 1) fprintf(stderr, "dpad double tap: gap %d fields: fired %d, pressed %d fields\n", gap_fields, g.fired, pressed_fields);
+        CHECK(g.fired == 1);
+        /* each tap PRESS_FIELDS; a second tap while the first shows cuts it to a field (the up field first) */
+        CHECK(pressed_fields >= (gap_fields ? 6 : 4));
+        CHECK(pad_dirs() == 0);
+    }
+    /* a slide across the pad still never sends opposite directions together */
+    start_dpad(1, 0, 0, 154.5f, 69.5f);
+    float lx, ly, rx, ry;
+    arm_at(ARM_LEFT, &lx, &ly), arm_at(ARM_RIGHT, &rx, &ry);
+    touch_down(t, 1, lx, ly, now);
+    touch_move(t, 1, rx, ry, now);
+    field();
+    CHECK(!((pad_dirs() & PAD_LEFT) && (pad_dirs() & PAD_RIGHT)));
+    for (int i = 0; i < 4; i++) { field(); CHECK(pad_dirs() == PAD_RIGHT); }
+    touch_up(t, 1, rx, ry, now);
+    fields(4);
+    CHECK(pad_dirs() == 0);
+}
+
+static void test_dpad_shapes(void)
+{
+    static TouchShape shapes[TOUCH_SHAPES];
+    for (int preset = 0; preset < 2; preset++) {
+        start_dpad(preset, 0, 0, 154.5f, 69.5f);
+        float cx, cy, cr, ax, ay, bx, by;
+        touch_control(t, TC_STICK, &cx, &cy, &cr);
+        arm_at(ARM_UP, &ax, &ay);
+        arm_at(ARM_RIGHT, &bx, &by);
+        int n = touch_shapes(t, shapes, TOUCH_SHAPES), green = 0, boxes_near = 0;
+        for (int i = 0; i < n; i++)
+            if (shapes[i].kind == TS_RECT && fabsf(shapes[i].x - cx) < cr && fabsf(shapes[i].y - cy) < cr && shapes[i].a < 6 && shapes[i].a > 1) boxes_near++;
+        CHECK(boxes_near == 4);   /* four arms, nothing of a stick's ring */
+        touch_down(t, 1, (ax + bx) / 2, (ay + by) / 2, now);
+        field();
+        n = touch_shapes(t, shapes, TOUCH_SHAPES);
+        for (int i = 0; i < n; i++)
+            if (shapes[i].kind == TS_RECT && (shapes[i].fill >> 8) == 0xA6E39Au) green++;
+        CHECK(green == 2);   /* up and right */
+        touch_up(t, 1, 0, 0, now);
+    }
+}
+
+/* ---- finding 226: the layout's freedom, tablets, the history, the editor alone ---- */
+
+static const TouchScreen PHONE = {154.5f, 69.5f, 0, 0, 0, 0, 0, 0, 0, 0};          /* the Mi 11i */
+static const TouchScreen MINI = {176.4f, 115.9f, 0, 0, 0, 0, 0, 0, 0, 0};          /* an 8.3-inch iPad mini */
+static const TouchScreen TABLET13 = {264.8f, 198.6f, 0, 0, 0, 0, 0, 0, 0, 0};      /* a 13-inch iPad */
+
+static void on_screen(const TouchScreen *sc, float w, float h)
+{
+    TouchSettings s = *touch_settings(t);
+    TouchScreen x = *sc;
+    x.width = w, x.height = h;
+    touch_configure(t, &s, &x);
+}
+
+static void set_screen(const TouchScreen *sc) { on_screen(sc, sc->width, sc->height); }
+
+static void editor_tap(int b)
+{
+    float x, y;
+    CHECK(touch_target(t, TOUCH_TARGET_EDITOR, b, &x, &y));
+    touch_down(t, 40, x, y, now);
+    field();
+    touch_up(t, 40, x, y, now);
+    field();
+}
+
+enum { E_GROUND, E_AIR, E_MINUS, E_PLUS, E_UNDO, E_REDO, E_RESET, E_DONE };
+
+static float size_of(int preset, int c) { return touch_settings(t)->edit[preset][c].size; }
+
+/* A drag of a control's centre by (mx, my), sampled each field. */
+static void drag(int c, float mx, float my)
+{
+    float x, y, r;
+    CHECK(touch_control(t, c, &x, &y, &r));
+    touch_down(t, 41, x, y, now);
+    field();
+    slide(41, x, y, x + mx, y + my, 300);
+    touch_up(t, 41, x + mx, y + my, now);
+    field();
+}
+
+/* Every two drawn controls of the ground layout apart (gap >= min), each wholly on the screen. */
+static void check_layout_clear(float min_gap, float W, float H)
+{
+    static const int skip[] = {TC_STICK, TC_TRICK, TC_PLUS_LEFT, TC_PLUS_RIGHT};
+    for (int c = 0; c < TC_COUNT; c++) {
+        float x, y, hw, hh;
+        int skipped = 0;
+        for (unsigned i = 0; i < 4; i++) skipped |= c == skip[i];
+        if (!touch_control(t, c, &x, &y, NULL) || skipped) continue;
+        touch_control_size(t, c, &hw, &hh);
+        CHECK(x - hw >= -0.01f && x + hw <= W + 0.01f && y - hh >= -0.01f && y + hh <= H + 0.01f);
+        for (int d = c + 1; d < TC_COUNT; d++) {
+            float x2, y2, hw2, hh2;
+            int skip2 = 0;
+            for (unsigned i = 0; i < 4; i++) skip2 |= d == skip[i];
+            if (!touch_control(t, d, &x2, &y2, NULL) || skip2) continue;
+            touch_control_size(t, d, &hw2, &hh2);
+            float gap = fmaxf(fabsf(x - x2) - hw - hw2, fabsf(y - y2) - hh - hh2);   /* boxes round both: a lower bound */
+            int round = hw == hh && hw2 == hh2 && c != TC_CAMERA && c != TC_PAUSE && c != TC_LBAR && c != TC_RBAR &&
+                        d != TC_CAMERA && d != TC_PAUSE && d != TC_LBAR && d != TC_RBAR;
+            if (round) gap = hypotf(x - x2, y - y2) - hw - hw2;
+            if (gap < min_gap) fprintf(stderr, "test_touch: controls %d and %d %.2f mm apart on %.0f x %.0f\n", c, d, gap, W, H);
+            CHECK(gap >= min_gap);
+        }
+    }
+}
+
+/* The size range's ends (25 % and 600 %) and the screen holding the control. */
+static void test_size_range(void)
+{
+    /* the trick stick's spot (Air tab; only the screen and the strips bound it): 25 % to 600 % */
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    set_screen(&TABLET13);
+    touch_open_editor(t);
+    field();
+    editor_tap(E_AIR);
+    for (int i = 0; i < 60; i++) editor_tap(E_MINUS);
+    CHECK(fabsf(size_of(0, TC_TRICK) - 0.25f) < 0.001f);
+    for (int i = 0; i < 60; i++) editor_tap(E_PLUS);
+    CHECK(fabsf(size_of(0, TC_TRICK) - 6.0f) < 0.001f);
+    /* PEDAL on a phone: + stops where the screen holds it (wholly on screen, clear of the others) */
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    touch_open_editor(t);
+    field();
+    for (int i = 0; i < 60; i++) editor_tap(E_PLUS);
+    float grown = size_of(0, TC_PEDAL);
+    CHECK(grown > 1.0f && grown < 6.0f);
+    check_layout_clear(0, PHONE.width, PHONE.height);
+    for (int i = 0; i < 80; i++) editor_tap(E_MINUS);
+    CHECK(fabsf(size_of(0, TC_PEDAL) - 0.25f) < 0.001f);
+    /* the steps: 5 % below 100 %, 10 % to 200 %, 25 % above */
+    for (int i = 0; i < 15; i++) editor_tap(E_PLUS);
+    CHECK(fabsf(size_of(0, TC_PEDAL) - 1.0f) < 0.001f);
+    editor_tap(E_PLUS);
+    CHECK(fabsf(size_of(0, TC_PEDAL) - 1.1f) < 0.001f);
+    /* the saved text takes the ends and refuses past them */
+    TouchSettings s, back;
+    touch_settings_default(&s);
+    touch_layout_parse(&back, "thumb.layout=2;thumb.pedal=0.0,0.0,0.25;thumb.hop=0.0,0.0,6.00;thumb.brake=0.0,0.0,0.20;thumb.slide=0.0,0.0,6.50");
+    CHECK(fabsf(back.edit[0][TC_PEDAL].size - 0.25f) < 0.001f && fabsf(back.edit[0][TC_HOP].size - 6.0f) < 0.001f);
+    CHECK(back.edit[0][TC_BRAKE].size == 1 && back.edit[0][TC_SLIDE].size == 1);
+    (void)s;
+    /* a held + repeats: more than a step a second's hold, and one undo step for the run */
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    set_screen(&TABLET13);
+    touch_open_editor(t);
+    field();
+    editor_tap(E_AIR);
+    float px, py;
+    touch_target(t, TOUCH_TARGET_EDITOR, E_PLUS, &px, &py);
+    touch_down(t, 42, px, py, now);
+    wait_ms(1000);
+    touch_up(t, 42, px, py, now);
+    field();
+    CHECK(size_of(0, TC_TRICK) >= 1.5f);   /* 400 ms, then a step every 90 ms */
+    editor_tap(E_UNDO);
+    CHECK(fabsf(size_of(0, TC_TRICK) - 1.0f) < 0.001f);
+}
+
+/* A control dragged past the screen's corner stays wholly on it, against the corner, at a phone,
+   a small tablet and a 13-inch tablet; grown there, it stays on the screen. */
+static void test_screen_bounds(void)
+{
+    const TouchScreen *screens[3] = {&PHONE, &MINI, &TABLET13};
+    for (int i = 0; i < 3; i++)
+        for (int preset = 0; preset < 2; preset++) {
+            const TouchScreen *sc = screens[i];
+            start(preset ? TOUCH_CLASSIC : TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+            set_screen(sc);
+            touch_open_editor(t);
+            field();
+            /* the camera / SELECT button into the bottom-left corner (the steering side: open) */
+            drag(TC_CAMERA, -400, 400);
+            float x, y, hw, hh;
+            touch_control(t, TC_CAMERA, &x, &y, NULL);
+            touch_control_size(t, TC_CAMERA, &hw, &hh);
+            CHECK(fabsf(x - hw) < 0.05f && fabsf(y + hh - sc->height) < 0.05f);
+            for (int k = 0; k < 6; k++) editor_tap(E_PLUS);
+            touch_control(t, TC_CAMERA, &x, &y, NULL);
+            touch_control_size(t, TC_CAMERA, &hw, &hh);
+            CHECK(size_of(preset, TC_CAMERA) > 1.0f);
+            CHECK(x - hw >= -0.05f && y + hh <= sc->height + 0.05f);
+            check_layout_clear(0, sc->width, sc->height);
+        }
+}
+
+/* The tablet threshold, both sides, and the tablet defaults: all on screen and apart, the top
+   buttons and SKIP under the right thumb, the clusters lifted. */
+static void test_tablet(void)
+{
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    CHECK(!touch_tablet(t));
+    on_screen(&PHONE, 160, 89.9f);
+    CHECK(!touch_tablet(t));
+    on_screen(&PHONE, 160, 90.0f);
+    CHECK(touch_tablet(t));
+    on_screen(&PHONE, 89.9f, 160);   /* the short side, whichever it is */
+    CHECK(!touch_tablet(t));
+    const TouchScreen *screens[2] = {&MINI, &TABLET13};
+    for (int i = 0; i < 2; i++)
+        for (int preset = 0; preset < 2; preset++)
+            for (int left = 0; left < 2; left++)
+                for (int attacks = 0; attacks < 2; attacks++) {
+                    const TouchScreen *sc = screens[i];
+                    start(preset ? TOUCH_CLASSIC : TOUCH_THUMB_ZONES, attacks);
+                    TouchSettings s = *touch_settings(t);
+                    s.left_handed = left;
+                    touch_configure(t, &s, sc);
+                    CHECK(touch_tablet(t));
+                    check_layout_clear(3.0f * 0.99f, sc->width, sc->height);   /* the defaults keep their 3 mm gaps */
+                    float x, y, r;
+                    for (int c = TC_CAMERA; c <= TC_PAUSE; c++) {   /* the right thumb's side, below the top third */
+                        touch_control(t, c, &x, &y, &r);
+                        CHECK(left ? x < sc->width / 2 : x > sc->width / 2);
+                        CHECK(y > sc->height * 0.15f);
+                    }
+                    touch_control(t, preset ? TC_CROSS : TC_PEDAL, &x, &y, &r);
+                    CHECK(sc->height - y > 69.5f * 0.17f * 1.25f + 5.0f);   /* lifted from the bottom edge (Classic's ✕: 17 % up on a phone) */
+                    /* the floating stick's area reaches the screen's top (the top buttons are across) */
+                    if (!preset) {
+                        float sx = left ? sc->width - 30 : 30;
+                        touch_down(t, 3, sx, 20, now);
+                        field();
+                        touch_move(t, 3, sx + 10, 20, now);
+                        field();
+                        uint8_t lx = 128, ly = 128, rx = 128, ry = 128;
+                        uint16_t b = 0;
+                        touch_pad(t, &b, &lx, &ly, &rx, &ry);
+                        CHECK(lx > 160);
+                        touch_up(t, 3, sx, 20, now);
+                        field();
+                    }
+                    /* SKIP under the right thumb */
+                    game.flyover = 1;
+                    field();
+                    CHECK(touch_target(t, TOUCH_TARGET_SKIP, 0, &x, &y));
+                    CHECK(left ? x < sc->width / 3 : x > sc->width * 2 / 3);
+                    game.flyover = 0;
+                    field();
+                }
+    /* the Size setting is a share of the tablet's base: 100 % there is 125 % of a phone's */
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    set_screen(&TABLET13);
+    float r_auto, r_100;
+    touch_control(t, TC_PEDAL, NULL, NULL, &r_auto);
+    TouchSettings s = *touch_settings(t);
+    s.size = 100;
+    touch_configure(t, &s, NULL);
+    touch_control(t, TC_PEDAL, NULL, NULL, &r_100);
+    CHECK(fabsf(r_auto - 11.6f * 1.25f) < 0.3f && fabsf(r_auto - r_100) < 0.01f);
+}
+
+/* The default places on the phones the first on-screen runs used (the lead's report, finding 226):
+   the iPhone 17 Pro Max (153.6 x 70.7 mm, home indicator 3.2 mm, the Dynamic Island's 9.9 mm band
+   on either side) and the Mi 11i (its cutout band on the right, a 5.2 mm top strip). Every preset,
+   hand and attack mode: every control on the screen, 3 mm apart (the cutout once pushed SLIDE onto
+   HOP), none over the cutout; the top buttons clear of the moved HUD (the speedometer and its
+   PUNCH meter reach about 0.9 of the height across from the HUD's corner); SKIP clear of the
+   attract demo's centred PRESS ANY BUTTON TO EXIT (35-65 % across) and under the action thumb. */
+static void test_phone_defaults(void)
+{
+    static const TouchScreen screens[3] = {
+        {153.6f, 70.7f, 0, 0, 0, 3.2f, 0, 0, 9.9f, 70.7f},             /* island on the left */
+        {153.6f, 70.7f, 0, 0, 0, 3.2f, 143.7f, 0, 153.6f, 70.7f},      /* island on the right */
+        {154.4f, 69.6f, 0, 5.2f, 0, 0, 149.3f, 0, 154.4f, 69.6f},      /* the Mi 11i */
+    };
+    for (int i = 0; i < 3; i++)
+        for (int preset = 0; preset < 2; preset++)
+            for (int left = 0; left < 2; left++)
+                for (int attacks = 0; attacks < 2; attacks++) {
+                    const TouchScreen *sc = &screens[i];
+                    start(preset ? TOUCH_CLASSIC : TOUCH_THUMB_ZONES, attacks);
+                    TouchSettings s = *touch_settings(t);
+                    s.left_handed = left;
+                    touch_configure(t, &s, sc);
+                    CHECK(!touch_tablet(t));
+                    check_layout_clear(3.0f * 0.99f, sc->width, sc->height);
+                    for (int c = 0; c < TC_COUNT; c++) {
+                        float x, y, hw, hh;
+                        if (c == TC_TRICK || !touch_control(t, c, &x, &y, NULL)) continue;
+                        touch_control_size(t, c, &hw, &hh);
+                        int over = x + hw > sc->cut_x0 && x - hw < sc->cut_x1;
+                        if (over) fprintf(stderr, "test_touch: control %d over the cutout (screen %d)\n", c, i);
+                        CHECK(!over);
+                    }
+                    float hud = 0.9f * sc->height;
+                    for (int c = TC_CAMERA; c <= TC_PAUSE; c++) {
+                        float x, y, hw, hh;
+                        touch_control(t, c, &x, &y, NULL);
+                        touch_control_size(t, c, &hw, &hh);
+                        CHECK(left ? x + hw < sc->width - hud : x - hw > hud);
+                        CHECK(y - hh >= sc->strip_top);
+                    }
+                    game.attract = 1;
+                    field();
+                    float x, y;
+                    CHECK(touch_target(t, TOUCH_TARGET_SKIP, 0, &x, &y));
+                    CHECK(x + 15 < 0.35f * sc->width || x - 15 > 0.65f * sc->width);
+                    CHECK(left ? x < sc->width / 2 : x > sc->width / 2);
+                    CHECK(x - 15 > sc->cut_x1 || x + 15 < sc->cut_x0);
+                    game.attract = 0;
+                    field();
+                }
+}
+
+/* touch_edits as 0.8.0 wrote them (its touch_layout_format: "%.1f,%.1f,%.2f", sizes 0.60-1.60):
+   they load as they were and lay out on 0.8.0's places, on a phone and on a tablet. */
+static void test_old_edits(void)
+{
+    static const char *const OLD = "thumb.pedal=-4.0,2.5,1.15;thumb.hop=3.0,-2.0,0.90;thumb.stick=6.0,-3.0,1.00;"
+                                   "classic.camera=10.0,4.0,1.20;classic.cross=1.5,-1.0,1.10;classic.l3=-2.0,0.0,0.85";
+    TouchSettings s;
+    touch_settings_default(&s);
+    touch_layout_parse(&s, OLD);
+    CHECK(s.legacy[0] && s.legacy[1]);
+    CHECK(fabsf(s.edit[0][TC_PEDAL].dx + 4.0f) < 0.001f && fabsf(s.edit[0][TC_PEDAL].size - 1.15f) < 0.001f);
+    char text[2048];
+    touch_layout_format(&s, text, sizeof text);
+    CHECK(!strcmp(text, OLD));   /* written back as it was: no mark, the same numbers */
+    /* the places 0.8.0 drew (test_scaling's PEDAL at 131.3, 49.3, r 11.6 on the Mi 11i) plus the edit;
+       on the 13-inch tablet the same places from the corner, 0.8.0's size: no tablet defaults */
+    for (int i = 0; i < 2; i++) {
+        start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+        const TouchScreen *sc = i ? &TABLET13 : &PHONE;
+        TouchSettings set = *touch_settings(t);
+        touch_layout_parse(&set, OLD);
+        touch_configure(t, &set, sc);
+        CHECK(!touch_tablet(t));
+        float x, y, r;
+        touch_control(t, TC_PEDAL, &x, &y, &r);
+        float ex = sc->width - (154.5f - 131.3f) - 4.0f, ey = sc->height - (69.5f - 49.3f) + 2.5f;
+        CHECK(fabsf(x - ex) < 0.2f && fabsf(y - ey) < 0.2f && fabsf(r - 11.6f * 1.15f) < 0.2f);
+        float cx, cy;
+        touch_control(t, TC_CAMERA, &cx, &cy, NULL);   /* the top button where 0.8.0 had it */
+        CHECK(fabsf(cx - 0.225f * 154.5f) < 0.05f && fabsf(cy - 0.08f * 69.5f) < 0.05f);
+    }
+    /* the mark: a preset laid out on the current places; RESET in the editor puts a 0.8.0 preset there */
+    touch_settings_default(&s);
+    touch_layout_parse(&s, "thumb.layout=2;thumb.pedal=1.0,1.0,2.50;classic.l3=-2.0,0.0,0.85");
+    CHECK(!s.legacy[0] && s.legacy[1]);
+    touch_layout_format(&s, text, sizeof text);
+    CHECK(!strcmp(text, "thumb.layout=2;thumb.pedal=1.0,1.0,2.50;classic.l3=-2.0,0.0,0.85"));
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    TouchSettings set = *touch_settings(t);
+    touch_layout_parse(&set, OLD);
+    touch_configure(t, &set, &TABLET13);
+    touch_open_editor(t);
+    field();
+    editor_tap(E_RESET);
+    CHECK(touch_tablet(t) && !touch_settings(t)->legacy[0]);
+    editor_tap(E_UNDO);   /* undo brings the old layout and its places back */
+    CHECK(!touch_tablet(t) && touch_settings(t)->legacy[0] && fabsf(size_of(0, TC_PEDAL) - 1.15f) < 0.001f);
+    /* a preset without edits (none saved) takes the current places: no mark needed */
+    touch_settings_default(&s);
+    touch_layout_parse(&s, "");
+    CHECK(!s.legacy[0] && !s.legacy[1]);
+}
+
+/* Undo and redo: each gesture and each tap one step; a new change drops what was undone; the
+   history holds 31 steps back. */
+static void test_undo_redo(void)
+{
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    touch_open_editor(t);
+    field();
+    float x0, y0, x, y;
+    touch_control(t, TC_BRAKE, &x0, &y0, NULL);
+    drag(TC_BRAKE, 0, -6);                            /* step 1: moved */
+    touch_control(t, TC_BRAKE, &x, &y, NULL);
+    CHECK(fabsf(y - (y0 - 6)) < 0.2f);
+    editor_tap(E_PLUS);                               /* step 2: BRAKE (selected) 110 % */
+    CHECK(fabsf(size_of(0, TC_BRAKE) - 1.1f) < 0.001f);
+    editor_tap(E_UNDO);
+    CHECK(fabsf(size_of(0, TC_BRAKE) - 1.0f) < 0.001f);
+    touch_control(t, TC_BRAKE, &x, &y, NULL);
+    CHECK(fabsf(y - (y0 - 6)) < 0.2f);
+    editor_tap(E_UNDO);
+    touch_control(t, TC_BRAKE, &x, &y, NULL);
+    CHECK(fabsf(y - y0) < 0.01f && fabsf(x - x0) < 0.01f);
+    editor_tap(E_UNDO);                               /* nothing more: stays */
+    CHECK(touch_settings(t)->edit[0][TC_BRAKE].dy == 0);
+    editor_tap(E_REDO);
+    touch_control(t, TC_BRAKE, &x, &y, NULL);
+    CHECK(fabsf(y - (y0 - 6)) < 0.2f);
+    editor_tap(E_MINUS);                              /* a new step: redo of 110 % is gone */
+    editor_tap(E_REDO);
+    CHECK(fabsf(size_of(0, TC_BRAKE) - 0.95f) < 0.001f);
+    /* RESET is one step */
+    editor_tap(E_RESET);
+    CHECK(touch_settings(t)->edit[0][TC_BRAKE].dy == 0 && size_of(0, TC_BRAKE) == 1);
+    editor_tap(E_UNDO);
+    CHECK(fabsf(size_of(0, TC_BRAKE) - 0.95f) < 0.001f);
+    /* 40 steps: 31 come back */
+    for (int i = 0; i < 40; i++) editor_tap(i % 2 ? E_PLUS : E_MINUS);
+    int undone = 0;
+    for (int i = 0; i < 40; i++) {
+        float before = size_of(0, TC_BRAKE);
+        editor_tap(E_UNDO);
+        if (size_of(0, TC_BRAKE) != before) undone++;
+    }
+    CHECK(undone >= 30 && undone <= 31);   /* alternate steps: a change each */
+    /* a pinch: a second finger while one holds the control, apart 1.5 times as far: 150 % */
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    set_screen(&TABLET13);
+    touch_open_editor(t);
+    field();
+    editor_tap(E_AIR);
+    float tx, ty;
+    touch_control(t, TC_TRICK, &tx, &ty, NULL);
+    touch_down(t, 50, tx, ty, now);
+    field();
+    touch_down(t, 51, tx - 20, ty, now);
+    field();
+    slide(51, tx - 20, ty, tx - 30, ty, 200);
+    CHECK(fabsf(size_of(0, TC_TRICK) - 1.5f) < 0.02f);
+    touch_up(t, 51, tx - 30, ty, now);
+    touch_up(t, 50, tx, ty, now);
+    field();
+    editor_tap(E_UNDO);
+    CHECK(fabsf(size_of(0, TC_TRICK) - 1.0f) < 0.001f);
+}
+
+/* The editor alone (the launcher's entry): a plain background, Done and Back close it and save. */
+static void test_editor_alone(void)
+{
+    for (int back = 0; back < 2; back++) {
+        start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+        memset(&game, 0, sizeof game);   /* no race: the game's menus or its boot behind */
+        game.fps = 60;
+        touch_open_editor_alone(t);
+        field();
+        CHECK(touch_editor_open(t) && touch_visible(t) && touch_owns_touches(t));
+        TouchShape shapes[TOUCH_SHAPES];
+        int n = touch_shapes(t, shapes, TOUCH_SHAPES);
+        CHECK(n > 10 && shapes[0].kind == TS_RECT && (shapes[0].fill & 0xFF) == 0xFF);   /* opaque */
+        drag(TC_HOP, 0, -5);
+        uint16_t b = buttons();
+        CHECK(b == 0);   /* nothing reaches the game */
+        if (back) touch_back(t, now);
+        else editor_tap(E_DONE);
+        field();
+        CHECK(!touch_editor_open(t));
+        TouchSettings saved;
+        CHECK(touch_take_saved(t, &saved));
+        CHECK(fabsf(saved.edit[0][TC_HOP].dy + 5) < 0.2f);
+    }
+    /* opened from TOUCH CONTROLS, the game's picture shows through */
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    touch_open_editor(t);
+    field();
+    TouchShape shapes[TOUCH_SHAPES];
+    touch_shapes(t, shapes, TOUCH_SHAPES);
+    CHECK((shapes[0].fill & 0xFF) < 0xFF);
+}
+
+/* ---- the review of 2026-11-13 (finding 229): moving a button never takes steering away ---- */
+
+/* A finger at x, y that moves 8 mm right steers (the stick's x past 150). */
+static int steers_at(float x, float y)
+{
+    touch_down(t, 60, x, y, now);
+    field();
+    touch_move(t, 60, x + 8, y, now);
+    field();
+    uint8_t lx = 128, ly = 128, rx = 128, ry = 128;
+    uint16_t b = 0;
+    touch_pad(t, &b, &lx, &ly, &rx, &ry);
+    touch_up(t, 60, x + 8, y, now);
+    fields(3);
+    return lx > 150;
+}
+
+/* The D-pad's right arm, tapped, presses right. */
+static int dpad_works(void)
+{
+    float x, y;
+    if (!touch_target(t, TOUCH_TARGET_DPAD, ARM_RIGHT, &x, &y)) return 0;
+    touch_down(t, 61, x, y, now);
+    field();
+    int ok = (pad_dirs() & PAD_RIGHT) != 0;
+    touch_up(t, 61, x, y, now);
+    fields(4);
+    return ok;
+}
+
+/* Classic, a phone and a 13-inch tablet, stick and D-pad, either hand: the L bar dragged to the
+   screen's bottom (the review's case) is saved, and the lower left still steers (the D-pad still
+   presses); the D-pad keeps a usable size. */
+static void test_moved_bar_steers(void)
+{
+    const TouchScreen *screens[2] = {&PHONE, &TABLET13};
+    for (int i = 0; i < 2; i++)
+        for (int dpad = 0; dpad < 2; dpad++)
+            for (int left = 0; left < 2; left++) {
+                const TouchScreen *sc = screens[i];
+                start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+                TouchSettings s = *touch_settings(t);
+                s.dpad = dpad, s.left_handed = left;
+                touch_configure(t, &s, sc);
+                field();
+                touch_open_editor(t);
+                field();
+                float bx, by, bhw, bhh;
+                touch_control(t, TC_LBAR, &bx, &by, NULL);
+                touch_control_size(t, TC_LBAR, &bhw, &bhh);
+                drag(TC_LBAR, sc->width / 2 - bx, 0);   /* across to the middle, then down to the bottom */
+                touch_control(t, TC_LBAR, &bx, &by, NULL);
+                drag(TC_LBAR, 0, sc->height - bhh - by + 5);
+                editor_tap(E_DONE);
+                field();
+                CHECK(!touch_editor_open(t));
+                touch_control(t, TC_LBAR, &bx, &by, NULL);
+                if (by + bhh < sc->height - 0.5f) fprintf(stderr, "test_touch: the L bar stopped at %.1f of %.1f\n", by + bhh, sc->height);
+                CHECK(by + bhh > sc->height - 0.5f);   /* the review's place: against the bottom */
+                if (dpad) {
+                    float cx, cy, cr;
+                    touch_control(t, TC_STICK, &cx, &cy, &cr);
+                    CHECK(cr > 8.0f);   /* the pad's half extent: arms of a usable size */
+                    CHECK(dpad_works());
+                } else {
+                    float x = left ? sc->width - 20 : 12, y = sc->height - 25;   /* the lower left, under the bar's default place */
+                    int ok = steers_at(x, y);
+                    if (!ok) fprintf(stderr, "test_touch: no steering at %.0f,%.0f (screen %d, left %d)\n", x, y, i, left);
+                    CHECK(ok);
+                }
+            }
+    /* the D-pad's room has a floor: a screen so short that the room under the bar is gone */
+    start_dpad(1, 0, 0, 154.5f, 30.0f);
+    float cx, cy, cr;
+    touch_control(t, TC_STICK, &cx, &cy, &cr);
+    CHECK(cr > 0);
+}
+
+/* A saved layout with the bar at the bottom (written by a build before the fix) loads and steers;
+   one whose controls cover the whole steering area loads with those controls at their default
+   places for the run (the note says so, once), and steers; the editor refuses a drag that would
+   cover it. */
+static void test_saved_layout_steers(void)
+{
+    for (int left = 0; left < 2; left++) {
+        start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+        float bx, by, bhw, bhh;
+        touch_control(t, TC_LBAR, &bx, &by, NULL);
+        touch_control_size(t, TC_LBAR, &bhw, &bhh);
+        char text[256];
+        snprintf(text, sizeof text, "classic.layout=2;classic.lbar=%.1f,%.1f,1.00", 30.0, PHONE.height - bhh - by);
+        TouchSettings s = *touch_settings(t);
+        s.left_handed = left;
+        touch_layout_parse(&s, text);
+        touch_configure(t, &s, &PHONE);
+        field();
+        CHECK(touch_take_note(t) == NULL);   /* nothing to rescue: the area is the default one */
+        touch_control(t, TC_LBAR, &bx, &by, NULL);
+        CHECK(by + bhh > PHONE.height - 0.5f);
+        CHECK(steers_at(left ? PHONE.width - 20 : 12, PHONE.height * 0.62f));
+    }
+    /* L3 grown over the whole steering area (a hand-edited dhd.ini): L3 back at its place, noted once */
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    float lx, ly;
+    touch_control(t, TC_L3, &lx, &ly, NULL);
+    TouchSettings s = *touch_settings(t);
+    char text[256];
+    snprintf(text, sizeof text, "classic.layout=2;classic.l3=%.1f,%.1f,6.00", 0.22f * PHONE.width - lx, PHONE.height * 0.62f - ly);
+    touch_layout_parse(&s, text);
+    touch_configure(t, &s, &PHONE);
+    field();
+    const char *note = touch_take_note(t);
+    CHECK(note && strstr(note, "L3"));
+    CHECK(touch_take_note(t) == NULL);
+    CHECK(touch_settings(t)->edit[1][TC_L3].size == 1);
+    CHECK(steers_at(12, PHONE.height * 0.62f));
+    touch_configure(t, &s, &PHONE);   /* configured again (a setting changed): no second line */
+    field();
+    CHECK(touch_take_note(t) == NULL);
+    /* the editor: L3 grown at the steering area's middle stops before it covers it */
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    touch_open_editor(t);
+    field();
+    touch_control(t, TC_L3, &lx, &ly, NULL);
+    drag(TC_L3, 0.22f * PHONE.width - lx, PHONE.height * 0.62f - ly);
+    for (int i = 0; i < 40; i++) editor_tap(E_PLUS);
+    editor_tap(E_DONE);
+    field();
+    CHECK(size_of(1, TC_L3) > 1.0f);
+    float found = 0;
+    for (float y = 20; y < PHONE.height - 5 && !found; y += 4)
+        for (float x = 6; x < 0.44f * PHONE.width - 12 && !found; x += 4)
+            if (steers_at(x, y)) found = 1;
+    CHECK(found);
+    /* the D-pad's home dragged onto L3 stops short: the pad stays clear and presses */
+    start_dpad(1, 0, 0, 154.5f, 69.5f);
+    touch_open_editor(t);
+    field();
+    float sx, sy, l3x, l3y;
+    touch_control(t, TC_STICK, &sx, &sy, NULL);
+    touch_control(t, TC_L3, &l3x, &l3y, NULL);
+    drag(TC_STICK, l3x - sx, l3y - sy);   /* onto L3: refused, it stops short */
+    editor_tap(E_DONE);
+    field();
+    CHECK(dpad_works());
+}
+
+/* ---- finding 229: Button Style, the action pictures' ground and air ---- */
+
+/* How many shapes of a kind the overlay draws now (TS_ICON: of that picture, id < 0 any). */
+static int count_shapes(int kind, int id)
+{
+    static TouchShape shapes[TOUCH_SHAPES];
+    int n = touch_shapes(t, shapes, TOUCH_SHAPES), k = 0;
+    for (int i = 0; i < n; i++)
+        if (shapes[i].kind == kind && (kind != TS_ICON || id < 0 || (int)(shapes[i].c + 0.5f) == id)) k++;
+    return k;
+}
+
+static void set_style(int style)
+{
+    TouchSettings s = *touch_settings(t);
+    s.style = style;
+    touch_configure(t, &s, NULL);
+    field();
+}
+
+/* Symbols is the default (the look before finding 229, until players choose); Actions draws pictures
+   with badges, Symbols the symbols alone; the style changes no place, no size and no saved layout. */
+static void test_button_style(void)
+{
+    TouchSettings d;
+    touch_settings_default(&d);
+    CHECK(d.style == TOUCH_STYLE_SYMBOLS);
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    CHECK(count_shapes(TS_ICON, -1) == 0 && count_shapes(TS_CROSS, 0) == 1);   /* the default draws no picture */
+    for (int preset = 0; preset < 2; preset++) {
+        start(preset ? TOUCH_CLASSIC : TOUCH_THUMB_ZONES, TOUCH_ATTACK_BUTTONS);
+        TouchSettings s = *touch_settings(t);
+        s.style = TOUCH_STYLE_ACTIONS;
+        touch_layout_parse(&s, preset ? "classic.layout=2;classic.cross=1.0,-2.0,1.20" : "thumb.layout=2;thumb.hop=-3.0,1.0,0.90");
+        touch_configure(t, &s, NULL);
+        field();
+        float before[TC_COUNT][3];
+        for (int c = 0; c < TC_COUNT; c++) {
+            before[c][0] = before[c][1] = before[c][2] = -1;
+            touch_control(t, c, &before[c][0], &before[c][1], &before[c][2]);
+        }
+        char text_actions[1024], text_symbols[1024];
+        touch_layout_format(touch_settings(t), text_actions, sizeof text_actions);
+        /* Actions: the pedal, the fists, the brake (and a badge of each pad name) */
+        CHECK(count_shapes(TS_ICON, TI_PEDAL) == 1);
+        CHECK(count_shapes(TS_ICON, TI_FIST) == 2);
+        CHECK(count_shapes(TS_ICON, TI_BRAKE) == 1);
+        CHECK(count_shapes(TS_CROSS, 0) == 1 && count_shapes(TS_SQUARE, 0) == 1 && count_shapes(TS_CIRCLE, 0) == 1 &&
+              count_shapes(TS_TRIANGLE, 0) == 1);   /* the badges */
+        CHECK(count_shapes(TS_ICON, preset ? TI_SLIDE : TI_HOP) == 1);
+        if (preset) CHECK(count_shapes(TS_ICON, TI_HAND) == 1 && count_shapes(TS_ICON, TI_BOOT) == 1 && count_shapes(TS_ICON, TI_WRAP) == 1 &&
+                          count_shapes(TS_ICON, TI_SPRINT) == 1 && count_shapes(TS_ICON, TI_CAMERA) == 1);
+        set_style(TOUCH_STYLE_SYMBOLS);
+        CHECK(count_shapes(TS_ICON, -1) == 0);   /* the look before finding 229 */
+        CHECK(count_shapes(TS_CROSS, 0) == 1 && count_shapes(TS_SQUARE, 0) == 1 && count_shapes(TS_TRIANGLE, 0) == 1);
+        for (int c = 0; c < TC_COUNT; c++) {
+            float x = -1, y = -1, r = -1;
+            touch_control(t, c, &x, &y, &r);
+            CHECK(x == before[c][0] && y == before[c][1] && r == before[c][2]);
+        }
+        touch_layout_format(touch_settings(t), text_symbols, sizeof text_symbols);
+        CHECK(!strcmp(text_actions, text_symbols));
+        /* the editor shows the style that is on */
+        touch_open_editor(t);
+        field();
+        CHECK(count_shapes(TS_ICON, -1) == 0);
+        set_style(TOUCH_STYLE_ACTIONS);
+        CHECK(count_shapes(TS_ICON, TI_PEDAL) == 1);
+        /* Button Icons chosen as Xbox: the badges name A, B, X, Y (letters, no symbols); as before
+           with the PS2 names */
+        TouchSettings x = *touch_settings(t);
+        x.badges = TOUCH_BADGES_XBOX;
+        touch_configure(t, &x, NULL);
+        field();
+        CHECK(count_shapes(TS_CROSS, 0) == 0 && count_shapes(TS_TRIANGLE, 0) == 0);
+        CHECK(count_shapes(TS_ICON, TI_PEDAL) == 1);
+        x.badges = TOUCH_BADGES_PS2;
+        touch_configure(t, &x, NULL);
+        field();
+        CHECK(count_shapes(TS_CROSS, 0) == 1);
+    }
+    /* the smallest Size on the Mi 11i: the face buttons keep their pictures; L3, R3 and the bars,
+       too small for theirs, show their names */
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    TouchSettings small = *touch_settings(t);
+    small.style = TOUCH_STYLE_ACTIONS;
+    small.size = 70;
+    touch_configure(t, &small, NULL);
+    field();
+    CHECK(count_shapes(TS_ICON, TI_PEDAL) == 1 && count_shapes(TS_ICON, TI_FIST) == 2 && count_shapes(TS_ICON, TI_BRAKE) == 1);
+    CHECK(count_shapes(TS_ICON, TI_SLIDE) == 0 && count_shapes(TS_ICON, TI_SPRINT) == 0 && count_shapes(TS_ICON, TI_HAND) == 0);
+    small.size = 0;   /* auto: every picture */
+    touch_configure(t, &small, NULL);
+    field();
+    CHECK(count_shapes(TS_ICON, TI_SLIDE) == 1 && count_shapes(TS_ICON, TI_SPRINT) == 1 && count_shapes(TS_ICON, TI_HAND) == 1);
+}
+
+/* The ground and air pictures: Classic's △ (brake, superstyle) and R2 (the hop, a trick's link).
+   The air ones come after the air wait, the ground ones after TOUCH_GROUND_MS on the ground: a bump
+   shorter than either changes nothing. A control under a finger keeps its picture until it is let
+   go. The editor always shows the ground. */
+static void test_air_pictures(void)
+{
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    set_style(TOUCH_STYLE_ACTIONS);
+    CHECK(!touch_air_picture(t, TC_TRIANGLE) && count_shapes(TS_ICON, TI_BRAKE) == 1 && count_shapes(TS_ICON, TI_HOP) == 1);
+    game.air = 1;
+    wait_ms(100);
+    CHECK(!touch_air_picture(t, TC_TRIANGLE));   /* not yet: the air wait is 150 ms */
+    wait_ms(70);
+    CHECK(touch_air_picture(t, TC_TRIANGLE) && touch_air_picture(t, TC_RBAR));
+    CHECK(count_shapes(TS_ICON, TI_STAR) == 1 && count_shapes(TS_ICON, TI_LINK) == 1 && count_shapes(TS_ICON, TI_BRAKE) == 0);
+    /* a touch of the ground for 50 ms (a bump, a rail's edge): still the air */
+    game.air = 0;
+    wait_ms(50);
+    CHECK(touch_air_picture(t, TC_TRIANGLE));
+    game.air = 1;
+    wait_ms(50);
+    CHECK(touch_air_picture(t, TC_TRIANGLE));
+    /* landed: the ground after TOUCH_GROUND_MS */
+    game.air = 0;
+    wait_ms(TOUCH_GROUND_MS - 30);
+    CHECK(touch_air_picture(t, TC_TRIANGLE));
+    wait_ms(50);
+    CHECK(!touch_air_picture(t, TC_TRIANGLE) && count_shapes(TS_ICON, TI_BRAKE) == 1);
+    /* a hop under 150 ms in the air: no change */
+    game.air = 1;
+    wait_ms(100);
+    game.air = 0;
+    wait_ms(200);
+    CHECK(!touch_air_picture(t, TC_TRIANGLE));
+    /* a finger on △ through a take-off: △ keeps the brake while held, the rest switch; let go, it switches */
+    float x, y;
+    at(TC_TRIANGLE, &x, &y);
+    touch_down(t, 5, x, y, now);
+    field();
+    game.air = 1;
+    wait_ms(300);
+    CHECK(!touch_air_picture(t, TC_TRIANGLE) && touch_air_picture(t, TC_RBAR));
+    CHECK(count_shapes(TS_ICON, TI_BRAKE) == 1 && count_shapes(TS_ICON, TI_LINK) == 1);
+    touch_up(t, 5, x, y, now);
+    field();
+    CHECK(touch_air_picture(t, TC_TRIANGLE) && count_shapes(TS_ICON, TI_STAR) == 1);
+    /* and back: held through the landing, it keeps the star until let go */
+    touch_down(t, 6, x, y, now);
+    field();
+    game.air = 0;
+    wait_ms(300);
+    CHECK(touch_air_picture(t, TC_TRIANGLE) && !touch_air_picture(t, TC_RBAR));
+    touch_up(t, 6, x, y, now);
+    field();
+    CHECK(!touch_air_picture(t, TC_TRIANGLE));
+    /* the editor over a race in the air: the ground pictures */
+    game.air = 1;
+    wait_ms(300);
+    touch_open_editor(t);
+    field();
+    CHECK(!touch_air_picture(t, TC_TRIANGLE) && count_shapes(TS_ICON, TI_BRAKE) == 1 && count_shapes(TS_ICON, TI_STAR) == 0);
+    /* the race gone (a menu): the ground */
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    game.air = 1;
+    wait_ms(300);
+    CHECK(touch_air_picture(t, TC_TRIANGLE));
+    game.race_hud = 0;
+    wait_ms(400);
+    CHECK(!touch_air_picture(t, TC_TRIANGLE));
+}
+
+/* ---- finding 229, the review of lanes 229 and 227 (round 2) ---- */
+
+/* How many characters ch the overlay draws now. */
+static int count_char(char ch)
+{
+    static TouchShape shapes[TOUCH_SHAPES];
+    int n = touch_shapes(t, shapes, TOUCH_SHAPES), k = 0;
+    for (int i = 0; i < n; i++)
+        if (shapes[i].kind == TS_CHAR && (int)(shapes[i].c + 0.5f) == (unsigned char)ch) k++;
+    return k;
+}
+
+/* Thumb zones on the Mi 11i with HOP grown to 600 % over the steering side (a layout made for a
+   tablet, or edited by hand), PEDAL moved 2 mm up (harmless), hints not yet shown. */
+static void thumb_needing_rescue(TouchSettings *s, char *loaded, int size)
+{
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    float hx, hy;
+    touch_control(t, TC_HOP, &hx, &hy, NULL);
+    *s = *touch_settings(t);
+    s->hints_shown = 0;
+    s->edit[0][TC_HOP] = (TouchEdit){52.0f - hx, PHONE.height / 2 - hy, 6.0f};
+    s->edit[0][TC_PEDAL] = (TouchEdit){0, -2.0f, 1.0f};
+    touch_layout_format(s, loaded, size);
+    TouchSettings parsed;
+    touch_settings_default(&parsed);
+    parsed.preset = TOUCH_THUMB_ZONES;
+    parsed.vibration = 0;
+    parsed.hints_shown = 0;
+    touch_layout_parse(&parsed, loaded);   /* as the host loads it from dhd.ini */
+    *s = parsed;
+    touch_configure(t, s, &PHONE);
+}
+
+/* Review defect 3: a hint shown during a race saves the hints and never the rescued layout; the
+   layout reaches dhd.ini only from the layout editor (then the rescued one, on purpose). The rescue
+   resets the fewest controls (HOP, not the harmless PEDAL before it in the controls' order). */
+static void test_rescue_not_saved_by_hints(void)
+{
+    char loaded[1024], out_text[1024];
+    TouchSettings s;
+    thumb_needing_rescue(&s, loaded, sizeof loaded);
+    const char *note = touch_take_note(t);
+    CHECK(note && strstr(note, "HOP") && !strstr(note, "PEDAL"));   /* the culprit alone */
+    CHECK(touch_settings(t)->edit[0][TC_HOP].size == 1);              /* reset for the run */
+    CHECK(touch_settings(t)->edit[0][TC_PEDAL].dy == -2.0f);           /* kept: it was not in the way */
+    CHECK(steers_at(12, PHONE.height * 0.5f));
+    /* the race's first hint (PEDAL) shows: the hints are saved, the layout as loaded */
+    game.race_ms = 500;
+    field();
+    TouchSettings saved;
+    int what = touch_take_saved(t, &saved);
+    CHECK(what == TOUCH_SAVED_HINTS);
+    CHECK(saved.hints_shown & TOUCH_HINT_PEDAL);
+    touch_layout_format(&saved, out_text, sizeof out_text);
+    if (strcmp(out_text, loaded)) fprintf(stderr, "test_touch: saved \"%s\", loaded \"%s\"\n", out_text, loaded);
+    CHECK(!strcmp(out_text, loaded));   /* byte-identical to what was loaded */
+    /* a setting changed on the TOUCH CONTROLS page (the host configures again from dhd.ini's
+       string): rescued again for the run, and the next hint still saves the loaded layout */
+    TouchSettings again = s;
+    again.style = TOUCH_STYLE_ACTIONS;
+    touch_configure(t, &again, &PHONE);
+    CHECK(touch_settings(t)->edit[0][TC_HOP].size == 1);
+    game.race_ms = 18000;   /* the next hint (HOP or the attack's), once the first has gone */
+    what = 0;
+    for (int i = 0; i < 600 && !what; i++) { field(); what = touch_take_saved(t, &saved); }
+    CHECK(what == TOUCH_SAVED_HINTS);
+    touch_layout_format(&saved, out_text, sizeof out_text);
+    CHECK(!strcmp(out_text, loaded));
+    /* the layout editor's Done saves the layout shown: the rescued one, on purpose */
+    touch_open_editor(t);
+    field();
+    editor_tap(E_DONE);
+    field();
+    what = touch_take_saved(t, &saved);
+    CHECK(what & TOUCH_SAVED_LAYOUT);
+    CHECK(saved.edit[0][TC_HOP].size == 1 && saved.edit[0][TC_PEDAL].dy == -2.0f);
+    touch_layout_format(&saved, out_text, sizeof out_text);
+    CHECK(strcmp(out_text, loaded) != 0);
+    /* Back in the editor saves too */
+    thumb_needing_rescue(&s, loaded, sizeof loaded);
+    touch_open_editor(t);
+    field();
+    touch_back(t, now);
+    field();
+    what = touch_take_saved(t, &saved);
+    CHECK(what & TOUCH_SAVED_LAYOUT);
+}
+
+/* Review gap: Thumb zones has no L bar; a right-hand button dragged into the steering side, and a
+   0.8.0 layout's camera moved to the bottom (its area started under the camera), leave steering. */
+static void test_thumb_moved_buttons_steer(void)
+{
+    for (int left = 0; left < 2; left++) {
+        start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+        TouchSettings s = *touch_settings(t);
+        s.left_handed = left;
+        touch_configure(t, &s, &PHONE);
+        field();
+        touch_open_editor(t);
+        field();
+        float hx, hy;
+        touch_control(t, TC_BRAKE, &hx, &hy, NULL);   /* BRAKE, the cluster's inner button: across, then down */
+        drag(TC_BRAKE, left ? PHONE.width - 45 - hx : 45 - hx, 0);
+        touch_control(t, TC_BRAKE, &hx, &hy, NULL);
+        drag(TC_BRAKE, 0, PHONE.height - 12 - hy);
+        editor_tap(E_DONE);
+        field();
+        touch_control(t, TC_BRAKE, &hx, &hy, NULL);
+        CHECK(left ? hx > PHONE.width / 2 : hx < PHONE.width / 2);   /* it went there */
+        CHECK(steers_at(left ? PHONE.width - 20 : 12, 20));           /* the rest of the area steers */
+    }
+    /* a 0.8.0 layout (no layout=2): the camera dragged to the bottom left */
+    start(TOUCH_THUMB_ZONES, TOUCH_ATTACK_FLICK);
+    float cx, cy, chw, chh;
+    touch_control(t, TC_CAMERA, &cx, &cy, NULL);
+    TouchSettings s = *touch_settings(t);
+    char text[128];
+    snprintf(text, sizeof text, "thumb.camera=%.1f,%.1f,1.00", 40.0f - cx, PHONE.height - 6 - cy);
+    touch_layout_parse(&s, text);
+    CHECK(s.legacy[0]);
+    touch_configure(t, &s, &PHONE);
+    field();
+    touch_control(t, TC_CAMERA, &cx, &cy, NULL);
+    touch_control_size(t, TC_CAMERA, &chw, &chh);
+    CHECK(cy + chh > PHONE.height - 8);
+    CHECK(touch_take_note(t) == NULL);   /* nothing to rescue: the area is the default one */
+    CHECK(steers_at(12, 20));
+}
+
+/* Review gap: the D-pad's arms on a screen with no room under the bar: the room's floor is
+   DPAD_HALF_MIN_MM (2 mm) before the fit to the HUD and L3 (at least 0.6) and the editor's size
+   multiply it, so at the default size the arms' half is at least 1.2 mm (an editor size of 25 %
+   can make it smaller, as it makes every control smaller). */
+static void test_dpad_room_floor(void)
+{
+    start_dpad(1, 0, 0, 154.5f, 30.0f);
+    float cx, cy, extent;
+    touch_control(t, TC_STICK, &cx, &cy, &extent);
+    float half = (extent - 3.0f) / 3.0f;   /* the extent is 3 half sizes and a 3 mm gap */
+    if (half < 1.2f - 0.01f) fprintf(stderr, "test_touch: the D-pad's half %.2f mm\n", half);
+    CHECK(half >= 1.2f - 0.01f);
+    CHECK(dpad_works());
+}
+
+/* Review gap: the badges' letters themselves, Xbox and Nintendo by place. */
+static void test_badge_letters(void)
+{
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    TouchSettings s = *touch_settings(t);
+    s.style = TOUCH_STYLE_ACTIONS;
+    s.badges = TOUCH_BADGES_XBOX;
+    touch_configure(t, &s, NULL);
+    field();
+    /* ✕ A, ○ B, ◻ X, △ Y; the bars' L2 L1 R1 R2 as LT LB RB RT; L3 R3 as LS RS */
+    /* (SELECT and START keep their words: their S, E, L, C, T, A, R count too) */
+    CHECK(count_char('A') == 2 && count_char('Y') == 1 && count_char('X') == 1);   /* A, START's A */
+    CHECK(count_char('B') == 3);   /* B, LB, RB */
+    CHECK(count_char('T') == 5);   /* LT, RT, SELECT's T, START's two */
+    CHECK(count_char('S') == 4);   /* LS, RS, SELECT's S, START's S */
+    CHECK(count_shapes(TS_CROSS, 0) == 0 && count_shapes(TS_CIRCLE, 0) == 0 && count_shapes(TS_SQUARE, 0) == 0 &&
+          count_shapes(TS_TRIANGLE, 0) == 0);
+    s.badges = TOUCH_BADGES_NINTENDO;
+    touch_configure(t, &s, NULL);
+    field();
+    /* ✕ B, ○ A, ◻ Y, △ X; the bars ZL L R ZR; L3 R3 LS RS */
+    CHECK(count_char('Z') == 2 && count_char('T') == 3);   /* ZL, ZR; no LT or RT */
+    CHECK(count_char('Y') == 1 && count_char('X') == 1 && count_char('A') == 2);   /* A, START's A */
+    CHECK(count_char('B') == 1);
+    s.badges = TOUCH_BADGES_PS2;
+    touch_configure(t, &s, NULL);
+    field();
+    CHECK(count_char('Z') == 0 && count_shapes(TS_CROSS, 0) == 1 && count_shapes(TS_TRIANGLE, 0) == 1);
+}
+
+/* Review risk R3: the picture-or-name band. L3 on the Mi 11i (its picture's half is 0.58 of its
+   radius, 2.49 mm at 100 %): below 2.0 mm the name, back to the picture only above 2.2 mm; a size
+   that wobbles inside the band keeps what it had. */
+static void test_picture_band(void)
+{
+    start(TOUCH_CLASSIC, TOUCH_ATTACK_FLICK);
+    TouchSettings s = *touch_settings(t);
+    s.style = TOUCH_STYLE_ACTIONS;
+    touch_configure(t, &s, NULL);
+    field();
+    float r;
+    touch_control(t, TC_L3, NULL, NULL, &r);
+    float half100 = r * 0.58f;
+    static const struct { float g; int picture; } steps[] = {
+        {2.15f, 1}, {2.05f, 1}, {1.95f, 0}, {2.05f, 0}, {2.15f, 0}, {1.98f, 0}, {2.25f, 1}, {2.05f, 1}, {2.12f, 1}};
+    for (unsigned i = 0; i < sizeof steps / sizeof *steps; i++) {
+        s.edit[1][TC_L3].size = steps[i].g / half100;
+        touch_configure(t, &s, NULL);
+        field();
+        int shown = count_shapes(TS_ICON, TI_SLIDE) == 1;
+        if (shown != steps[i].picture) fprintf(stderr, "test_touch: L3 at %.2f mm: picture %d\n", steps[i].g, shown);
+        CHECK(shown == steps[i].picture);
+    }
+}
+
 int main(void)
 {
+    test_dpad_layout();
+    test_dpad_press();
+    test_dpad_rules();
+    test_dpad_shapes();
+    test_dpad_double_tap();
     test_scaling();
     test_flick();
     test_quick_tap();
@@ -1079,6 +2871,11 @@ int main(void)
     test_pause();
     test_pause_controller();
     test_restart_clock();
+    test_race_running();
+    test_flyover();
+    test_movie_skip();
+    test_replay_attract();
+    test_replay_high_rate();
     test_editor_bar();
     test_trick_hint();
     test_classic_resume();
@@ -1088,6 +2885,23 @@ int main(void)
     test_fixed_stick();
     test_queue();
     test_tilt();
+    test_codes();
+    test_size_range();
+    test_screen_bounds();
+    test_tablet();
+    test_phone_defaults();
+    test_old_edits();
+    test_undo_redo();
+    test_editor_alone();
+    test_moved_bar_steers();
+    test_saved_layout_steers();
+    test_button_style();
+    test_air_pictures();
+    test_rescue_not_saved_by_hints();
+    test_thumb_moved_buttons_steer();
+    test_dpad_room_floor();
+    test_badge_letters();
+    test_picture_band();
     touch_free(t);
     if (failures) { fprintf(stderr, "test_touch: %d failed\n", failures); return 1; }
     printf("test_touch: all passed\n");

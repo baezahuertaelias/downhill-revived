@@ -26,11 +26,46 @@ extern uintptr_t guest_base;
 #define GUEST_BASE ((uintptr_t)0)
 #endif
 
-/* Host pointer of a 32-bit guest address. */
+/* Host pointer of a 32-bit guest address. The layout's one switch, HOST64_TWO_PARTS
+   (memory_layout.h), decides it here as in guest memory and the access checks (finding 262); the
+   module's own units (built for wasm, where the guest's memory is the module's) have no layout. */
+#if defined(__wasm__)
+#define GUEST_TWO_PARTS 0
+#else
+#include "../host64/memory_layout.h"
+#define GUEST_TWO_PARTS HOST64_TWO_PARTS
+#endif
+#if GUEST_TWO_PARTS
+/* iOS (finding 258): the guest's memory is two parts with other mappings of the process between
+   and above them; an address there ends the process as the guest's own fault does
+   (guest_memory_posix.c), never reaching what lies there. */
+extern uint64_t host64_guest_end;
+/* The high part [0x70000000, end) has a host address of its own (finding 267): guest address a
+   there is at host64_high_base + a. */
+extern uint8_t *host64_high_base;
+void host64_memory_wild(uint64_t address) __attribute__((noreturn, cold));
+static inline void *guest_pointer(uint32_t addr)
+{
+    if (__builtin_expect(addr - 0x3a000000u < 0x36000000u || addr >= host64_guest_end, 0))
+        host64_memory_wild(addr);
+    return (void *)((addr >= 0x70000000u ? (uintptr_t)host64_high_base : GUEST_BASE) + (uintptr_t)addr);
+}
+#define GUEST(addr) guest_pointer((uint32_t)(addr))
+/* The guest address of a host pointer into either part (its inverse). */
+static inline uint32_t guest_address(uintptr_t p)
+{
+    uintptr_t high = (uintptr_t)host64_high_base;
+    return (uint32_t)(p - (p - (high + 0x70000000u) < host64_guest_end - 0x70000000u ? high : GUEST_BASE));
+}
+#define GADDR(ptr) guest_address((uintptr_t)(ptr))
+#else
 #define GUEST(addr) ((void *)(GUEST_BASE + (uintptr_t)(uint32_t)(addr)))
+#endif
 
 /* Guest address of a host pointer (or of a host address held in an integer). The result is
    32 bits: on a 64-bit host it is only meaningful for pointers that point into guest memory. */
+#if !GUEST_TWO_PARTS
 #define GADDR(ptr) ((uint32_t)((uintptr_t)(ptr) - GUEST_BASE))
+#endif
 
 #endif

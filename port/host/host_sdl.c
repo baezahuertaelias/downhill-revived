@@ -11,6 +11,7 @@
    fp_mode.c, the generated imports_gen.c, port/hle/host.c). The module sees only host_api.h. */
 #include "host_api.h"
 #include "host_os.h"
+#include "host_end.h"
 #include "../hle/hle.h"
 #include "../include/guest.h"
 #include "../net/net.h"
@@ -22,17 +23,30 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __SWITCH__
+#include <unistd.h>
+#endif
 
 /* ---- environment, errors and the program ---- */
 const char *host_getenv(const char *name) { return getenv(name); }
 
 typedef struct { const char *title, *message; } ErrorBox;
 
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
 static void show_error_box(void *box)
 {
     const ErrorBox *b = box;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* SDL has no message box on iOS: the app's alert, waited for (port/ios/app/main.m) */
+    void ios_error_box(const char *title, const char *message) __attribute__((weak));
+    if (ios_error_box) ios_error_box(b->title, b->message);
+#else
     if (!SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, b->title, b->message, NULL))
         fprintf(stderr, "(no error box: %s)\n", SDL_GetError());
+#endif
 }
 
 /* The log carries it too; tool runs (DHD_HEADLESS) never wait on a box. The box is shown on the
@@ -67,11 +81,21 @@ typedef struct {
 static void display_read(void *out)
 {
     DisplayFacts *d = out;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    void ios_metal_get_drawable_size(int *out_w, int *out_h) __attribute__((weak));
+    bool ios_metal_has_promotion_support(void) __attribute__((weak));
+    int w = 0, h = 0;
+    if (ios_metal_get_drawable_size) ios_metal_get_drawable_size(&w, &h);
+    d->hz = (ios_metal_has_promotion_support && ios_metal_has_promotion_support()) ? 120 : 60;
+    if (w > 0 && h > 0) d->aspect = (double)w / (double)h;
+    else d->aspect = 16.0 / 9.0;
+#else
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO)) return;
     const SDL_DisplayMode *m = SDL_GetDesktopDisplayMode(SDL_GetPrimaryDisplay());
     if (!m) return;
     d->hz = (int)m->refresh_rate;  /* the whole hertz below, as the mode's own number was (143 at 143.86) */
     if (m->w > 0 && m->h > 0) d->aspect = (double)m->w / m->h;
+#endif
 }
 
 static DisplayFacts display_facts(void)
@@ -81,12 +105,24 @@ static DisplayFacts display_facts(void)
     return d;
 }
 
-int host_display_hz(void) { return display_facts().hz; }
+int host_display_hz(void)
+{
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    int ios_metal_effective_fps(void);
+    return ios_metal_effective_fps();
+#else
+    return display_facts().hz;
+#endif
+}
 
 /* DHD_MONITOR_ASPECT where the starter knows better (Android's activity: the long side over the
    short), else the primary display's shape; 16 / 9 when unknown. */
 double host_monitor_aspect(void)
 {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    double ios_metal_game_aspect(void);
+    return ios_metal_game_aspect();
+#endif
     const char *named = getenv("DHD_MONITOR_ASPECT");
     if (named && atof(named) >= 1.0 && atof(named) < 4.0) return atof(named);
     double aspect = display_facts().aspect;
@@ -221,6 +257,9 @@ void host_file_close(HostFile h)
 {
     FILE *f = file_of(h);
     if (f) {
+#ifdef __SWITCH__
+        if (f != DISCARD && !fflush(f)) fsync(fileno(f));  /* fsdev's close alone promises the card nothing */
+#endif
         if (f != DISCARD) fclose(f);
         SDL_LockSpinlock(&slot_lock);
         file_slot[h] = NULL;
@@ -252,6 +291,11 @@ size_t host_file_write(HostFile h, const void *src, size_t size)
 int host_file_flush(HostFile h)
 {
     FILE *f = file_of(h);
+#ifdef __SWITCH__
+    /* The memory card's writes (mc.c): on the SD card when the game's save says done, as a sleep or
+       a battery running out may be the next thing to happen. */
+    if (f && f != DISCARD) return fflush(f) ? -1 : fsync(fileno(f));
+#endif
     return !f ? -1 : f == DISCARD ? 0 : fflush(f);
 }
 
@@ -407,10 +451,18 @@ static char disc_iso[1024], disc_cache[1024], disc_note[256];
 static uint8_t disc_digest[32];
 static int disc_answer;
 
+/* Set at the end (host_end.h): a hash still running stops at its next piece, writing nothing (finding 208). */
+static int disc_stop;
+static void disc_stop_at_exit(void) { __atomic_store_n(&disc_stop, 1, __ATOMIC_RELAXED); }
+
+/* The check runs while the game plays (finding 208): at low priority, resting 1 ms after each
+   1 MiB piece it reads, so a first start's hash of the whole image (once; later iso-check.txt
+   answers) leaves the game's threads and its own disc reads first. */
 static void disc_run(void *unused)
 {
     (void)unused;
-    disc_answer = dhd_disc_check(disc_iso, disc_cache, disc_digest, disc_note, sizeof disc_note);
+    SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_LOW);
+    disc_answer = dhd_disc_check(disc_iso, disc_cache, disc_digest, disc_note, sizeof disc_note, &disc_stop, 1000);
     SDL_SetAtomicInt(&disc_job, JOB_DONE);
 }
 
@@ -422,6 +474,8 @@ int host_service_disc_check_start(uint32_t iso, uint32_t cache)
     if (!SDL_CompareAndSwapAtomicInt(&disc_job, JOB_IDLE, JOB_WORKING)) return 0;
     snprintf(disc_iso, sizeof disc_iso, "%s", at);
     snprintf(disc_cache, sizeof disc_cache, "%s", cache_at);
+    static int stop_registered;
+    if (!stop_registered++) host_end_add(HOST_END_WORKERS, "disc check", disc_stop_at_exit);
     if (!host_thread_detach(disc_run, NULL)) {
         SDL_SetAtomicInt(&disc_job, JOB_IDLE);
         return 0;

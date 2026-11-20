@@ -2,8 +2,11 @@
 //! like the performance counter. C (port/hle/touch.c) lays the controls out in mm and hands over
 //! a list of shapes each picture (`dhdr_surface_touch`); here each is one instanced quad whose
 //! fragment shader draws it as a signed distance (discs with a two-tone rim, rings, rounded
-//! boxes, the trick stick's sectors, the PS2 symbols, chevrons, stripes) or as a character of the
-//! 8x8 font (`font8x8.rs`). Nothing here reads the game or the environment.
+//! boxes, the trick stick's sectors, the PS2 symbols, chevrons, stripes, the action pictures of
+//! Button Style Actions) or as a character of the 8x8 font (`font8x8.rs`). The action pictures
+//! (finding 229) are signed distances too, generated from `touch_icons.txt` into
+//! `touch_icons.wgsl` by `port/tools/touch_icons.py`: no texture, sharp at any size. Nothing here
+//! reads the game or the environment.
 
 use crate::device::Gpu;
 use super::font8x8;
@@ -18,10 +21,17 @@ pub struct TouchOverlay {
     width_mm: f32,
     height_mm: f32,
     objects: Option<Objects>,
+    /// The device refused the overlay's shader or pipeline (once; finding 229): no overlay is drawn
+    /// from then on, the game goes on and its touch areas still work.
+    refused: bool,
     /// The shapes and the screen uniform last written to the GPU (written again only on a change).
     written: (Vec<f32>, [f32; 4]),
     /// Drawn in this picture's present pass already (`draw_in_pass`); `draw` then skips it once.
     drawn: bool,
+    /// The objects being made on a thread of their own (finding 256): started at the first
+    /// picture of a touch screen, taken when the controls are first shown.
+    #[cfg(not(target_arch = "wasm32"))]
+    building: Option<std::sync::mpsc::Receiver<Result<Objects, String>>>,
 }
 
 struct Objects {
@@ -44,9 +54,48 @@ impl TouchOverlay {
 
     /// The shapes' instances and the screen uniform on the GPU for a w x h frame (each written
     /// only when it changed); the number of shapes to draw, or None when there are none.
-    fn prepare(&mut self, gpu: &Gpu, format: wgpu::TextureFormat, w: u32, h: u32) -> Option<u32> {
-        if self.items.is_empty() || w == 0 || h == 0 || self.width_mm <= 0.0 || self.height_mm <= 0.0 { return None; }
-        let o = self.objects.get_or_insert_with(|| Objects::new(gpu, format));
+    fn prepare(&mut self, gpu: &'static Gpu, format: wgpu::TextureFormat, w: u32, h: u32) -> Option<u32> {
+        if w == 0 || h == 0 || self.width_mm <= 0.0 || self.height_mm <= 0.0 { return None; }
+        if self.refused { return None; }
+        if self.objects.is_none() {
+            // inside Validation and Internal error scopes, as the native pipelines (in the browser
+            // errors come through promises: there the scopes are a no-op)
+            let make = move || crate::native::init::scoped_pipeline(gpu, "touch overlay", || Objects::new(gpu, format));
+            // Its shader and pipeline take the driver 0.4 s on a weak phone. They are made on a
+            // thread of their own from the first picture of a touch screen on (the menus show no
+            // controls), so the first picture with the controls no longer waits for them
+            // (finding 256); it still waits when they are shown before the thread is done.
+            #[cfg(not(target_arch = "wasm32"))]
+            let made = {
+                if self.building.is_none() {
+                    let (out, made) = std::sync::mpsc::channel();
+                    let spawned = std::thread::Builder::new().name("dhd-touch".into()).spawn(move || { let _ = out.send(make()); });
+                    if spawned.is_ok() { self.building = Some(made); }
+                }
+                match self.building.as_ref() {
+                    Some(made) if self.items.is_empty() => match made.try_recv() {
+                        Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+                        r => r.unwrap_or_else(|_| Err("its thread ended".into())),
+                    },
+                    Some(made) => made.recv().unwrap_or_else(|_| Err("its thread ended".into())),
+                    None => make(),  // no thread: here, as before
+                }
+            };
+            #[cfg(target_arch = "wasm32")]
+            let made = { if self.items.is_empty() { return None; } make() };
+            #[cfg(not(target_arch = "wasm32"))]
+            { self.building = None; }
+            match made {
+                Ok(o) => self.objects = Some(o),
+                Err(e) => {
+                    crate::host::log(&format!("touch overlay: not drawn, the device refused it ({e}); the touch areas still work"));
+                    self.refused = true;
+                    return None;
+                }
+            }
+        }
+        if self.items.is_empty() { return None; }
+        let o = self.objects.as_mut()?;
         let count = (self.items.len() / ITEM_FLOATS) as u64;
         if count * ITEM_BYTES > o.capacity {
             o.capacity = (count * ITEM_BYTES).next_power_of_two();
@@ -80,7 +129,7 @@ impl TouchOverlay {
     /// renderer's present pass, finding 146): the same pixels as `draw`'s pass of its own after
     /// it, without a second command buffer, submission and load and store of the whole frame.
     /// The next `draw` (dhdr_surface_present's) skips it.
-    pub fn draw_in_pass(&mut self, gpu: &Gpu, pass: &mut wgpu::RenderPass<'_>, format: wgpu::TextureFormat, w: u32, h: u32) {
+    pub fn draw_in_pass(&mut self, gpu: &'static Gpu, pass: &mut wgpu::RenderPass<'_>, format: wgpu::TextureFormat, w: u32, h: u32) {
         if let Some(count) = self.prepare(gpu, format, w, h) {
             pass.set_scissor_rect(0, 0, w, h);
             self.record(pass, count);
@@ -88,7 +137,7 @@ impl TouchOverlay {
         }
     }
 
-    pub fn draw(&mut self, gpu: &Gpu, target: &wgpu::TextureView, format: wgpu::TextureFormat, w: u32, h: u32) {
+    pub fn draw(&mut self, gpu: &'static Gpu, target: &wgpu::TextureView, format: wgpu::TextureFormat, w: u32, h: u32) {
         if std::mem::take(&mut self.drawn) { return; }
         let Some(count) = self.prepare(gpu, format, w, h) else { return };
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("touch overlay") });
@@ -101,12 +150,14 @@ impl TouchOverlay {
             });
             self.record(&mut pass, count);
         }
-        gpu.queue.submit([encoder.finish()]);
+        let command = encoder.finish();
+        crate::startup::submit(&gpu.queue, [command]);
     }
 }
 
 impl Objects {
     fn new(gpu: &Gpu, format: wgpu::TextureFormat) -> Self {
+        let _startup = crate::startup::step("touch overlay shader and pipeline");
         let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("touch overlay"),
             source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
         let attributes = wgpu::vertex_attr_array![0 => Float32x4, 1 => Float32x4, 2 => Float32x4, 3 => Float32x4];
@@ -150,7 +201,7 @@ impl Objects {
 
 // Kinds as port/hle/touch.h numbers them (TS_*). Shapes are in mm; `screen` is the surface's
 // size in pixels and its pixels per mm.
-pub(crate) const SHADER: &str = r#"
+pub(crate) const SHADER: &str = concat!(r#"
 struct Screen { size: vec2f, per_mm: vec2f }
 @group(0) @binding(0) var<uniform> screen: Screen;
 @group(0) @binding(1) var font: texture_2d<f32>;
@@ -170,6 +221,7 @@ const PI: f32 = 3.14159265;
 fn extent(kind: f32, a: f32, b: f32) -> vec2f {
     let k = i32(kind);
     if (k == 2 || k == 10) { return vec2f(a, b); }           // rect, stripes: half sizes
+    if (k == 11) { return vec2f(a, a); }                       // an action picture: a its half size
     if (k == 9) { return vec2f(a * 0.5, a * 0.5); }           // a character: a high
     if (k == 3) { return vec2f(b, b); }                        // sector: outer radius
     if (k == 1) { return vec2f(a + b, a + b); }                // ring
@@ -212,6 +264,32 @@ fn triangle(p0: vec2f, r: f32) -> f32 {
     if (p.x + k * p.y > 0.) { p = vec2f(p.x - k * p.y, -k * p.x - p.y) / 2.; }
     p.x = p.x - clamp(p.x, -2. * r, 0.);
     return -length(p) * sign(p.y);
+}
+
+// The action pictures' pieces (touch_icons.wgsl): a segment's distance, a rounded box's, an arc's
+// (angles in radians, 0 right, anticlockwise as seen) and one edge of a polygon (Inigo Quilez's
+// sdPolygon, MIT; https://iquilezles.org/articles/distfunctions2d/), y down.
+fn ic_seg(p: vec2f, a: vec2f, b: vec2f) -> f32 { return segment(p, a, b); }
+fn ic_box(p: vec2f, half: vec2f, r: f32) -> f32 { return box(p, half, r); }
+fn ic_arc(p: vec2f, c: vec2f, r: f32, a0: f32, a1: f32) -> f32 {
+    let q = p - c;
+    let mid = (a0 + a1) * 0.5;
+    let half = (a1 - a0) * 0.5;
+    let ang = atan2(-q.y, q.x);
+    let off = abs(atan2(sin(ang - mid), cos(ang - mid)));
+    let e0 = length(q - vec2f(r * cos(a0), -r * sin(a0)));
+    let e1 = length(q - vec2f(r * cos(a1), -r * sin(a1)));
+    return select(min(e0, e1), abs(length(q) - r), off <= half);
+}
+fn ic_edge(p: vec2f, v: vec2f, w: vec2f, e: ptr<function, f32>, s: ptr<function, f32>) {
+    let ed = w - v;
+    let pv = p - v;
+    let b = pv - ed * clamp(dot(pv, ed) / dot(ed, ed), 0., 1.);
+    *e = min(*e, dot(b, b));
+    let c1 = p.y >= v.y;
+    let c2 = p.y < w.y;
+    let c3 = ed.x * pv.y > ed.y * pv.x;
+    if ((c1 && c2 && c3) || (!c1 && !c2 && !c3)) { *s = -*s; }
 }
 
 fn over(base: vec4f, top: vec4f, cover: f32) -> vec4f {   // top over base, straight alpha
@@ -290,8 +368,14 @@ fn over(base: vec4f, top: vec4f, cover: f32) -> vec4f {   // top over base, stra
         let inside = clamp(0.5 - box(p, vec2f(a, b), 0.) / aa, 0., 1.);
         let stripe = step(0.5, fract((p.x + p.y) / 2.4));
         out = over(out, v.fill, inside * stripe);
+    } else if (k == 11) {    // an action picture: a its half size, b < 0 mirrored, c which
+        let q = vec2f(p.x * select(1.0, -1.0, b < 0.), p.y) / a;
+        let dist = icon_dist(i32(c + 0.5), q) * a;
+        let edge = max(a * 0.09, aa * 1.2);   // a dark edge keeps it readable over bright snow
+        out = over(out, vec4f(0., 0., 0., 0.6 * v.line.a), clamp(0.5 - (dist - edge) / aa, 0., 1.));
+        out = over(out, v.line, clamp(0.5 - dist / aa, 0., 1.));
     }
     if (out.a <= 0.002) { discard; }
     return out;
 }
-"#;
+"#, include_str!("touch_icons.wgsl"));

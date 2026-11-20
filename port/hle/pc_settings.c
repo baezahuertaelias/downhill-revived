@@ -7,7 +7,9 @@
      or △ BACK presses it (menu_page.c).
    Every change is saved to dhd.ini at once (host_setting_save keeps the other lines). Display,
    window size, picture shape, scaling, skip movies (the startup movies), vibration, the sticks'
-   dead zone, the button symbols, unlock all and FPS & Ping apply at once; resolution,
+   dead zone, the button symbols, unlock all, FPS & Ping, the Performance group (Graphics:
+   Performance Mode, a preset for the three effects after it, finding 183) and Native VU
+   (above that group; findings 194, 198) apply at once; resolution,
    widescreen, the texture pack, the font, the frame rate and V-Sync at the next start ("*" and
    the row's hint, a line above the legend, say so). A setting the environment sets (DHD_*) is
    shown but can't be changed here.
@@ -19,9 +21,11 @@
    variable at once and the host follows it), and DHD_PC_SETTINGS_RESTART replaces the hint of
    a row that waits for the next start. The browser sets all three (port/web/www/settings.js);
    x64 sets none of them, so its page is as described above.
-   With touch (the host sets DHD_TOUCH: android, or mouse for a desktop test) the page ends with a
-   Touch Controls row whose three screens are touch_settings.c's (finding 141); on Android the
-   page is called SETTINGS. */
+   After the rows, Controls opens the CONTROLS screen (controls_settings.c, finding 157: the keys
+   and controller buttons for the PS2 pad's buttons; a host lists DHD_KEYBOARD in its
+   DHD_PC_SETTINGS_ROWS to show it). With touch (the host sets DHD_TOUCH: android, or mouse for a
+   desktop test) the page ends with a Touch Controls row whose three screens are
+   touch_settings.c's (finding 141); on Android the page is called SETTINGS. */
 #include "hle.h"
 #include "../runtime/portable.h"
 #include "menu_page.h"
@@ -31,6 +35,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "controls_table.h"
+#include "settings_tabs.h"
 #include "settings_table.h"  /* the settings' choices: generated from port/render/settings */
 
 void gs_window_apply(void);           /* port/gs/present.c */
@@ -40,10 +46,19 @@ void touch_settings_build(MenuPage *p, int page);
 void touch_settings_update(MenuPage *p, int page, int cursor);
 void touch_settings_change(MenuPage *p, int page, int row, int step);
 int touch_settings_accept(MenuPage *p, int page, int row);
+/* controls_settings.c: the CONTROLS screen of this page */
+const char *controls_settings_title(void);
+void controls_settings_open(void);
+void controls_settings_build(MenuPage *p);
+void controls_settings_draw(MenuPage *p);
+void controls_settings_update(MenuPage *p, int cursor);
+void controls_settings_change(MenuPage *p, int row, int step);
+int controls_settings_accept(MenuPage *p, int row);
 void gs_present_options_apply(void);
 int texpack_available(void);          /* port/gs/texpack.c */
+void port_unlock_refresh(void);       /* patches_unlock.py: the lobby's rider statues follow Unlock All */
 
-enum { ROWS = 16, MAX_CHOICES = 16 };
+enum { ROWS = 23, MAX_CHOICES = 16 };
 
 /* A row: its label and dhd.ini key; the setting's variable, built-in value and choices come from
    setting_table (dhd_settings), the list from choices_build. */
@@ -57,7 +72,7 @@ typedef struct {
 } Row;
 
 enum { RESOLUTION, DISPLAY, SIZE, SHAPE, SCALING, WIDESCREEN, MOVIES, VIBRATION, DEAD_ZONE, PROMPTS, TEXTURES, FONT, RATE,
-       VSYNC, COUNTER, UNLOCK };
+       VSYNC, COUNTER, UNLOCK, NAMES, NATIVE_VU, PERFORMANCE, SHADOWS, FLARE, PARTICLES, LAUNCHER };
 static Row rows[ROWS] = {
     {"Resolution:", "scale", 0},
     {"Display:", "window", 1},
@@ -74,19 +89,65 @@ static Row rows[ROWS] = {
     {"Frame Rate:", "fps", 0},
     {"V-Sync:", "vsync", 0},  /* no tearing (port/gs/gpu_rust.c) */
     {"FPS & Ping:", "perf_counter", 1},
-    {"Unlock All:", "unlock_all", 1},  /* port_unlock_all */
+    {"Unlock All:", "unlock_all", 1},
+    {"Player Names:", "names", 1},
+    /* right above the Performance group (finding 194): the VU1 programs' batch loops drawn by the
+       native renderer's shaders (port/hle/vu1_mesh.inc); live, read by the VU thread through
+       gs_present_options_apply */
+    {"Native VU:", "native_vu", 1},
+    /* the Performance group (finding 183): the preset is no setting of its own; ON is the three
+       below off, OFF the three on, anything else Custom (perf_state) */
+    {"Performance Mode:", "", 1},
+    {"Shadows & Sun Glow:", "shadows", 1},
+    {"Lens Flare:", "lens_flare", 1},
+    {"Particles:", "particles", 1},
+    /* a phone's launcher (finding 225): OFF starts the game at once next time; only where the host
+       lists DHD_LAUNCHER_AT_START (Android), the desktop's launcher has no such setting */
+    {"Launcher At Start:", "launcher", 1},
 };
 static char monitor_size[24];
 
 /* Unlock All (dhd.ini "unlock_all", DHD_UNLOCK_ALL): the game's unlock checks answer as if
    everything were unlocked, while it is on: tracks, riders and pro riders, sponsor rows, the
    shop's items and the preset bikes (patches.py's track mask, patches_unlock.py; finding 095).
-   The save's own unlocks are never written, so turning it off brings them back. */
+   The save's own unlocks are never written, so turning it off brings them back. A change here
+   applies at once: commit calls port_unlock_refresh (patches_unlock.py), which brings the lobby's
+   rider statues, the one unlock state the front end keeps, up to date (finding 200). */
 int port_unlock_all(void)
 {
     static HleEnv env;
     const char *v = hle_env(&env, "DHD_UNLOCK_ALL");
     return v && atoi(v) != 0;
+}
+
+/* Performance (finding 183): Shadows & Sun Glow (dhd.ini "shadows", DHD_SHADOWS), Lens Flare
+   ("lens_flare") and Particles ("particles"), on without a value. The game's draw code asks these
+   each frame (port/patches_effects.py): off, the effect is not drawn; nothing the game logic reads
+   changes, so they apply at once and online too. */
+static int effect_on(HleEnv *env, const char *name)
+{
+    const char *v = hle_env(env, name);
+    return !v || !*v || atoi(v) != 0;
+}
+int port_fx_shadows(void) { static HleEnv env; return effect_on(&env, "DHD_SHADOWS"); }
+int port_fx_lens_flare(void) { static HleEnv env; return effect_on(&env, "DHD_LENS_FLARE"); }
+int port_fx_particles(void) { static HleEnv env; return effect_on(&env, "DHD_PARTICLES"); }
+
+/* The heat haze's two textures (VU1 program 0x29C0 in the two packets func_00237918 makes once a
+   race, each starting it with MSCAL and continuing it with MSCNT): those four words, set to VIF
+   NOPs while Particles is off (the haze's emitters, which read the textures, aren't drawn then) and
+   back to the game's words when it is on. */
+enum { HAZE_WORDS = 4 };
+static unsigned *haze_words[HAZE_WORDS], haze_game[HAZE_WORDS], haze_count;
+void port_fx_haze_word(unsigned *word)
+{
+    if (haze_count == HAZE_WORDS) haze_count = 0;  /* a new race: the game makes both packets again */
+    haze_words[haze_count] = word;
+    haze_game[haze_count++] = *word;
+}
+void port_fx_haze(int on)
+{
+    for (unsigned i = 0; i < haze_count; i++) *haze_words[i] = on ? haze_game[i] : 0;
 }
 
 static int loaded;
@@ -138,9 +199,35 @@ static void choices_build(void)
             if (!known && r->count < MAX_CHOICES) r->choices[r->count++] = (SettingChoice){monitor_size, monitor_size};
         }
     }
+    /* Performance Mode: OFF (the effects on) or ON (them off) */
+    rows[PERFORMANCE].env = "";
+    rows[PERFORMANCE].builtin = "0";
+    rows[PERFORMANCE].count = 2;
+    rows[PERFORMANCE].choices[0] = (SettingChoice){"0", "OFF"};
+    rows[PERFORMANCE].choices[1] = (SettingChoice){"1", "ON"};
+}
+
+/* Performance Mode as the three effects' rows stand: 1 all off, 0 all on, -1 a mix (Custom). */
+static int perf_state(void)
+{
+    int off = 0;
+    for (int i = SHADOWS; i <= PARTICLES; i++) {
+        const Row *r = &rows[i];
+        off += r->selected >= 0 && !strcmp(r->choices[r->selected].value, "0");
+    }
+    return off == 3 ? 1 : off == 0 ? 0 : -1;
 }
 static char hint[64];
 static const char *restart_hint = "* Applies when the game starts again";
+enum { TAB_DISPLAY, TAB_GRAPHICS, TAB_CONTROLS, TAB_ONLINE, TAB_GAME, TABS };
+static const char *const tab_labels[TABS] = {"Display", "Graphics", "Controls", "Online", "Game"};
+static const int row_tab[ROWS] = {TAB_GRAPHICS, TAB_DISPLAY, TAB_DISPLAY, TAB_DISPLAY, TAB_GRAPHICS,
+    TAB_DISPLAY, TAB_GAME, TAB_CONTROLS, TAB_CONTROLS, TAB_CONTROLS, TAB_GRAPHICS, TAB_GRAPHICS,
+    TAB_DISPLAY, TAB_DISPLAY, TAB_DISPLAY, TAB_GAME, TAB_ONLINE, TAB_GRAPHICS, TAB_GRAPHICS, TAB_GRAPHICS,
+    TAB_GRAPHICS, TAB_GRAPHICS, TAB_GAME};
+static int tab, visible[ROWS], tabs[TABS], tab_count;
+static unsigned held_before;
+static int tab_left[TABS], tab_right[TABS];
 static int shown[ROWS], shown_count;  /* the page's rows: indexes into rows[] */
 
 /* Whether env is one of list's comma-separated names. */
@@ -159,19 +246,31 @@ static void choose_rows(void)
     const char *list = host_getenv("DHD_PC_SETTINGS_ROWS"), *live = host_getenv("DHD_PC_SETTINGS_LIVE");
     const char *restart = host_getenv("DHD_PC_SETTINGS_RESTART");
     if (restart && *restart) restart_hint = restart;
-    shown_count = 0;
     for (int i = 0; i < ROWS; i++) {
-        if (!list || listed(list, rows[i].env)) shown[shown_count++] = i;
-        if (live && listed(live, rows[i].env)) rows[i].live = 1;
+        int named = rows[i].env && *rows[i].env;
+        visible[i] = !list || (named && listed(list, rows[i].env));
+        if (live && named && listed(live, rows[i].env)) rows[i].live = 1;
     }
+    visible[PERFORMANCE] = visible[SHADOWS] || visible[FLARE] || visible[PARTICLES];
+    visible[LAUNCHER] = list && rows[LAUNCHER].env && listed(list, rows[LAUNCHER].env);
+    const char *touch = host_getenv("DHD_TOUCH");
+    int controls = !list || listed(list, "DHD_KEYBOARD") || (touch && *touch);
+    tab_count = settings_tabs_choose(tabs, TABS, row_tab, visible, ROWS, TAB_CONTROLS, controls);
 }
 
-static Row *row_at(int index) { return index >= 0 && index < shown_count ? &rows[shown[index]] : NULL; }
+/* The page's menu rows: which of rows[] each is (-1 a heading), and each shown row's menu row. */
+static int row_of_menu[MENU_PAGE_ROWS], menu_of_row[ROWS];
+static Row *row_at(int index) { return index >= 0 && index < MENU_PAGE_ROWS && row_of_menu[index] >= 0 ? &rows[row_of_menu[index]] : NULL; }
 
 /* The value the program runs with now: the variable (set from dhd.ini, in a choice's own spelling,
    or the environment), else the game's built-in one. */
 static void current(const Row *r, char *out, size_t size)
 {
+    if (r == &rows[PERFORMANCE]) {
+        int state = perf_state();
+        snprintf(out, size, "%s", state < 0 ? "Custom" : state ? "1" : "0");
+        return;
+    }
     if (r == &rows[SIZE]) {
         const char *w = host_getenv("DHD_WINDOW_WIDTH"), *h = host_getenv("DHD_WINDOW_HEIGHT");
         snprintf(out, size, "%dx%d", w && atoi(w) > 0 ? atoi(w) : 896, h && atoi(h) > 0 ? atoi(h) : 672);
@@ -190,18 +289,22 @@ static int find(const Row *r, const char *value)
 
 static int locked(const Row *r)
 {
+    if (r == &rows[PERFORMANCE]) return locked(&rows[SHADOWS]) && locked(&rows[FLARE]) && locked(&rows[PARTICLES]);
     return host_service_host_setting_locked(GADDR(r->env)) || (r == &rows[SIZE] && host_service_host_setting_locked(GADDR("DHD_WINDOW_HEIGHT")));
 }
 
 static MenuPage page;
-static int screen;         /* 0 the PC settings, 1-3 TOUCH CONTROLS */
-static int touch_row = -1; /* the Touch Controls row, -1 without touch */
+enum { CONTROLS = 4 };      /* the screen of controls_settings.c */
+static int screen;          /* 0 the PC settings, 1-3 TOUCH CONTROLS, CONTROLS */
+static int touch_row = -1;  /* the Touch Controls row, -1 without touch */
+static int controls_row = -1;  /* the Controls row, -1 when the host doesn't offer it */
 
 static const char *page_title(void)
 {
     const char *touch = host_getenv("DHD_TOUCH");
+    if (screen == CONTROLS) return controls_settings_title();
     if (screen) return touch_settings_title(screen);
-    return touch && !strcmp(touch, "android") ? "SETTINGS" : "PC SETTINGS";
+    return touch && !strcmp(touch, "android") ? "SETTINGS" : "REVIVED SETTINGS";
 }
 
 /* Resolution's value as the GPU draws it (scale_limit, host_service_gs_scale), after its label:
@@ -228,10 +331,9 @@ static void scale_note(const Row *r, char *value, size_t size)
 static void format(Row *r)
 {
     char value[48];
-    int index = -1;
-    for (int i = 0; i < shown_count; i++)
-        if (&rows[shown[i]] == r) index = i;
+    int index = menu_of_row[r - rows];
     if (index < 0) return;
+    if (r == &rows[PERFORMANCE]) r->selected = r->running = perf_state();  /* -1: Custom */
     if (r->selected >= 0) snprintf(value, sizeof value, "%s", r->choices[r->selected].label);
     else current(r, value, sizeof value);
     if (r == &rows[RESOLUTION]) scale_note(r, value, sizeof value);
@@ -252,8 +354,10 @@ static void commit(Row *r, int apply)
     if (!apply) return;
     r->running = r->selected;
     if (r == &rows[DISPLAY] || r == &rows[SIZE]) host_service_gs_window_apply();
-    else if (r == &rows[SHAPE] || r == &rows[SCALING] || r == &rows[COUNTER]) host_service_gs_present_options_apply();
+    else if (r == &rows[SHAPE] || r == &rows[SCALING] || r == &rows[COUNTER] || r == &rows[NATIVE_VU])
+        host_service_gs_present_options_apply();
     else if (r == &rows[VIBRATION]) host_service_host_pad_vibrate(0, 0, 0);
+    else if (r == &rows[UNLOCK]) port_unlock_refresh();
 }
 
 static void change(int index, int step)
@@ -261,6 +365,21 @@ static void change(int index, int step)
     Row *r = row_at(index);
     if (!r) return;
     if (locked(r)) return;
+    if (r == &rows[PERFORMANCE]) {  /* the preset: ON turns the three effects off, OFF on (Custom: right is ON) */
+        int on = perf_state() < 0 ? step > 0 : perf_state() == 0;
+        menu_page_sound(step > 0);
+        for (int i = SHADOWS; i <= PARTICLES; i++) {
+            Row *e = &rows[i];
+            int want = find(e, on ? "0" : "1");
+            if (locked(e) || want < 0 || e->selected == want) continue;
+            e->selected = want;
+            commit(e, e->live);
+            format(e);
+        }
+        format(r);
+        hle_log("pc settings: %s %s\n", r->label, on ? "on" : "off");
+        return;
+    }
     r->selected = r->selected < 0 ? (step > 0 ? 0 : r->count - 1) : (r->selected + step + r->count) % r->count;
     menu_page_sound(step > 0);
     commit(r, r->live);
@@ -272,6 +391,7 @@ static void change(int index, int step)
         format(&rows[SHAPE]);
     }
     format(r);
+    if (r >= &rows[SHADOWS] && r <= &rows[PARTICLES]) format(&rows[PERFORMANCE]);
     hle_log("pc settings: %s %s\n", r->label, r->choices[r->selected].value);
 }
 
@@ -280,25 +400,72 @@ static void change(int index, int step)
 static void page_build(MenuPage *p)
 {
     p->title = page_title();
+    p->title_y = screen ? 0 : 35;
+    /* the tabs' legend at y 180 (page_draw) stays under the rows' panel, which ends 13 below the
+       last row: a tab of ten rows (Graphics) moves its rows up; nine or fewer are where they were */
+    p->rows_last = screen ? 0 : 166;
+    p->footer = NULL;
+    if (screen == CONTROLS) { controls_settings_build(p); return; }
     if (screen) { touch_settings_build(p, screen); return; }
+    shown_count = 0;
+    for (int i = 0; i < ROWS; i++)
+        if (visible[i] && row_tab[i] == tabs[tab]) shown[shown_count++] = i;
+    const char *touch_mode = host_getenv("DHD_TOUCH");
+    p->footer = touch_mode && !strcmp(touch_mode, "android")
+        ? GLYPH_LEFT " Change " GLYPH_RIGHT "  " GLYPH_CROSS " Keep  " GLYPH_TRIANGLE " Back"
+        : GLYPH_LEFT " Change " GLYPH_RIGHT "  " GLYPH_CROSS " Keep  " GLYPH_TRIANGLE " Undo";
+    for (int i = 0; i < MENU_PAGE_ROWS; i++) row_of_menu[i] = -1;
+    for (int i = 0; i < ROWS; i++) menu_of_row[i] = -1;
     for (int i = 0; i < shown_count; i++) {
-        menu_page_value(p, rows[shown[i]].label, "", 1);
+        if (shown[i] == PERFORMANCE) menu_page_text(p, "Performance");  /* the group's heading */
+        int at = menu_page_value(p, rows[shown[i]].label, "", 1);
+        if (at < 0 || at >= MENU_PAGE_ROWS) continue;
+        row_of_menu[at] = shown[i];
+        menu_of_row[shown[i]] = at;
         format(&rows[shown[i]]);
     }
+    const char *list = host_getenv("DHD_PC_SETTINGS_ROWS");
+    controls_row = tabs[tab] == TAB_CONTROLS && (!list || listed(list, "DHD_KEYBOARD")) ? menu_page_row(p, "Controls", 1) : -1;
     const char *touch = host_getenv("DHD_TOUCH");
-    touch_row = touch && *touch ? menu_page_row(p, "Touch Controls", 1) : -1;
+    touch_row = tabs[tab] == TAB_CONTROLS && touch && *touch ? menu_page_row(p, "Touch Controls", 1) : -1;
 }
 
 static void page_update(MenuPage *p, int cursor)  /* the hint for the row (the legend stays) */
 {
+    if (screen == CONTROLS) { controls_settings_update(p, cursor); return; }
     if (screen) { touch_settings_update(p, screen, cursor); return; }
+    unsigned held = 0;
+    for (int player = 0; player < 2; player++) {
+        HostPad pad = {0};
+        host_service_host_pad_device(player, GADDR(&pad));
+        held |= pad.buttons;
+    }
+    unsigned pressed = held & ~held_before;
+    held_before = held;
+    if (p->armed && tab_count > 1 && (pressed & (PAD_L1 | PAD_R1))) {
+        int step = pressed & PAD_R1 ? 1 : -1;
+        tab = settings_tab_step(tab, step, tab_count);
+        menu_page_sound(step > 0);
+        menu_page_rebuild_at(p, 0);
+        return;
+    }
     const Row *r = row_at(cursor);
     p->hint = NULL;
+    if (cursor >= 0 && cursor == controls_row) p->hint = "Your keys and controller buttons";
     if (r && locked(r)) {
         snprintf(hint, sizeof hint, "Set by %s outside the game", r == &rows[SIZE] ? "DHD_WINDOW_WIDTH" : r->env);
         p->hint = hint;
     } else if (r && r->selected != r->running) p->hint = restart_hint;
     else if (r == &rows[TEXTURES] && !host_service_texpack_available()) p->hint = "No pack: see texture_pack in dhd.ini";
+    else if (r == &rows[PERFORMANCE]) p->hint = "ON: the three effects below off, for speed";
+    else if (r == &rows[SHADOWS]) p->hint = "The riders' shadows and the glow around the sun";
+    else if (r == &rows[FLARE]) p->hint = "The rings across the picture from the sun";
+    else if (r == &rows[PARTICLES]) p->hint = "Dust, dirt, spray and heat haze";
+    else if (r == &rows[NATIVE_VU]) {
+        const char *renderer = host_getenv("DHD_RENDER");
+        p->hint = renderer && !strcmp(renderer, "exact") ? "Only with the native renderer"
+                                                         : "Faster. Turn OFF if the picture looks wrong";
+    }
     else if (r == &rows[RESOLUTION] && scale_limit && scale_limit < 8) {
         if (scale_phone) snprintf(hint, sizeof hint, "Phones go up to %dx", scale_limit);
         else if (scale_why) snprintf(hint, sizeof hint, "This GPU's %s allows up to %dx", scale_why + 4, scale_limit);
@@ -309,10 +476,11 @@ static void page_update(MenuPage *p, int cursor)  /* the hint for the row (the l
 
 static void page_back(MenuPage *p)  /* Triangle: the values the page opened with, close */
 {
-    if (screen) {  /* TOUCH CONTROLS saves as it goes: back to the PC settings, on its row */
+    if (screen) {  /* TOUCH CONTROLS and CONTROLS save as they go: back to the PC settings, on their row */
+        int row = screen == CONTROLS ? controls_row : touch_row;
         screen = 0;
         menu_play("S_BACK");
-        menu_page_rebuild_at(p, touch_row >= 0 ? touch_row : 0);
+        menu_page_rebuild_at(p, row >= 0 ? row : 0);
         return;
     }
     /* A phone's Back (and △) leaves SETTINGS as its other screens do: with what was chosen, which
@@ -325,19 +493,33 @@ static void page_back(MenuPage *p)  /* Triangle: the values the page opened with
     }
     for (int i = 0; i < ROWS; i++) {
         Row *r = &rows[i];
-        if (r->selected == r->opened || r->opened < 0) continue;
+        if (i == PERFORMANCE || r->selected == r->opened || r->opened < 0) continue;
         r->selected = r->opened;
         commit(r, r->live || r->opened == r->running);
     }
     menu_page_cancel(p);
 }
 
-static void page_left(MenuPage *p, int index) { if (screen) touch_settings_change(p, screen, index, -1); else change(index, -1); }
-static void page_right(MenuPage *p, int index) { if (screen) touch_settings_change(p, screen, index, 1); else change(index, 1); }
+static void page_step(MenuPage *p, int index, int step)
+{
+    if (screen == CONTROLS) controls_settings_change(p, index, step);
+    else if (screen) touch_settings_change(p, screen, index, step);
+    else change(index, step);
+}
+static void page_left(MenuPage *p, int index) { page_step(p, index, -1); }
+static void page_right(MenuPage *p, int index) { page_step(p, index, 1); }
 
-/* Cross: keep and close; on Touch Controls (and inside it) the touch screens. */
+/* Cross: keep and close; on Touch Controls (and inside it) the touch screens, on Controls its screen. */
 static void page_accept(MenuPage *p, int index)
 {
+    if (screen == CONTROLS) { controls_settings_accept(p, index); return; }
+    if (!screen && controls_row >= 0 && index == controls_row) {
+        menu_play("S_SELECT");
+        controls_settings_open();
+        screen = CONTROLS;
+        menu_page_rebuild_at(p, 0);
+        return;
+    }
     if (!screen && (touch_row < 0 || index != touch_row)) { menu_page_close(p); return; }
     int next = screen ? touch_settings_accept(p, screen, index) : 1;
     if (!screen) menu_play("S_SELECT");
@@ -347,13 +529,74 @@ static void page_accept(MenuPage *p, int index)
     menu_page_rebuild_at(p, back_to_row);
 }
 
-/* OPTIONS, item 9 (patched func_001F0160): run the page until it closes. */
+static void page_draw(MenuPage *p)
+{
+    if (screen == CONTROLS) { controls_settings_draw(p); return; }
+    if (screen) return;
+    MenuStyle style = menu_page_style(p, MENU_STYLE_OFF);
+    char legend[96];
+    int width = 0;
+    for (int i = 0; i < tab_count; i++) width += menu_text_width(tab_labels[tabs[i]], &style) + 16;
+    int x = 256 - width / 2;
+    for (int i = 0; i < tab_count; i++) {
+        int w = menu_text_width(tab_labels[tabs[i]], &style) + 16;
+        tab_left[i] = x, tab_right[i] = x + w;
+        char label[24];
+        snprintf(label, sizeof label, i == tab ? "[%s]" : "%s", tab_labels[tabs[i]]);
+        MenuStyle shown = menu_page_style(p, i == tab ? MENU_STYLE_SELECTED : MENU_STYLE_OFF);
+        menu_draw_text(MENU_CENTRE, x + w / 2, 62, label, &shown);
+        x += w;
+    }
+    ControlsLayout layout;
+    int pad = host_service_controls_pad(CONTROL_PAD1);
+    int device = pad > 0 ? CONTROL_PAD1 : CONTROL_KEYBOARD;
+    if (!host_service_controls_layout(device, GADDR(&layout))) layout = control_defaults[device];
+    const char *words[2] = {"-", "-"};
+    for (int i = 0; i < 2; i++) {
+        int code = layout.input[4 + i][0];
+        if (device == CONTROL_KEYBOARD) {
+            for (int k = 0; k < CONTROL_KEYS; k++) if (control_keys[k].vk == code) words[i] = control_keys[k].label;
+        } else {
+            for (int k = 0; k < CONTROL_PAD_INPUTS; k++) if (control_pad_inputs[k].id == code)
+                words[i] = control_pad_inputs[k].label[pad - 1 == PAD_KIND_PLAYSTATION ? 1 : pad - 1 == PAD_KIND_NINTENDO ? 2 : 0];
+        }
+    }
+    /* A phone with touch controls and no pad has no A / D (nor L1 / R1) to press: what it can do
+       is tap a tab's name (page_header_mouse); the keyboard's keys are not offered there
+       (finding 211). With a pad connected the pad's own buttons are. DHD_TOUCH is set by the host
+       where touch controls are on: a phone, or a desktop whose mouse is a finger (checks only). */
+    const char *touch = host_getenv("DHD_TOUCH");
+    if (pad <= 0 && touch && *touch) snprintf(legend, sizeof legend, "Tap a tab");
+    else snprintf(legend, sizeof legend, "%s / %s  Tabs", words[0], words[1]);
+    menu_draw_text(MENU_CENTRE, 256, 180, legend, &style);
+}
+
+/* A tap or click on a tab keeps the normal row and legend mouse handling. */
+static int page_header_mouse(MenuPage *p, int x, int y)
+{
+    if (screen || y < 55 || y > 73) return 0;
+    for (int i = 0; i < tab_count; i++) {
+        if (x < tab_left[i] || x >= tab_right[i]) continue;
+        if (i != tab) {
+            menu_page_sound(i > tab);
+            tab = i;
+            menu_page_rebuild_at(p, 0);
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/* OPTIONS, first item (patched func_001F0160): run the page until it closes. */
 void port_pc_settings(void)
 {
     screen = 0;
+    held_before = 0xFFFF;
     page.title = page_title();
     page.build = page_build;
     page.update = page_update;
+    page.draw = page_draw;
+    page.header_mouse = page_header_mouse;
     page.hints = 1;   /* the row's hint above the legend (menu_page.h) */
     page.accept = page_accept;  /* Cross: keep, close (Touch Controls: its screens) */
     page.back = page_back;
@@ -373,11 +616,11 @@ void port_pc_settings(void)
     menu_page_run(&page);
 }
 
-/* OPTIONS' rows (patched func_001F0160): row 9 is this page; the game's table has an unused
+/* OPTIONS' rows (patched func_001F0160): row 0 is this page; the game's table has an unused
    "UNLOCK RIDERS/BIKES(test)" there, which stays as it is. */
 char *port_options_label(char *label, int index)
 {
-    if (index != 9) return label;
+    if (index != 0) return label;
     const char *touch = host_getenv("DHD_TOUCH");  /* the page's own name (page_title): SETTINGS on a phone */
-    return (char *)(touch && !strcmp(touch, "android") ? "SETTINGS" : "PC SETTINGS");
+    return (char *)(touch && !strcmp(touch, "android") ? "SETTINGS" : "REVIVED SETTINGS");
 }

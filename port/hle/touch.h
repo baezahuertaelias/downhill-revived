@@ -23,6 +23,15 @@ enum { TOUCH_FINGERS = 10, TOUCH_SHAPES = 512, TOUCH_TEXT = 48 };
 enum { TOUCH_THUMB_ZONES, TOUCH_CLASSIC };
 enum { TOUCH_LABELS_AUTO, TOUCH_LABELS_ALWAYS, TOUCH_LABELS_OFF };
 enum { TOUCH_ATTACK_FLICK, TOUCH_ATTACK_BUTTONS };
+/* Button Style (finding 229): Actions shows what each button does (a pedal, fists, a brake ...) with
+   a small badge of the pad's name; Symbols shows the PS2 pad's symbols alone (the look before, and
+   the default until players have chosen between them). */
+enum { TOUCH_STYLE_ACTIONS, TOUCH_STYLE_SYMBOLS };
+/* The names on Actions' badges: the PS2 pad's, or the Xbox or Nintendo names in the same places
+   when Button Icons (dhd.ini prompts, finding 134) chooses them, so the badges say what the game's
+   prompts say. Auto keeps the PS2 names: on a touch screen the game's prompts name a controller
+   only while one is in use (finding 227), and the overlay hides then. */
+enum { TOUCH_BADGES_PS2, TOUCH_BADGES_XBOX, TOUCH_BADGES_NINTENDO };
 
 /* The controls a layout has (also the editor's and dhd.ini touch_layout's names). */
 enum {
@@ -37,14 +46,24 @@ enum {
 
 typedef struct {
     float dx, dy;    /* mm from the preset's place */
-    float size;      /* times the preset's size (1 = as designed) */
+    float size;      /* times the preset's size (1 = as designed; TOUCH_SIZE_MIN to TOUCH_SIZE_MAX) */
 } TouchEdit;
+
+/* A control's own size in the layout editor (finding 226): 25 % to 600 %, where the screen holds it. */
+#define TOUCH_SIZE_MIN 0.25f
+#define TOUCH_SIZE_MAX 6.0f
+/* A screen whose short side is this long or longer (mm) is a tablet's: the tablet defaults
+   (finding 226: a larger base size, the clusters nearer where two thumbs hold it, Pause and SKIP
+   under the thumbs). Phones end near 78 mm, the smallest tablets start near 94 mm. */
+#define TOUCH_TABLET_MM 90.0f
+#define TOUCH_TABLET_SCALE 1.25f
 
 /* The player's settings (dhd.ini touch_*, the TOUCH CONTROLS pages). */
 typedef struct {
     int preset;           /* TOUCH_THUMB_ZONES / TOUCH_CLASSIC */
     int left_handed;      /* Hand: Left mirrors both presets and the HUD */
     int tilt;             /* Steer with: 0 stick, 1 tilt */
+    int dpad;             /* Steer with: the four-button D-pad (finding 214; tilt is 0 then) */
     int size;             /* percent; 0: the height rule's own (100% capped) */
     int opacity;          /* percent */
     int stick_fixed;      /* Stick: 0 floating, 1 fixed */
@@ -52,6 +71,8 @@ typedef struct {
     int trick_size;       /* mm */
     int labels;           /* TOUCH_LABELS_* */
     int attacks;          /* TOUCH_ATTACK_* */
+    int style;            /* TOUCH_STYLE_* */
+    int badges;           /* TOUCH_BADGES_* */
     int vibration;
     int show_with_pad;    /* With a controller: 0 hide, 1 show */
     int tilt_strength;    /* percent */
@@ -60,10 +81,14 @@ typedef struct {
     int hud_moved;        /* 1: the HUD moves out of the controls' way (the HUD hook); 0: the fallback layout */
     int air_wait_ms;      /* 150, or 33 when the air flag is steady (check 6) */
     TouchEdit edit[2][TC_COUNT];  /* per preset */
+    int legacy[2];        /* per preset: its edits were saved by 0.8.0 or before (no "layout=2" in
+                             touch_edits), so it keeps 0.8.0's places on every screen: an update
+                             never moves a player's layout (finding 226) */
 } TouchSettings;
 
 void touch_settings_default(TouchSettings *s);
-/* dhd.ini touch_layout: "preset.control=dx,dy,size;..." and back (out: at least 1024 bytes). */
+/* dhd.ini touch_edits: "preset.control=dx,dy,size;..." and back (out: at least 1024 bytes); a
+   preset laid out on the current places also has "preset.layout=2" (older readers skip it). */
 void touch_layout_parse(TouchSettings *s, const char *text);
 void touch_layout_format(const TouchSettings *s, char *out, int size);
 
@@ -78,9 +103,15 @@ typedef struct {
 /* What the game says each field (port/hle/pad.c through HostTouch, host_api.h). */
 typedef struct {
     int race_hud;        /* the race HUD was drawn (the HUD hook): the race is on screen */
+    int flyover;         /* the camera's flight over the track plays: START skips it (finding 209) */
+    int movie;           /* a movie plays: START skips it (finding 214); the SKIP button serves both */
+    int replay;          /* a race's replay: START opens its menu (RE-START, SAVE, QUIT, CONTINUE) */
+    int attract;         /* the title's attract demo: any button ends it */
     int air;             /* player 1's rider is in the air (rider +0x4564, finding 141) */
     int online;          /* an online race (no pause: the panel) */
-    int clock_moving;    /* the race clock advanced since the last field */
+    int clock_moving;    /* the race clock advanced within the last 1.5 fields' time: at a high rate
+                            most updates advance no whole field (finding 218) */
+    int menu_up;         /* a game popup is up: in a replay, its menu (finding 218) */
     int pause_row[3];    /* the game's pause menu: RESUME, RE-START, QUIT's rows (-1: none) */
     double race_ms;      /* race time, ms (fields * 1000/60), stopped while paused */
     uint32_t vsync;      /* the game's VBLANKs so far */
@@ -96,8 +127,12 @@ enum {
     TS_CROSS, TS_CIRCLE, TS_TRIANGLE, TS_SQUARE,   /* the PS2 symbols: a radius */
     TS_CHEVRON,    /* ‹ (c = pi) or › (c = 0): a size */
     TS_CHAR,       /* one character of the 8x8 font: a its height, c the character */
-    TS_STRIPES     /* the editor's no-start strips: a rectangle with stripes (a,b half sizes) */
+    TS_STRIPES,    /* the editor's no-start strips: a rectangle with stripes (a,b half sizes) */
+    TS_ICON        /* an action picture (finding 229): a half its size, b -1 mirrored, c the TI_* */
 };
+/* The action pictures, in port/render/src/present/touch_icons.txt's order (its shader's ids). */
+enum { TI_PEDAL, TI_FIST, TI_BRAKE, TI_HOP, TI_SLIDE, TI_SPRINT, TI_STAR, TI_HAND, TI_BOOT, TI_WRAP,
+       TI_CAMERA, TI_PAUSE, TI_BAR, TI_LINK, TI_COUNT };
 typedef struct {
     int kind;
     float x, y, a, b, c, d;
@@ -129,6 +164,11 @@ void touch_pad_lost(Touch *t, double now);     /* the controller went away mid-r
 /* The phone's roll (tilt steering); known 0: no reading yet, or no sensor (the stick keeps steering). */
 void touch_tilt(Touch *t, int known, float degrees);
 void touch_open_editor(Touch *t);              /* TOUCH CONTROLS > Edit layout */
+/* The editor alone (the launcher's "Edit the touch layout", DHD_TOUCH_EDITOR): over a plain
+   background instead of the game's picture; Done or Back closes it as usual. */
+void touch_open_editor_alone(Touch *t);
+int touch_editor_open(const Touch *t);
+int touch_tablet(const Touch *t);              /* laid out with the tablet defaults */
 
 /* The host's queue between its input thread and the game's field (no lock here: the host holds
    its own). It never loses what ends a press: a finger's moves are merged (the latest kept) once
@@ -157,14 +197,27 @@ void touch_pad(const Touch *t, uint16_t *buttons, uint8_t *left_x, uint8_t *left
 /* Outputs since the last call, then cleared. */
 int touch_take_buzz(Touch *t);
 int touch_take_ask(Touch *t);
-/* Saved settings that changed (hints shown, the editor's Done): 1 and a copy in *out. */
+/* Saved settings that changed since the last call: TOUCH_SAVED_* bits (0 none) and a copy in *out.
+   Hints shown change touch_hints only; the layout (touch_edits) changes only when the layout
+   editor saved (Done or Back). Until then *out carries the layout as it was loaded, never one the
+   steering rescue changed for this run (finding 229), so a host may write it back unchanged. */
+enum { TOUCH_SAVED_HINTS = 1, TOUCH_SAVED_LAYOUT = 2 };
 int touch_take_saved(Touch *t, TouchSettings *out);
+/* A line for the host's log, once (NULL: none): a loaded layout that left no room to steer and the
+   controls shown at their default places for it (finding 229). */
+const char *touch_take_note(Touch *t);
 
 /* State the host passes on. */
 int touch_visible(const Touch *t);       /* the overlay is drawn (the race HUD, or the editor) */
 int touch_hud_mode(const Touch *t);      /* 0 the game's HUD; 1 moved (right hand), 2 moved (left hand) */
 int touch_owns_touches(const Touch *t);  /* touches are the overlay's (no menu mouse from them) */
 int touch_freeze(const Touch *t);        /* the trick-stick hint holds the game */
+
+/* A control shows its air picture (Button Style Actions, finding 229): the rider has been in the air
+   for the air wait (on the ground again for TOUCH_GROUND_MS), and the control was not held down
+   when that changed (a held control keeps its picture until it is let go). */
+enum { TOUCH_GROUND_MS = 120 };
+int touch_air_picture(const Touch *t, int control);
 
 /* The overlay's shapes, mm; returns the count. */
 int touch_shapes(const Touch *t, TouchShape *out, int max);
@@ -176,11 +229,17 @@ float touch_button_scale(float s);                          /* 1.2 s - 0.2 */
 uint16_t touch_sector_buttons(int sector);
 const char *touch_trick_name(uint16_t buttons);             /* NULL: no tabled trick */
 /* Where a panel's button is (its centre, mm): the pause rows (Resume, Restart race, Quit race,
-   Controls, Bail out), the question (No, Yes), the online panel (Close, Bail out, Leave race),
-   the editor's bar (Ground, Air, -, +, Reset, Done). 0 if there is no such button. */
-enum { TOUCH_TARGET_PAUSE, TOUCH_TARGET_CONFIRM, TOUCH_TARGET_PANEL, TOUCH_TARGET_EDITOR };
+   Controls, Bail out, Codes), the question (No, Yes), the online panel (Close, Bail out, Leave race),
+   the editor's bar (Ground, Air, -, +, Undo, Redo, Reset, Done), the pause rows' CODES page (Up, Down, Left,
+   Right, Triangle, Circle, Cross, Square, Clear, Back, Enter; finding 189). 0 if there is no such
+   button. */
+enum { TOUCH_TARGET_PAUSE, TOUCH_TARGET_CONFIRM, TOUCH_TARGET_PANEL, TOUCH_TARGET_EDITOR, TOUCH_TARGET_CODES,
+       TOUCH_TARGET_SKIP /* the flight over the track's SKIP button, index 0 (finding 209) */,
+       TOUCH_TARGET_DPAD /* the D-pad's arms: up, down, left, right (finding 214); 0 unless it steers */ };
 int touch_target(const Touch *t, int kind, int index, float *x, float *y);
 /* Where a control sits now (centre and radius, mm); 0 if the layout has none. */
 int touch_control(const Touch *t, int control, float *x, float *y, float *r);
+/* The same control's half sizes (a box's width and height; a round control's radius twice). */
+int touch_control_size(const Touch *t, int control, float *half_w, float *half_h);
 
 #endif

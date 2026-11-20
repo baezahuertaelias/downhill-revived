@@ -10,14 +10,35 @@ The root and `port/AGENTS.md` rules apply. Design: findings 091, 143; phones' sp
 - The release key never enters the repository: the `DHD_ANDROID_*` variables name the keystore
   outside the checkout and its passwords. The release check pins the release certificate;
   changing the key needs `--new-signing-key` on purpose (finding 143).
-- No online play on phones yet: the host does not offer it (`host_service_net_offered`). Do not
-  enable it without a decision (root AGENTS.md, current decisions).
-- A phone has no launcher: the game copies the disc chosen in the document picker on first start
-  (on a worker thread), checks once a day for a newer release and only shows a notice.
+- Online on phones is the desktop's (`host_service_net_offered`, finding 237): every room, SFU and
+  P2P, through the shared menu and net code; no phone-only online path or limit (root AGENTS.md,
+  current decisions).
+- The app's entry is the launcher (finding 225): `LauncherActivity` shows the desktop launcher's
+  page (`port/launcher/ui`, packed as `assets/launcher`) in a WebView, answers its calls
+  (`LauncherBridge`, the list in `port/launcher/BRIDGE.md`) with the shared native code
+  (`Native` -> `port/host/android_launcher.c`: dhd_settings, the disc checks, `update_find`), imports
+  the disc (`DiscImport`, on a worker thread) and starts `DhdActivity` from PLAY (and ends). "Edit
+  the touch layout" starts the game as the layout editor alone (`--touch-editor` from
+  `DhdActivity.getArguments`) with the launcher left behind it: the editor's Done ends the process
+  through `host_end`. `DhdActivity` is `singleInstance`, in a task of its own; the launcher shows
+  again because Android brings back the launcher's task and starts it from its saved state. Nothing
+  guarantees that on every maker's Android (and not when the task was removed): then the player
+  lands on the home screen, and the durable mark `LauncherActivity.editorMark` (the app's private
+  preferences) opens the launcher at its Touch tab at the next start, even with the launcher set
+  to be skipped (finding 228).
+  No second UI in Java: a launcher change goes in `port/launcher/ui`. The WebView loads only the app's own files
+  (no JavaScript interface; the bridge is a MessagePort posted to that origin). Nothing is
+  downloaded by the app: the launcher (or, on a direct start, the game once a day) only says a
+  newer release is out.
 - The surface's formats are fixed (RGBA8, no format query; finding 145).
 - Low-end phones are named by device only: the Realme RMX3930 (Unisoc T612); its profile is
   reproduced on the rooted Mi 11i with `port/tools/phone_throttle.py --apply t612`.
 - Phone measurements: screen on, other apps closed, unlocked fps for speed runs
   (`DHD_FPS=240 DHD_VSYNC=0 DHD_FRAME_CLOCK=1`), and the window must reach the race itself
   (finding 147). One phone run at a time.
-- Tests: `python port/android/test_build_apk.py`, `test_disc_image.py` (JVM tests).
+- Boot-disc parsing lives only in `port/host/disc_check.c`; `DiscImage.check` supplies positional
+  FileChannel reads through `disc_check_jni.c`. Keep `volumeBytes` and copy/import completeness
+  rules separate (finding 234).
+- Tests: `python port/android/test_build_apk.py`, `test_disc_image.py` (JVM + production JNI adapter).
+  The latter needs a host C compiler and JDK JNI headers (`DHD_JNI_HEADERS` overrides the JDK's
+  include folder when using a runtime-only JDK).

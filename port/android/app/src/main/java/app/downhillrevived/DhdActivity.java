@@ -4,7 +4,13 @@
 // the touch controls (finding 141, port/host/android_touch.c, called from SDL's thread): the
 // screen's density and its gesture and cutout insets, the vibrator, and the phone's roll for tilt
 // steering; and the update notice (finding 143, port/host/android_update.c): one line over the game
-// when a newer release has an APK, which opens the release's page in the browser.
+// when a newer release has an APK, which opens the release's page in the browser (only when the
+// launcher didn't show its own update line this start: a direct start).
+// The launcher (LauncherActivity, finding 225) starts it with PLAY; its extras become what the game
+// reads: the argument --touch-editor (the layout editor alone, findings 226, 228) and
+// DHD_LAUNCHER_CHECKED. Without a disc image it can play (a
+// start that skips the launcher: a USB controller plugged in) it opens the launcher's disc page
+// instead and ends before the game starts (discReady).
 package app.downhillrevived;
 
 import android.content.Intent;
@@ -12,7 +18,6 @@ import android.content.pm.ActivityInfo;
 import android.content.res.Configuration;
 import android.graphics.Color;
 import android.graphics.Insets;
-import android.graphics.Rect;
 import android.graphics.drawable.GradientDrawable;
 import android.net.Uri;
 import android.hardware.Sensor;
@@ -27,11 +32,11 @@ import android.util.Log;
 import android.util.TypedValue;
 import android.view.DisplayCutout;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.Surface;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
-import android.view.WindowInsetsController;
 import android.widget.FrameLayout;
 import android.widget.TextView;
 
@@ -40,9 +45,30 @@ import org.libsdl.app.SDLActivity;
 public class DhdActivity extends SDLActivity {
     /** How long the update notice stays. */
     private static final int NOTICE_MS = 15000;
+    /** The launcher's extras: the touch layout editor alone (the game ends after its Done); the update
+     *  line was shown. */
+    static final String EDIT_TOUCH_LAYOUT = "edit_touch_layout", LAUNCHER_CHECKED = "launcher_checked";
+    /** The game started in this process (it runs once per process, SDL_main never starts twice):
+     *  the launcher, opened again from the icon, goes back to it. */
+    static volatile boolean started;
 
     private volatile float roll = Float.NaN;
     private SensorEventListener tiltListener;
+    private boolean motionWithoutSurface;
+
+    @Override
+    public boolean dispatchGenericMotionEvent(MotionEvent event) {
+        // SDL's surface and its invisible text editor share key handling, but only the
+        // surface has a joystick-motion listener. Keep the same SDL route while typing.
+        View.OnGenericMotionListener listener = SDLActivity.getMotionListener();
+        if (PadMotion.dispatch(event, mSurface, listener)) {
+            boolean away = !mSurface.hasFocus();
+            if (away && !motionWithoutSurface) Native.padMotionFocus(event.getDeviceId());
+            motionWithoutSurface = away;
+            return true;
+        }
+        return super.dispatchGenericMotionEvent(event);
+    }
 
     @Override
     protected String[] getLibraries() {
@@ -52,7 +78,7 @@ public class DhdActivity extends SDLActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         // How the run before ended, before the native game starts (it quotes dhd-exit.txt into the
-        // new dhd.log): once per process, so a start that skips SetupActivity (a USB controller
+        // new dhd.log): once per process, so a start that skips the launcher (a USB controller
         // plugged in) writes it too (finding 152). On a thread, waited for 2 s at most: the record's
         // trace can be slow to come, and the UI thread must not freeze; a late record only misses
         // this run's "previous run" lines
@@ -63,16 +89,36 @@ public class DhdActivity extends SDLActivity {
         } catch (InterruptedException ignored) {
             Thread.currentThread().interrupt();
         }
+        if (!discReady()) {
+            startActivity(new Intent(this, LauncherActivity.class).setAction(LauncherActivity.DISC)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
+            super.onCreate(savedInstanceState);
+            finish();  // before SDL's thread starts (onResume): no game in this process
+            return;
+        }
+        started = true;
         super.onCreate(savedInstanceState);
+        Screen.underCutout(getWindow());  // Android 10 only (SDL asks for it itself from 11)
         // The screen's shape (its long side over its short one), for widescreen = 1:
         // host_monitor_aspect reads DHD_MONITOR_ASPECT. Set before SDL_main starts.
         try {
-            Rect bounds = getWindowManager().getMaximumWindowMetrics().getBounds();
-            int w = Math.max(bounds.width(), bounds.height()), h = Math.min(bounds.width(), bounds.height());
+            int[] size = Screen.size(this);
+            int w = Math.max(size[0], size[1]), h = Math.min(size[0], size[1]);
             if (h > 0) nativeSetenv("DHD_MONITOR_ASPECT", Double.toString((double) w / h));
+            Intent start = getIntent();
+            if (start != null && start.getBooleanExtra(LAUNCHER_CHECKED, false)) nativeSetenv("DHD_LAUNCHER_CHECKED", "1");
         } catch (Throwable e) {  // the libraries didn't load: SDLActivity shows why
             Log.w("DownhillRevived", "no screen shape: " + e);
         }
+    }
+
+    /** SDL_main's arguments after its own name (SDL asks on its thread before SDL_main): the layout
+     *  editor alone when the launcher asked for it (android_main.c passes --touch-editor on to the
+     *  game, touch_host_args). */
+    @Override
+    protected String[] getArguments() {
+        Intent start = getIntent();
+        return start != null && start.getBooleanExtra(EDIT_TOUCH_LAYOUT, false) ? new String[] { "--touch-editor" } : new String[0];
     }
 
     @Override
@@ -90,7 +136,7 @@ public class DhdActivity extends SDLActivity {
     // SDL hides the system bars once, when the game goes full screen. A rotation the activity asks
     // for itself (tilt steering keeps the screen on its landscape side, touchTiltOn) can bring the
     // status bar back on some phones (MIUI on a Redmi 9): hide them again after a rotation and when
-    // the window gets its focus back, as SetupActivity does.
+    // the window gets its focus back, as the launcher does.
     @Override
     public void onConfigurationChanged(Configuration newConfig) {
         super.onConfigurationChanged(newConfig);
@@ -107,18 +153,11 @@ public class DhdActivity extends SDLActivity {
      *  is done; only while the game is full screen (SDL's own flag). */
     private void rehideBars() {
         if (!mFullscreenModeActive) return;
-        hideBars();
+        Screen.hideBars(getWindow());
         View decor = getWindow().getDecorView();
         decor.post(new Runnable() {
-            @Override public void run() { if (mFullscreenModeActive) hideBars(); }
+            @Override public void run() { if (mFullscreenModeActive) Screen.hideBars(getWindow()); }
         });
-    }
-
-    private void hideBars() {
-        WindowInsetsController c = getWindow().getInsetsController();
-        if (c == null) return;
-        c.hide(WindowInsets.Type.systemBars());
-        c.setSystemBarsBehavior(WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
     }
 
     /** The touch controls' screen: xdpi and ydpi times 1000, the system gesture insets (left, top,
@@ -131,7 +170,7 @@ public class DhdActivity extends SDLActivity {
         try {
             WindowInsets in = getWindow().getDecorView().getRootWindowInsets();
             if (in != null) {
-                Insets g = in.getInsets(WindowInsets.Type.systemGestures());
+                Insets g = Screen.gestureInsets(in);
                 r[2] = g.left; r[3] = g.top; r[4] = g.right; r[5] = g.bottom;
                 DisplayCutout c = in.getDisplayCutout();
                 if (c != null) {
@@ -169,7 +208,7 @@ public class DhdActivity extends SDLActivity {
                     tiltListener = new SensorEventListener() {
                         @Override public void onSensorChanged(SensorEvent e) {
                             float x = e.values[0], y = e.values[1], sx, sy;
-                            int rotation = getDisplay().getRotation();
+                            int rotation = Screen.rotation(DhdActivity.this);
                             if (rotation == Surface.ROTATION_90) { sx = -y; sy = x; }
                             else if (rotation == Surface.ROTATION_270) { sx = y; sy = -x; }
                             else if (rotation == Surface.ROTATION_180) { sx = -x; sy = -y; }
@@ -181,7 +220,7 @@ public class DhdActivity extends SDLActivity {
                     registerTilt();
                     // kept on its landscape side (LOCKED would keep a portrait screen when the game
                     // starts from a portrait home screen: the picture then stays in a strip)
-                    setRequestedOrientation(getDisplay().getRotation() == Surface.ROTATION_270
+                    setRequestedOrientation(Screen.rotation(DhdActivity.this) == Surface.ROTATION_270
                             ? ActivityInfo.SCREEN_ORIENTATION_REVERSE_LANDSCAPE : ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE);
                 } else if (!on && tiltListener != null) {
                     sensors.unregisterListener(tiltListener);
@@ -250,6 +289,23 @@ public class DhdActivity extends SDLActivity {
                 notice.postDelayed(remove, NOTICE_MS);
             }
         });
+    }
+
+    /** The copy of the disc image is there and is the game (DiscImage, the check android_main.c
+     *  makes again in C); a copy that isn't the game is removed, so the launcher asks for it. */
+    private boolean discReady() {
+        java.io.File disc = DiscImport.disc(this);
+        if (!disc.isFile()) return false;
+        try (java.io.RandomAccessFile f = new java.io.RandomAccessFile(disc, "r")) {
+            String problem = DiscImage.check(f.getChannel());
+            if (problem == null) return true;
+            Log.w("DownhillRevived", "the disc image's copy isn't the game (" + problem + "); removed");
+        } catch (java.io.IOException e) {
+            Log.w("DownhillRevived", "the disc image's copy can't be read: " + e);
+            return false;
+        }
+        disc.delete();
+        return false;
     }
 
     private int dp(int value) {

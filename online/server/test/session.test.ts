@@ -32,11 +32,12 @@ async function start(h:Client,cs:Client[],code:string) {
   await Promise.all(cs.map(c=>c.json("start")));
 }
 describe("session rooms",()=>{
-  it("relays only between current entrants, excluding waiting and returned players",async()=>{
+  it("never relays race data over the control socket",async()=>{
     const {h,cs,code}=await setup(); await start(h,cs,code);
     const late=await Client.join(code,"Late");
     cs[1].ws.send(new Uint8Array([5,0,99]).buffer);
-    expect([...(await h.binary())]).toEqual([5,1,99]);
+    cs[1].sendJson({type:"ping",t:1}); await cs[1].json("pong");
+    await expect(h.next(f=>typeof f!=="string",50)).rejects.toThrow("timed out");
     late.sendJson({type:"ping",t:1}); await late.json("pong"); late.drain();
     await expect(late.next(f=>typeof f!=="string",50)).rejects.toThrow("timed out");
     h.sendJson({type:"back"}); await snap(h,r=>!r.members[0].inRace);
@@ -276,6 +277,58 @@ describe("session rooms",()=>{
     for(let i=0;i<10;i++)cs[i].sendJson({type:"finish",ticks:600+i,place:i+1});
     expect((await snap(h,r=>r.lastRace)).settings.track).toBe(12);
   });
+  // Finding 166: the game's online list as a 0.7.12-0.7.14 host sends it (online_menu.c tracks in
+  // index order, limits from func_00182290), with Salt City MX (17, six riders) and Salt City TD
+  // (18, eight); MOSH pick-only. Newer games send the same ids in Super Career order (below).
+  const gameTracks=[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,22,23,24,25];
+  const gameLimits=gameTracks.map(t=>[0,1,2,3,5,11,12,19,20].includes(t)?10:[4,10,13,16,18,22,24].includes(t)?8:6);
+  it("takes the game's list with both Salt City events and their rider limits",async()=>{
+    const {h,cs,code}=await setup(8);
+    h.sendJson({type:"settings",track:17,then:"next",rotation:gameTracks,trackLimits:gameLimits,pickOnly:[23]});
+    await snap(h,r=>r.rotation.length===25&&r.settings.track===17);
+    await runInDurableObject(env.ROOM.get(env.ROOM.idFromName(code)),async(room:any)=>{
+      expect([room.trackLimit(room.state,17),room.trackLimit(room.state,18)]).toEqual([6,8]);
+      expect(room.fittingRotation(room.state,6).slice(0,2)).toEqual([18,19]);
+      expect(room.fittingRotation(room.state,8)).toEqual([18,19,20,22,24,0,1,2,3,4,5,10,11,12,13,16]);
+    });
+    // eight ready on Salt City MX (six places): Salt City TD at grid lock, then NEXT goes on to BC
+    await start(h,cs,code);
+    await runInDurableObject(env.ROOM.get(env.ROOM.idFromName(code)),async(room:any)=>{
+      expect([room.state.race.track,room.state.race.slots.length,room.state.lastEvent]).toEqual([18,8,"track_switch:17:6:18"]);
+    });
+    for(let i=0;i<8;i++)cs[i].sendJson({type:"finish",ticks:600+i,place:i+1});
+    expect((await snap(h,r=>r.lastRace)).settings.track).toBe(19);
+  });
+  // Finding 190: the same 25 ids and limits in the game's Super Career order (D_0026F150), MOSH
+  // last. Only the order differs, so NEXT and the grid-lock switch follow the career.
+  const careerTracks=[0,6,24,1,7,13,2,8,10,5,14,22,11,15,16,12,19,25,3,9,4,20,17,18,23];
+  it("takes the game's list in Super Career order",async()=>{
+    expect([...careerTracks].sort((a,b)=>a-b)).toEqual(gameTracks);
+    const careerLimits=careerTracks.map(t=>gameLimits[gameTracks.indexOf(t)]);
+    const {h,cs,code}=await setup(8);
+    h.sendJson({type:"settings",track:17,then:"next",rotation:careerTracks,trackLimits:careerLimits,pickOnly:[23]});
+    await snap(h,r=>r.rotation.length===25&&r.settings.track===17&&r.rotation[1]===6);
+    await runInDurableObject(env.ROOM.get(env.ROOM.idFromName(code)),async(room:any)=>{
+      expect([room.trackLimit(room.state,17),room.trackLimit(room.state,18)]).toEqual([6,8]);
+      expect(room.fittingRotation(room.state,8)).toEqual([18,0,24,1,13,2,10,5,22,11,16,12,19,3,4,20]);
+    });
+    // eight ready on Salt City MX: Salt City TD at grid lock; NEXT skips MOSH, back to Mt. Midoule FR
+    await start(h,cs,code);
+    await runInDurableObject(env.ROOM.get(env.ROOM.idFromName(code)),async(room:any)=>{
+      expect([room.state.race.track,room.state.race.slots.length,room.state.lastEvent]).toEqual([18,8,"track_switch:17:6:18"]);
+    });
+    for(let i=0;i<8;i++)cs[i].sendJson({type:"finish",ticks:600+i,place:i+1});
+    expect((await snap(h,r=>r.lastRace)).settings.track).toBe(0);
+  });
+  it("races six on Salt City MX without a switch",async()=>{
+    const {h,cs,code}=await setup(6);
+    h.sendJson({type:"settings",track:17,rotation:gameTracks,trackLimits:gameLimits,pickOnly:[23]});
+    await snap(h,r=>r.rotation.length===25&&r.settings.track===17);
+    await start(h,cs,code);
+    await runInDurableObject(env.ROOM.get(env.ROOM.idFromName(code)),async(room:any)=>{
+      expect([room.state.race.track,room.state.race.slots.length]).toEqual([17,6]);
+    });
+  });
   // Finding 128: Ready means "count me in for the next race".
   const readies=(r:any)=>r.members.map((m:any)=>m.ready);
   const allReady=async(h:Client,cs:Client[])=>{for(const c of cs)c.sendJson({type:"ready",ready:true}); return snap(h,r=>r.members.every((m:any)=>m.ready));};
@@ -393,8 +446,86 @@ describe("session rooms",()=>{
     await start(h,cs,code);
     const r=await snap(h,r=>r.phase==="racing");
     expect(new TextEncoder().encode(JSON.stringify(r)).length).toBeLessThanOrEqual(4096);
+    // the largest finishes: a scored round's (finding 204), every number at its widest
     for(let i=0;i<9;i++) {cs[i].sendJson({type:"finish",ticks:0xffffffff,place:255}); await snap(h,r=>r.members[i].finishTicks===0xffffffff);}
     const largest=await snap(cs[9],r=>r.members.filter((m:any)=>m.raceState==="finished").length===9);
     expect(new TextEncoder().encode(JSON.stringify(largest)).length).toBeLessThanOrEqual(4096);
+    cs[9].sendJson({type:"back"});
+    await snap(h,r=>r.lastRace?.id===2);
+    // a scored round (finding 204) after it, every number at its widest: the round's snapshots and
+    // its results (a member's state shows the score instead of the round's length); the arena
+    // track makes it one (finding 221)
+    h.sendJson({type:"settings",track:23}); await snap(h,r=>r.settings.track===23);
+    await start(h,cs,code);
+    await snap(h,r=>r.phase==="racing");
+    for(let i=0;i<9;i++) {cs[i].sendJson({type:"finish",ticks:0xffffffff,place:255,score:999999}); await snap(h,r=>r.members[i].score===999999);}
+    const scored=await snap(cs[9],r=>r.members.filter((m:any)=>m.raceState==="finished").length===9);
+    expect(scored.members[0].finishTicks).toBe(undefined);
+    expect(new TextEncoder().encode(JSON.stringify(scored)).length).toBeLessThanOrEqual(4096);
+    cs[9].sendJson({type:"finish",ticks:0xffffffff,place:255,score:999999});
+    const results=await snap(h,r=>r.lastRace?.id===3);
+    expect(results.lastRace.entrants.every((x:any)=>x.score===999999)).toBe(true);
+    expect(new TextEncoder().encode(JSON.stringify(results)).length).toBeLessThanOrEqual(4096);
+  });
+  it("lists the score feature in the welcome (finding 204)",async()=>{
+    const h=await Client.connect("/v1/rooms/new"); h.hello("Host",{features:["session"]});
+    expect((await h.json("welcome")).features).toContain("score");
+  });
+  it("ranks a scored round by score, highest first, ties in grid order (finding 204)",async()=>{
+    const {h,cs,code}=await setup(4);
+    h.sendJson({type:"settings",track:23}); await snap(h,r=>r.settings.track===23);  // the arena: a scored round
+    await start(h,cs,code);
+    cs[1].sendJson({type:"finish",ticks:7200,place:3,score:300});
+    const live=await snap(h,r=>r.members[1].raceState==="finished");
+    expect(live.members[1].score).toBe(300);
+    h.sendJson({type:"finish",ticks:7201,place:2,score:500});
+    cs[3].sendJson({type:"finish",ticks:7199,place:1,score:300});
+    cs[2].sendJson({type:"back"});  // gave up: no score, last
+    const r=(await snap(h,r=>r.lastRace)).lastRace;
+    expect(r.entrants.map((x:any)=>[x.name,x.score??null,x.place])).toEqual(
+      [["Host",500,2],["P1",300,3],["P3",300,4],["P2",null,5]]);
+  });
+  it("a score on an ordinary race is ignored: one finisher cannot switch the ranking (finding 221)",async()=>{
+    const {h,cs,code}=await setup(4); await start(h,cs,code);  // the default track: not the arena
+    h.sendJson({type:"finish",ticks:600,place:1});
+    cs[1].sendJson({type:"finish",ticks:900,place:2});
+    cs[2].sendJson({type:"finish",ticks:1200,place:1,score:1});
+    const live=await snap(h,r=>r.members[2].raceState==="finished");
+    expect(live.members[2].score).toBe(undefined);
+    expect(live.members[2].finishTicks).toBe(1200);
+    cs[3].sendJson({type:"finish",ticks:1500,place:4});
+    const r=(await snap(h,r=>r.lastRace)).lastRace;
+    expect(r.entrants.map((x:any)=>[x.name,x.ticks,x.score??null,x.place])).toEqual(
+      [["Host",600,null,1],["P1",900,null,2],["P2",1200,null,3],["P3",1500,null,4]]);
+  });
+  it("a scored round: finishers without a score come after those with one, by time; no scores at all ranks by time (finding 221)",async()=>{
+    const {h,cs,code}=await setup(4);
+    h.sendJson({type:"settings",track:23}); await snap(h,r=>r.settings.track===23);
+    await start(h,cs,code);
+    h.sendJson({type:"finish",ticks:7200,place:1});              // no score (a game that sends none)
+    cs[1].sendJson({type:"finish",ticks:7100,place:2});          // none, faster
+    cs[2].sendJson({type:"finish",ticks:7300,place:3,score:0});  // 0 points is still a score
+    cs[3].sendJson({type:"finish",ticks:7300,place:4,score:50});
+    const r=(await snap(h,r=>r.lastRace)).lastRace;
+    expect(r.entrants.map((x:any)=>[x.name,x.score??null])).toEqual([["P3",50],["P2",0],["P1",null],["Host",null]]);
+    // the same room, a round whose games send no score at all (a 0.7.16 game on the arena): by time
+    await start(h,cs,code);
+    h.sendJson({type:"finish",ticks:900,place:2});
+    cs[1].sendJson({type:"finish",ticks:600,place:1});
+    cs[2].sendJson({type:"back"}); cs[3].sendJson({type:"back"});
+    const r2=(await snap(h,r=>r.lastRace?.id===2)).lastRace;
+    expect(r2.entrants.map((x:any)=>[x.name,x.ticks??null,x.score??null])).toEqual(
+      [["P1",600,null],["Host",900,null],["P2",null,null],["P3",null,null]]);
+  });
+  it("refuses a finish whose score is not an unsigned 32-bit number; a race without scores ranks by time",async()=>{
+    const {h,cs,code}=await setup(2); await start(h,cs,code);
+    for (const score of [-1,1.5,"7",1000000]) {
+      h.sendJson({type:"finish",ticks:600,place:1,score});
+      expect((await h.json("error")).code).toBe("bad_value");
+    }
+    h.sendJson({type:"finish",ticks:900,place:2});
+    cs[1].sendJson({type:"finish",ticks:600,place:1});
+    const r=(await snap(h,r=>r.lastRace)).lastRace;
+    expect(r.entrants.map((x:any)=>[x.ticks,x.score??null])).toEqual([[600,null],[900,null]]);
   });
 });

@@ -26,9 +26,8 @@ This project builds on the work of others:
   [wasm-bindgen](https://github.com/rustwasm/wasm-bindgen) (MIT/Apache-2.0): the browser build.
 - [libmpeg2](https://libmpeg2.sourceforge.io) 0.5.1 (GPL-2.0-or-later): the movie decoder,
   `port/third_party/libmpeg2`, unchanged.
-- [xxHash](https://github.com/Cyan4973/xxHash) (BSD-2-Clause): the XXH64 specification, from
-  which `port/net/hash.c` is written, and `port/gs/xxhash.h` (XXH3, unchanged) for texture pack
-  names.
+- [xxHash](https://github.com/Cyan4973/xxHash) (BSD-2-Clause): `port/gs/xxhash.h` (XXH3,
+  unchanged) for texture pack names.
 - PCSX2's texture replacement names (its GSTextureCache / GSTextureReplacements hash scheme),
   reimplemented in `port/gs/texpack.c` so PCSX2 packs load unchanged.
 - [splat](https://github.com/ethteck/splat), [spimdisasm](https://github.com/Decompollaborate/spimdisasm)
@@ -48,6 +47,12 @@ This project builds on the work of others:
 
 The full notices of the code adapted into this repository are kept with it
 (`port/hle/audio_licenses/`, file headers).
+
+The touch controls' action pictures (`port/render/src/present/touch_icons.txt`, finding 229) are
+the project's own drawings, written as vector shapes by hand and released under its licence; the
+idea of touch buttons that show what they do comes from the community iOS fork
+`bagasromadon/downhill-revived-ios-newbutton` (a fork of `ribeirogustav/downhill-revived-ios`),
+whose pictures are not used.
 
 The button icons in `port/res/buttons/` (A, B, X, Y, LB, RB, LT, RT, L, R, ZL, ZR) are the
 project's own art, made for it with an image generator: no brand logos or colours, no images from

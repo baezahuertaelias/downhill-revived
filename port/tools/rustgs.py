@@ -9,6 +9,7 @@
     python3 port/tools/rustgs.py build --target aarch64-apple-darwin [--profile ...]    # macOS, on a Mac
     python port/tools/rustgs.py build --target wasm32-unknown-unknown --crate dhd_settings  # the browser's dhd.ini module
     python port/tools/rustgs.py test  --target x86_64-pc-windows-msvc [--features ...] -- --test device_smoke [filter]
+    python port/tools/rustgs.py test  --target x86_64-pc-windows-msvc -- -p dhd_net -p dhd_star   # the network crates' own
     python port/tools/rustgs.py run   --target x86_64-pc-windows-msvc --bin optrace_replay -- <args>
     python port/tools/rustgs.py check --target aarch64-apple-darwin                    # cargo check (any target)
     python port/tools/rustgs.py tree  [--target T]      # the version gate, printed
@@ -80,8 +81,8 @@ Cache
 The built library (and the wasm glue) is kept in the shared object cache (objcache.DIR, default
 DHD_DEVCACHES/dhd-objcache). The key is sha256 over rustc -vV, cargo -V (and wasm-bindgen -V for wasm),
 Cargo.lock, every Cargo.toml, rust-toolchain.toml, the crate's .cargo/config.toml, every file under
-port/render/src, the four WGSL files, the encoded flags, triple, features, profile and the resolved
-versions; paths in it are relative to the tree, so every worktree has the same key. A hit copies the
+port/render/src, the four WGSL files, the files the crates include from elsewhere (INCLUDED), the
+encoded flags, triple, features, profile and the resolved versions; paths in it are relative to the tree, so every worktree has the same key. A hit copies the
 files out instead of running cargo. `--no-cache` builds with cargo and stores nothing.
 DHD_OBJCACHE=0 turns the cache off (every build a miss).
 
@@ -113,9 +114,15 @@ NET = RENDER / 'net'   # dhd_net, the WebSocket/HTTPS client linked into the nat
 SETTINGS = RENDER / 'settings'   # dhd_settings, dhd.ini's settings, linked into it too
 PRESENCE = RENDER / 'presence'   # dhd_presence, Discord Rich Presence, linked into it too
 DISC = RENDER / 'disc'   # dhd_disc, the disc image's online check, linked into it too
-MEMBERS = (NET, SETTINGS, PRESENCE, DISC)
+STAR = RENDER / 'star'   # dhd_star, a P2P room's star (finding 186), linked into it through dhd_net
+MEMBERS = (NET, SETTINGS, PRESENCE, DISC, STAR)
 GS = ROOT / 'port' / 'gs'
 WGSL = ('raster.wgsl', 'present.wgsl', 'native.wgsl', 'native_dual.wgsl')
+# Files outside port/render the crates include (include_str!), in the cache key like the sources. The
+# key once missed port/include/version.h, so the 0.8.5 Windows and Mac libraries came from a cache
+# entry built before the version bump and reported "0.8.4" (finding 252); inputs_gate refuses a
+# build that read a file of the tree the key does not cover.
+INCLUDED = ('port/include/version.h', 'port/hle/state_bundle.h', 'port/hle/state_bundle_fixture.h')
 DEVCACHES = Path(os.environ.get('DHD_DEVCACHES') or Path.home() / 'DevCaches')  # downloaded tools and caches
 CARGO_TARGETS = Path(os.environ.get('DHD_CARGO_DIR') or
                      (DEVCACHES / 'dhd-cargo' if os.name == 'nt' else Path.home() / '.cache' / 'dhd-cargo'))
@@ -123,15 +130,21 @@ SEED = CARGO_TARGETS / 'seed'
 WEB_OUT = ROOT / 'build' / 'web' / 'renderer'
 RENDER_CRATE = 'dhd_render'
 SETTINGS_CRATE = 'dhd_settings'   # --crate: the browser's dhd.ini module (wasm32 only)
-CRATES = (RENDER_CRATE, SETTINGS_CRATE)
+STAR_CRATE = 'dhd_star'
+CRATES = (RENDER_CRATE, SETTINGS_CRATE, STAR_CRATE)
 SETTINGS_WEB_OUT = ROOT / 'build' / 'web'   # dhd_settings.wasm
 X64 = 'x86_64-pc-windows-msvc'
 WASM = 'wasm32-unknown-unknown'
 ANDROID = 'aarch64-linux-android'  # build_host64.py --target android-arm64 (finding 091)
 LINUX = 'x86_64-unknown-linux-gnu'  # build_host64.py --target linux-x64 (here, or cross-built for WSL)
 MAC = 'aarch64-apple-darwin'      # build_host64.py --target macos-arm64, on a Mac
-TARGETS = (X64, WASM, ANDROID, LINUX, MAC)   # i686 is retired
-ARCHIVE_TARGETS = (ANDROID, LINUX, MAC)   # libdhd_render.a
+IOS = 'aarch64-apple-ios'         # build_host64.py --target ios-arm64, on a Mac with Xcode (finding 224)
+IOS_SIM = 'aarch64-apple-ios-sim' # build_host64.py --target ios-sim-arm64: the iOS Simulator on Apple silicon
+IOS_MIN = '17.0'                  # the app's floor (build_host64.IOS_MIN): the C parts' deployment target
+MAC_MIN = '11.0'                  # the game's macOS floor (build_host64.MAC_MIN), the same for macOS
+MAC_X64 = 'x86_64-apple-darwin'   # build_host64.py --target macos-x64, on an Intel Mac (reference traces; not released)
+TARGETS = (X64, WASM, ANDROID, LINUX, MAC, MAC_X64, IOS, IOS_SIM)   # i686 is retired
+ARCHIVE_TARGETS = (ANDROID, LINUX, MAC, MAC_X64, IOS, IOS_SIM)   # libdhd_render.a
 CHECK_TARGETS = TARGETS
 PROFILES = ('release', 'fixloop')
 FEATURES = ('test-hooks',)       # what a caller may add; native / web are rustgs's own
@@ -239,10 +252,17 @@ def c_tools(triple):
         # target dir; cc puts these flags last, so they win
         return {'CC_' + var: str(bin_dir / 'clang.exe'), 'AR_' + var: str(bin_dir / 'llvm-ar.exe'),
                 'CFLAGS_' + var: '-g0'}
-    if triple in (LINUX, MAC) and os.name != 'nt':
+    if triple in (LINUX, MAC, MAC_X64) and os.name != 'nt':
         # the machine's own compiler (cc finds it; Apple's through xcrun, with the SDK ring needs),
-        # without debug info: ring asks for -g3, whose DWARF names the registry and the target dir
-        return {'CFLAGS_' + var: '-g0'}
+        # without debug info: ring asks for -g3, whose DWARF names the registry and the target dir;
+        # on a Mac for macOS 11, not the SDK's own version (cc's default: the link then warns that
+        # ring's objects were built for a newer macOS than the game's floor)
+        return {'CFLAGS_' + var: '-g0', **({'MACOSX_DEPLOYMENT_TARGET': MAC_MIN} if triple == MAC else {})}
+    if triple in (IOS, IOS_SIM) and sys.platform == 'darwin':
+        # Apple's clang and ar by path: a wasi-sdk on PATH can put a wasm-only clang first; the C
+        # parts (ring) for the app's iOS 17 floor, not the SDK's own version (build_host64.IOS_MIN)
+        return {'CC_' + var: '/usr/bin/clang', 'AR_' + var: '/usr/bin/ar', 'CFLAGS_' + var: '-g0',
+                'IPHONEOS_DEPLOYMENT_TARGET': IOS_MIN}
     if triple == LINUX:
         # cross-built on Windows: LLVM's clang for the target, freestanding (no Linux headers here:
         # ring's C has a mode for that), without debug info (ring asks for -g3)
@@ -332,6 +352,8 @@ def source_files():
                 files.append(('port/render/%s/%s' % (member.name, rel.as_posix()), p))
     for name in WGSL:
         files.append(('port/gs/' + name, GS / name))
+    for rel in INCLUDED:
+        files.append((rel, ROOT / rel))
     return sorted(files)
 
 
@@ -363,13 +385,24 @@ def dep_info_paths(d_file):
 def inputs_gate(d_file):
     if not Path(d_file).is_file():
         refuse('dep-info %s is missing: the compiled inputs cannot be checked' % d_file)
-    allowed = [os.path.normcase(os.path.normpath(str(p))) for p in
-               (ROOT, home('CARGO_HOME'), home('RUSTUP_HOME'), target_dir())]
+    def norm(p):
+        return os.path.normcase(os.path.normpath(str(p)))
+
+    def inside(full, d):
+        return full == d or full.startswith(d.rstrip('\\/') + os.sep)
+    root = norm(ROOT)
+    unkeyed = [norm(p) for p in (home('CARGO_HOME'), home('RUSTUP_HOME'), target_dir())]
+    keyed = {norm(p) for _, p in source_files()}
     for path in dep_info_paths(d_file):
-        full = os.path.normcase(os.path.normpath(os.path.join(str(RENDER), path)))
-        if not any(full == a or full.startswith(a.rstrip('\\/') + os.sep) for a in allowed):
+        full = norm(os.path.join(str(RENDER), path))
+        if any(inside(full, d) for d in unkeyed):
+            continue
+        if not inside(full, root):
             refuse('the build read %s, outside the tree, CARGO_HOME, RUSTUP_HOME and the target dir (an include of '
                    'a file outside the tree?)' % path)
+        if full not in keyed:
+            refuse('the build read %s, which the cache key does not cover: a change to it would not rebuild the '
+                   'library (add it to INCLUDED in port/tools/rustgs.py)' % path)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -612,6 +645,10 @@ def cache_key(triple, profile, features, flags, versions, tools, crate=RENDER_CR
     part('versions', json.dumps(versions, sort_keys=True))
     if crate != RENDER_CRATE:   # the renderer's keys stay as they were
         part('crate', crate)
+    elif triple in (IOS, IOS_SIM):
+        part('deployment target', IOS_MIN)
+    elif triple == MAC:
+        part('deployment target', MAC_MIN)
     elif triple == WASM:
         part('bindgen', ' '.join(WASM_BINDGEN_ARGS))
     return h.hexdigest()
@@ -760,14 +797,48 @@ def build_settings(profile='release', no_cache=False):
     return rep
 
 
+def build_star(profile='release'):
+    """The P2P rooms' star (finding 186), for the browser page, separate from the game and renderer memories."""
+    env = common(WASM, profile)
+    tdir = target_dir() / STAR_CRATE
+    env['CARGO_TARGET_DIR'] = str(tdir)
+    env['CARGO_ENCODED_RUSTFLAGS'] = '\x1f'.join(rustflags(WASM, SETTINGS_CRATE))
+    include_precheck()
+    cmd = ['cargo', 'rustc', '-p', STAR_CRATE, '--lib', '--crate-type', 'cdylib', *cargo_args(WASM, profile)]
+    r = run_cargo(cmd, env)
+    if r.returncode:
+        sys.stdout.write(r.stdout)
+        raise SystemExit('rustgs: star cargo failed')
+    built = tdir / WASM / profile
+    inputs_gate(built / (STAR_CRATE + '.d'))
+    out = ROOT / 'build/web/star'
+    out.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run(['wasm-bindgen', '--target', 'web', '--no-typescript', '--out-dir', str(out),
+                        '--out-name', STAR_CRATE, str(built / (STAR_CRATE + '.wasm'))], env=env, capture_output=True, text=True)
+    if r.returncode:
+        refuse('star wasm-bindgen: ' + r.stderr[-1000:])
+    lib = out / (STAR_CRATE + '_bg.wasm')
+    sysroot = Path(tool_version(['rustc', '--print', 'sysroot'], env).strip()) / 'lib/rustlib' / WASM / 'lib'
+    problems = check_rust_lib.problems(lib, trees=[ROOT], extra=[tdir], sysroot=sysroot)
+    if problems:
+        refuse('star check_rust_lib: ' + '; '.join(problems[:8]))
+    sha = check_rust_lib.sha256(lib)
+    return {'lib': str(lib), 'crate': STAR_CRATE, 'sha256': sha, 'cache': 'miss', 'key': sha,
+            'glue': [str(out / (STAR_CRATE + '.js'))]}
+
+
 def build(triple, features=(), profile='release', no_cache=False, crate=RENDER_CRATE):
     """Builds (or fetches) the library; returns the report dict. Raises Refused or SystemExit."""
     features = list(parse_features(','.join(features)))
     check_features(features)
-    if triple == MAC and sys.platform != 'darwin':
-        refuse('--target %s builds on a Mac (ring compiles its C against the macOS SDK); `check` runs here' % MAC)
+    if triple in (MAC, MAC_X64, IOS, IOS_SIM) and sys.platform != 'darwin':
+        refuse('--target %s builds on a Mac (ring compiles its C against the Apple SDK); `check` runs here' % triple)
     if crate not in CRATES:
         refuse('--crate %s: one of %s' % (crate, ', '.join(CRATES)))
+    if crate == STAR_CRATE:
+        if triple != WASM or features:
+            refuse('dhd_star is the browser P2P star (--target wasm32-unknown-unknown, no features)')
+        return build_star(profile)
     if crate == SETTINGS_CRATE:
         if triple != WASM or features:
             refuse('--crate %s: the browser\'s module only (--target %s, no features); the game links it '
@@ -886,7 +957,10 @@ def test(triple, features, profile, rest):
     seed(triple, profile, rustflags(triple), tool_version(['rustc', '-vV'], env))
     import dxc
     env['DHDR_TEST_DXC'] = str(dxc.dll('x64'))
-    cmd = ['cargo', 'test', *cargo_args(triple, profile), *feature_args(triple, features), *rest]
+    # `-- -p dhd_net -p dhd_star`: those crates' own tests; only the renderer has the features.
+    packages = [rest[i + 1] for i, arg in enumerate(rest[:-1]) if arg in ('-p', '--package')]
+    features = feature_args(triple, features) if not packages or RENDER_CRATE in packages else []
+    cmd = ['cargo', 'test', *cargo_args(triple, profile), *features, *rest]
     print('  + ' + ' '.join(cmd), flush=True)
     return subprocess.run(cmd, cwd=str(RENDER), env=env).returncode
 

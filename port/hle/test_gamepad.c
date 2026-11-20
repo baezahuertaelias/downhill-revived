@@ -4,10 +4,14 @@
        test_gamepad mapping      gamepad.c's reading of what SDL reports (no pad needed): each
                                  kind of pad's button symbols, and stick values through the
                                  dead zone (stick.h): small ones ignored, large ones passed,
-                                 the whole travel used (finding 134)
+                                 the whole travel used (finding 134); a state through
+                                 the default and other layouts (finding 157)
    Built by port/tools/test_runtime.py (run there for 0 seconds and with mapping). */
 #include "hle.h"
 #include "stick.h"
+#include "controls_table.h"
+#include "gamepad_device.h"
+#include "text_input.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,6 +26,16 @@ int touch_host_event(const union SDL_Event *e) { (void)e; return 0; }  /* touch_
 void touch_host_tick(void) {}
 double host_pacing_period(void) { return 1.0 / 60; }  /* host.c's, for keyboard.c's field timing */
 
+/* A player's pad as the game gets it: the default layout, the game's dead zone. */
+static int read_pad(int player, HostPad *p)
+{
+    GamepadRaw raw;
+    memset(p, 0, sizeof *p);
+    if (!gamepad_raw(player, &raw)) return 0;
+    gamepad_apply(&control_defaults[CONTROL_PAD1], &raw, STICK_GAME, p);
+    return 1;
+}
+
 /* the game thread's side, as the game's: SDL's own loop runs on the main thread (sdl_host_main) */
 static int run(void *arg)
 {
@@ -35,7 +49,7 @@ static int run(void *arg)
     memset(last, 0, sizeof last);
     for (int i = 0; i < 4; i++) {
         HostPad p;
-        if (!gamepad_read(i, &p)) continue;
+        if (!read_pad(i, &p)) continue;
         players++;
         printf("player %d now: buttons %04X left %d,%d right %d,%d\n", i + 1, p.buttons, p.left_x, p.left_y,
                p.right_x, p.right_y);
@@ -44,7 +58,7 @@ static int run(void *arg)
     for (DWORD end = GetTickCount() + (DWORD)(seconds * 1000); GetTickCount() < end; Sleep(10))
         for (int i = 0; i < 4; i++) {
             HostPad p;
-            if (gamepad_read(i, &p) && memcmp(&p, &last[i], sizeof p)) {
+            if (read_pad(i, &p) && memcmp(&p, &last[i], sizeof p)) {
                 printf("player %d: buttons %04X left %3d,%3d right %3d,%3d L2 %3d R2 %3d\n", i + 1, p.buttons,
                        p.left_x, p.left_y, p.right_x, p.right_y, p.pressure[10], p.pressure[11]);
                 gamepad_vibrate(i, (p.buttons & PAD_CROSS) != 0, p.pressure[11]);  /* Cross / R2 rumble */
@@ -66,11 +80,224 @@ static void check(int ok, const char *what, int got, int want)
     printf("%s %s: %d (want %d)\n", ok ? "ok  " : "FAIL", what, got, want);
 }
 
+static int id(const char *name)
+{
+    for (int i = 0; i < CONTROL_PAD_INPUTS; i++)
+        if (!strcmp(control_pad_inputs[i].name, name)) return control_pad_inputs[i].id;
+    return 0;
+}
+
+static HostPad applied(const ControlsLayout *l, const GamepadRaw *raw)
+{
+    HostPad p;
+    memset(&p, 0, sizeof p);
+    gamepad_apply(l, raw, STICK_GAME, &p);
+    return p;
+}
+
+/* Swap L1/L2 and Swap R1/R2 (finding 189): a pad that reports its L1 as the left trigger and its
+   L2 as the left shoulder plays as a DualShock 2 with Swap L1/L2 on; the trigger's pressure goes
+   with it, the other side and the other buttons stay; a binding names the place pressed. */
+static void run_shoulder_swaps(void)
+{
+    const ControlsLayout *def = &control_defaults[CONTROL_PAD1];
+    ControlsLayout l = *def;
+    l.swap_shoulders = CONTROL_SWAP_L;
+    GamepadRaw raw = {0};
+    raw.trigger[0] = 255;  /* the pad's L1, reported as its left trigger */
+    check(applied(def, &raw).buttons == PAD_L2, "unswapped: the left trigger is L2", applied(def, &raw).buttons, PAD_L2);
+    HostPad p = applied(&l, &raw);
+    check(p.buttons == PAD_L1 && p.pressure[8] == 255 && p.pressure[10] == 0, "Swap L1/L2: the left trigger is L1", p.buttons, PAD_L1);
+    raw.trigger[0] = 0, raw.buttons = 1u << id("lb");  /* the pad's L2, reported as its left shoulder */
+    p = applied(&l, &raw);
+    check(p.buttons == PAD_L2 && p.pressure[10] == 255, "Swap L1/L2: the left shoulder is L2", p.buttons, PAD_L2);
+    raw.buttons = 1u << id("rb"), raw.trigger[1] = 200;
+    p = applied(&l, &raw);
+    check(p.buttons == (PAD_R1 | PAD_R2) && p.pressure[11] == 200, "Swap L1/L2 leaves R1 and R2", p.buttons, PAD_R1 | PAD_R2);
+    raw.buttons = 0, raw.trigger[0] = 20;
+    p = applied(&l, &raw);
+    check(p.buttons == PAD_R2 && p.pressure[8] == 20, "a light left trigger: L1's pressure, no press", p.pressure[8], 20);
+    l.swap_shoulders = CONTROL_SWAP_L | CONTROL_SWAP_R;
+    raw.trigger[0] = 0, raw.trigger[1] = 200, raw.buttons = 1u << id("rb") | 1u << id("south");
+    p = applied(&l, &raw);
+    check(p.buttons == (PAD_R1 | PAD_R2 | PAD_CROSS) && p.pressure[9] == 200 && p.pressure[11] == 255,
+          "both swapped: R1 has the right trigger's pressure", p.pressure[9], 200);
+    raw.trigger[1] = 0, raw.buttons = 1u << id("rb");
+    check(applied(&l, &raw).buttons == PAD_R2, "both swapped: the right shoulder is R2", applied(&l, &raw).buttons, PAD_R2);
+    /* a binding with the swaps: Square on lt (the place the player presses: the pad's left
+       shoulder with Swap L1/L2), L2 left with nothing */
+    l.input[2][1] = (uint8_t)id("lt"), l.input[6][0] = 0;
+    raw.buttons = 1u << id("lb"), raw.trigger[1] = 0;
+    check(applied(&l, &raw).buttons == PAD_SQUARE, "a binding names the swapped place", applied(&l, &raw).buttons, PAD_SQUARE);
+    /* gamepad_place is its own inverse, and only moves the shoulders it swaps */
+    int bad = 0;
+    for (int swaps = 0; swaps < 4; swaps++) {
+        l.swap_shoulders = (uint8_t)swaps;
+        for (int i = 1; i <= CONTROL_PAD_INPUTS; i++) {
+            int place = gamepad_place(&l, i);
+            int moved = place != i;
+            int should = (swaps & CONTROL_SWAP_L && (i == id("lb") || i == id("lt"))) ||
+                         (swaps & CONTROL_SWAP_R && (i == id("rb") || i == id("rt")));
+            if (gamepad_place(&l, place) != i || moved != should) bad++;
+        }
+    }
+    check(bad == 0, "the swaps' places", bad, 0);
+}
+
+/* A state through layouts (finding 157): the default is the old mapping by position (south
+   Cross, the triggers L2 and R2 with their pressure, the sticks as they are); another layout
+   moves the buttons, swaps and inverts the sticks. */
+static void run_layouts(void)
+{
+    static const struct { const char *input; uint16_t button; } positions[] = {
+        {"south", PAD_CROSS}, {"east", PAD_CIRCLE}, {"west", PAD_SQUARE}, {"north", PAD_TRIANGLE}, {"back", PAD_SELECT},
+        {"start", PAD_START}, {"ls", PAD_L3}, {"rs", PAD_R3}, {"lb", PAD_L1}, {"rb", PAD_R1}, {"dpad_up", PAD_UP},
+        {"dpad_down", PAD_DOWN}, {"dpad_left", PAD_LEFT}, {"dpad_right", PAD_RIGHT}};
+    const ControlsLayout *def = &control_defaults[CONTROL_PAD1];
+    for (size_t i = 0; i < sizeof positions / sizeof *positions; i++) {
+        GamepadRaw raw = {0};
+        raw.buttons = 1u << id(positions[i].input);
+        HostPad p = applied(def, &raw);
+        check(p.buttons == positions[i].button, positions[i].input, p.buttons, positions[i].button);
+    }
+    GamepadRaw raw = {0};
+    raw.buttons = 1u << id("south"), raw.trigger[0] = 20, raw.trigger[1] = 200;
+    raw.axis[0] = 5000, raw.axis[1] = -5000, raw.axis[2] = 32767, raw.axis[3] = -32768;
+    HostPad p = applied(def, &raw);
+    check(p.buttons == (PAD_CROSS | PAD_R2), "a light L2 is no press, R2 is", p.buttons, PAD_CROSS | PAD_R2);
+    check(p.pressure[10] == 20 && p.pressure[11] == 200 && p.pressure[6] == 255 && p.pressure[5] == 0, "pressures", p.pressure[10], 20);
+    check(p.left_x == 147 && p.left_y == 108 && p.right_x == 255 && p.right_y == 0, "sticks", p.left_x, 147);
+    /* another layout: Cross on east, Circle on south and L2 (main, alternate), sticks swapped, the left X inverted */
+    ControlsLayout l = *def;
+    l.input[0][0] = (uint8_t)id("east"), l.input[1][0] = (uint8_t)id("south"), l.input[1][1] = (uint8_t)id("lt");
+    l.input[6][0] = 0;
+    l.swap_sticks = 1, l.invert = CONTROL_INVERT_LX;
+    p = applied(&l, &raw);
+    check(p.buttons == (PAD_CIRCLE | PAD_R2), "south is Circle", p.buttons, PAD_CIRCLE | PAD_R2);
+    check(p.pressure[5] == 255 && p.pressure[10] == 0, "Circle's pressure: the most of its inputs", p.pressure[5], 255);
+    check(p.left_x == 255 && p.left_y == 0 && p.right_x == 108 && p.right_y == 108, "swapped, left X inverted", p.right_x, 108);
+    raw.buttons = 1u << id("east"), raw.trigger[0] = 0;
+    check(applied(&l, &raw).buttons == (PAD_CROSS | PAD_R2), "east is Cross", applied(&l, &raw).buttons, PAD_CROSS | PAD_R2);
+    raw.buttons = 0, raw.trigger[0] = 100;
+    check(applied(&l, &raw).buttons == (PAD_CIRCLE | PAD_R2), "LT is Circle's alternate", applied(&l, &raw).buttons, PAD_CIRCLE | PAD_R2);
+    raw.axis[0] = 0;
+    check(applied(&l, &raw).right_x == 128, "an inverted centre stays the centre", applied(&l, &raw).right_x, 128);
+    run_shoulder_swaps();
+}
+
 /* What gamepad.c does with what SDL reports: each pad's kind (the button symbols, prompts.c) and a
    stick value through the dead zone (stick.h). The SDL build has no virtual joysticks (sdl3.py),
    so the values are given here, as SDL hands them to gamepad.c. */
+/* Synthetic descriptions: the player's log has no capability dump, so the two reported
+   non-pads model sparse Android automatic mappings, not captured hardware descriptors. */
+static void run_device_slots(void)
+{
+    unsigned presses[4] = {0};
+    int claimed = 0, got = gamepad_claim_slot(presses, 1, &claimed);
+    check(got == -1 && !claimed, "axis and trigger noise cannot claim", got, -1);
+    presses[2] = 1u << SDL_GAMEPAD_BUTTON_SOUTH;
+    got = gamepad_claim_slot(presses, 0, &claimed);
+    check(got == -1 && !claimed, "split screen preserves order", got, -1);
+    got = gamepad_claim_slot(presses, 1, &claimed);
+    check(got == 2 && claimed, "first pressed pad swaps", got, 2);
+    got = gamepad_claim_slot(presses, 1, &claimed);
+    check(got == -1, "order fixed after claim", got, -1);
+    claimed = 0, presses[0] = 1u << SDL_GAMEPAD_BUTTON_START;
+    got = gamepad_claim_slot(presses, 1, &claimed);
+    check(got == -1 && claimed, "player 1 presses first", got, -1);
+    presses[0] = 0;
+    got = gamepad_claim_slot(presses, 1, &claimed);
+    check(got == -1, "no swap after player 1 pressed", got, -1);
+    claimed = 0, presses[2] = 1u << SDL_GAMEPAD_BUTTON_LEFT_SHOULDER;
+    got = gamepad_claim_slot(presses, 1, &claimed);
+    check(got == -1 && !claimed, "other buttons do not claim", got, -1);
+    const char *automatic = "00000000000000000000000000000000,*,a:b0,";
+    const char *explicit_mapping = "00000000000000000000000000000000,Accessible pad,a:b0,";
+    unsigned face = 15, dpad = (1u << SDL_GAMEPAD_BUTTON_DPAD_UP) |
+        (1u << SDL_GAMEPAD_BUTTON_DPAD_DOWN) | (1u << SDL_GAMEPAD_BUTTON_DPAD_LEFT) |
+        (1u << SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
+    const struct { const char *name; GamepadDevice d; int slot; } devices[] = {
+        {"Xiaomi Consumer", {SDL_GAMEPAD_TYPE_STANDARD, 0, automatic, 1, 0, 15, 0, 0}, -1},
+        {"S5 Aviator Mouse", {SDL_GAMEPAD_TYPE_STANDARD, 0, automatic, 3, 3, 15, 2, 0}, -1},
+        {"Wireless Controller", {SDL_GAMEPAD_TYPE_PS4}, 0},
+        {"DualSense", {0, SDL_GAMEPAD_TYPE_PS5}, 1},
+        {"Xbox", {SDL_GAMEPAD_TYPE_XBOXONE}, 2},
+        {"generic Bluetooth", {SDL_GAMEPAD_TYPE_STANDARD, 0, automatic, face | dpad, 0}, 3},
+        {"keyboard joystick", {0, 0, NULL, 0, 0, 104, 0, 0}, -1},
+        {"mouse axes", {0, 0, NULL, 0, 0, 3, 2, 0}, -1},
+    };
+    unsigned occupied = 0;
+    for (size_t i = 0; i < sizeof devices / sizeof *devices; i++) {
+        int admitted = gamepad_device_slot(&devices[i].d, 0);
+        check((admitted >= 0) == (devices[i].slot >= 0), devices[i].name, admitted, devices[i].slot >= 0 ? 0 : -1);
+        int slot = gamepad_device_slot(&devices[i].d, occupied);
+        check(slot == devices[i].slot, devices[i].name, slot, devices[i].slot);
+        if (slot >= 0) occupied |= 1u << slot;
+    }
+    GamepadDevice generic = {SDL_GAMEPAD_TYPE_STANDARD, 0, automatic, face, 3};
+    check(gamepad_device_slot(&generic, 0) == 0, "generic left stick", gamepad_device_slot(&generic, 0), 0);
+    generic.axes = 1;
+    check(gamepad_device_slot(&generic, 0) == -1, "half a stick", gamepad_device_slot(&generic, 0), -1);
+    generic.buttons = face | dpad;
+    check(gamepad_device_slot(&generic, 5) == 1, "first vacant slot", gamepad_device_slot(&generic, 5), 1);
+    check(gamepad_device_slot(&generic, 15) == -1, "four pads already there", gamepad_device_slot(&generic, 15), -1);
+    generic.buttons = 1, generic.axes = 0, generic.mapping = explicit_mapping;
+    check(gamepad_device_slot(&generic, 0) == 0, "explicit mapping", gamepad_device_slot(&generic, 0), 0);
+    generic.mapping = NULL, generic.raw_buttons = 4, generic.hats = 1;
+    check(gamepad_device_slot(&generic, 0) == 0, "unmapped hat pad", gamepad_device_slot(&generic, 0), 0);
+    generic.hats = 0, generic.raw_axes = 2;
+    check(gamepad_device_slot(&generic, 0) == 0, "unmapped stick pad", gamepad_device_slot(&generic, 0), 0);
+    generic.joystick_type = SDL_JOYSTICK_TYPE_WHEEL;
+    check(gamepad_device_slot(&generic, 0) == -1, "wheel is not a pad", gamepad_device_slot(&generic, 0), -1);
+    generic.joystick_type = SDL_JOYSTICK_TYPE_UNKNOWN;
+    generic.raw_axes = 0;
+    check(gamepad_device_slot(&generic, 0) == -1, "buttons alone", gamepad_device_slot(&generic, 0), -1);
+    check(!gamepad_named_mapping(NULL) && !gamepad_named_mapping("bad") &&
+          !gamepad_named_mapping("guid,,") && !gamepad_named_mapping(automatic), "mapping parsing", 0, 0);
+    /* Earlier report: air mouse first, PS4 second still takes player 1. */
+    check(gamepad_device_slot(&devices[1].d, 0) == -1 && gamepad_device_slot(&devices[2].d, 0) == 0,
+          "air mouse then PS4", gamepad_device_slot(&devices[2].d, 0), 0);
+}
+
+/* Synthetic event recording: a complete Bluetooth pad, an IME/keyboard device,
+   typed keys, editor close, then pad input and a removal/re-add under a new SDL id.
+   These are descriptions, not measurements of #80's unidentified controller. */
+static void run_room_code_devices(void)
+{
+    const char *automatic = "00000000000000000000000000000000,*,a:b0,";
+    GamepadDevice pad = {SDL_GAMEPAD_TYPE_STANDARD, 0, automatic, 15, 3};
+    GamepadDevice ime = {SDL_GAMEPAD_TYPE_STANDARD, 0, automatic, 1, 0, 104, 0, 0};
+    unsigned owner[4] = {0}, pressed[4] = {1u << SDL_GAMEPAD_BUTTON_SOUTH};
+    int claimed = 0, slot = gamepad_device_slot(&pad, 0);
+    check(slot == 0, "Bluetooth pad starts as player 1", slot, 0);
+    owner[slot] = 41;
+    gamepad_claim_slot(pressed, 1, &claimed);
+    text_input_begin();
+    check(gamepad_device_slot(&ime, 1) == -1, "IME cannot claim a controller slot", gamepad_device_slot(&ime, 1), -1);
+    keyboard_key('A', 'A', 1);
+    text_input_character('A');
+    keyboard_key('A', 'A', 0);
+    text_input_end();
+    pressed[0] = 1u << SDL_GAMEPAD_BUTTON_DPAD_LEFT;
+    check(gamepad_claim_slot(pressed, 1, &claimed) == -1 && owner[0] == 41,
+          "typing and closing leave the claimed pad in player 1", owner[0], 41);
+    owner[0] = 0; // disconnect; the reconnect has a new instance id
+    slot = gamepad_device_slot(&pad, 0);
+    owner[slot] = 42;
+    check(slot == 0 && claimed, "re-enumerated pad fills player 1 without a new claim", slot, 0);
+    GamepadRaw raw = {0};
+    HostPad out = {0};
+    raw.buttons = 1u << id("dpad_left") | 1u << id("south");
+    raw.axis[0] = 32767;
+    gamepad_apply(&control_defaults[CONTROL_PAD1], &raw, STICK_GAME, &out);
+    check((out.buttons & (PAD_LEFT | PAD_CROSS)) == (PAD_LEFT | PAD_CROSS) && out.left_x == 255,
+          "post-IME pad buttons and stick survive the shared layout", out.buttons, PAD_LEFT | PAD_CROSS);
+}
+
 static int run_mapping(void)
 {
+    run_device_slots();
+    run_room_code_devices();
     static const struct { const char *name; int type, label, want; } kinds[] = {
         {"Xbox 360", SDL_GAMEPAD_TYPE_XBOX360, SDL_GAMEPAD_BUTTON_LABEL_A, PAD_KIND_XBOX},
         {"Xbox One", SDL_GAMEPAD_TYPE_XBOXONE, SDL_GAMEPAD_BUTTON_LABEL_A, PAD_KIND_XBOX},
@@ -121,6 +348,7 @@ static int run_mapping(void)
     }
     check(stick_dead_zone_of("game") == STICK_GAME && stick_dead_zone_of(NULL) == STICK_GAME &&
           stick_dead_zone_of("15") == 15 && stick_dead_zone_of("400") == 95, "settings' values", 1, 1);
+    run_layouts();
     printf("test_gamepad mapping: %s\n", failures ? "FAILED" : "ok");
     return failures != 0;
 }

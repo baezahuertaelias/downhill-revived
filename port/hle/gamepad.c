@@ -4,22 +4,32 @@
 
    SDL runs on one thread for the whole process (sdl_host.c): it creates the window, waits for
    events and calls in here to keep each player's latest state and to send the vibration the
-   game asks for. The game thread only copies states (gamepad_read). Players are slots: a pad
-   that connects takes the first free one and keeps it until it disconnects.
+   game asks for. The game thread only copies states (gamepad_raw) and turns them into the PS2
+   pad's with the player's layout (gamepad_apply). Players are slots: a pad that connects takes
+   the first free one. Before player 1 presses, a later pad can claim its slot with a
+   deliberate press in a single-player context (finding 232); after that order stays fixed.
 
-   Buttons by position, as on a DualShock 2: the bottom face button is Cross, right Circle, left
-   Square, top Triangle, whatever the labels (a Switch Pro's B is Cross). Back/Share/Create is
-   SELECT, Start/Options/+ is START, the triggers are L2/R2 (with their pressure).
+   A state is the pad's inputs by their place (GamepadRaw: port/hle/controls_table.h's ids, the
+   triggers' and the sticks' values), as SDL's gamepad API names them: the bottom face button is
+   `south` whatever its label (a Switch Pro's B). The layout (dhd.ini pad1, pad2; finding 157)
+   says which input is which PS2 button; the default is by position, as on a DualShock 2: south
+   Cross, east Circle, west Square, north Triangle, Back/Share/Create SELECT, Start/Options/+
+   START, the triggers L2/R2 (with their pressure), the shoulders L1/R1, the sticks pressed L3/R3.
    A pad SDL knows as a joystick but has no gamepad mapping for gets a default one: hat 0 the
-   d-pad, axes 0/1 the left stick, 2/3 the right stick, buttons 0-3 Cross Circle Square
-   Triangle, 4/5 L1/R1, 6/7 L2/R2, 8 SELECT, 9 START, 10/11 L3/R3. gamecontrollerdb.txt beside
-   dhd.exe (SDL's format) adds or corrects mappings; so does SDL_GAMECONTROLLERCONFIG.
-   DHD_SDL=0: no pads (the keyboard still plays).
-   The sticks go through the dead zone the player chose (stick.h, dhd.ini stick_dead_zone; finding
-   134), and each pad says which kind it is (PlayStation, Xbox, Nintendo) for the button icons
-   (port/gs/button_icons.c). */
+   d-pad, axes 0/1 the left stick, 2/3 the right stick, buttons 0-3 south east west north, 4/5 the
+   shoulders, 6/7 the triggers (fully pressed or not), 8 back, 9 start, 10/11 the sticks pressed.
+   gamecontrollerdb.txt beside dhd.exe (SDL's format) adds or corrects mappings; so does
+   SDL_GAMECONTROLLERCONFIG. DHD_SDL=0: no pads (the keyboard still plays).
+   A layout's Swap L1/L2 and Swap R1/R2 (finding 189) make a shoulder and its trigger change places
+   before the layout reads them (gamepad_place), for pads that report them the other way round: the
+   bindings name the places the player presses, and the CONTROLS page's wait goes through the swap.
+   The sticks go through the layout's Invert and Swap Sticks, then the dead zone the player chose
+   (stick.h, dhd.ini stick_dead_zone; finding 134), and each pad says which kind it is
+   (PlayStation, Xbox, Nintendo) for the button icons (port/gs/button_icons.c). */
 #include "hle.h"
-#include "stick.h"
+#include "controls_table.h"
+#include "gamepad_device.h"
+#include "../host/host_end.h"
 
 #include <SDL3/SDL.h>
 #include <stdio.h>
@@ -33,69 +43,81 @@ typedef struct {
     SDL_Gamepad *gamepad;        /* or, without a mapping, */
     SDL_Joystick *joystick;
     int light, heavy;            /* vibration sent last */
+    unsigned previous_buttons; /* SDL button places: rising edges for the first-press claim */
     Uint64 sent;                 /* when (it is sent again before SDL's duration runs out) */
 } Slot;
 
+/* IDs already named as skipped: startup enumeration and SDL's added/remapped events may
+   describe the same device several times. Retried on remapping, logged once per connection. */
+static SDL_JoystickID *skipped;
+static int skipped_count;
+
+static void forget_skipped(SDL_JoystickID id)
+{
+    for (int n = 0; n < skipped_count; n++)
+        if (skipped[n] == id) { skipped[n] = skipped[--skipped_count]; break; }
+}
+
+static void log_skipped(SDL_JoystickID id, const char *name, const GamepadDevice *d)
+{
+    for (int n = 0; n < skipped_count; n++) if (skipped[n] == id) return;
+    SDL_JoystickID *ids = SDL_realloc(skipped, (skipped_count + 1) * sizeof *ids);
+    if (!ids) return;
+    skipped = ids;
+    skipped[skipped_count++] = id;
+    fprintf(stderr, "controller: %s skipped: not a gamepad (type %d, real %d, buttons %08X, axes %02X, raw %d/%d/%d)\n",
+            name ? name : "?", d->type, d->real_type, d->buttons, d->axes, d->raw_buttons, d->raw_axes, d->hats);
+}
+
 static Slot slots[SLOTS];       /* SDL thread only */
-static HostPad latest[SLOTS];   /* under lock */
+static GamepadRaw latest[SLOTS];  /* under lock */
+/* Each slot's buttons held at any state since the game's last read (gamepad_raw_take), under lock: a
+   press shorter than one field, on a PC that runs a few fields a second, still counts for one
+   (finding 262). */
+static uint32_t held_since[SLOTS];
 static int present[SLOTS];      /* under lock */
 static SDL_AtomicInt kinds[SLOTS];  /* each slot's PAD_KIND_* (gamepad_kind) */
 static SDL_Mutex *lock;         /* made by gamepad_thread_start */
 static SDL_AtomicInt want_light[SLOTS], want_heavy[SLOTS];
+static SDL_AtomicInt multiplayer; /* published by the game thread, never read game memory on SDL */
+static int claimed;             /* player 1 has pressed; fixed order for the rest of this run */
 static SDL_AtomicInt running;   /* 1 once the pads are up, -1 if they couldn't start */
-static SDL_AtomicInt dead_zone; /* stick.h's: STICK_GAME, or a percentage (gamepad_dead_zone) */
-
-static const uint16_t pressure_order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
-                                            PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
-
-static uint8_t axis_byte(Sint16 v) { return stick_byte(v, SDL_GetAtomicInt(&dead_zone)); }
 
 static uint8_t trigger_byte(Sint16 v) { return (uint8_t)(v <= 0 ? 0 : v >> 7); }
 
-static void read_gamepad(SDL_Gamepad *g, HostPad *out)
+static void read_gamepad(SDL_Gamepad *g, GamepadRaw *raw)
 {
-    static const struct { SDL_GamepadButton b; uint16_t button; } map[] = {
-        {SDL_GAMEPAD_BUTTON_SOUTH, PAD_CROSS}, {SDL_GAMEPAD_BUTTON_EAST, PAD_CIRCLE},
-        {SDL_GAMEPAD_BUTTON_WEST, PAD_SQUARE}, {SDL_GAMEPAD_BUTTON_NORTH, PAD_TRIANGLE},
-        {SDL_GAMEPAD_BUTTON_BACK, PAD_SELECT}, {SDL_GAMEPAD_BUTTON_START, PAD_START},
-        {SDL_GAMEPAD_BUTTON_LEFT_STICK, PAD_L3}, {SDL_GAMEPAD_BUTTON_RIGHT_STICK, PAD_R3},
-        {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, PAD_L1}, {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, PAD_R1},
-        {SDL_GAMEPAD_BUTTON_DPAD_UP, PAD_UP}, {SDL_GAMEPAD_BUTTON_DPAD_DOWN, PAD_DOWN},
-        {SDL_GAMEPAD_BUTTON_DPAD_LEFT, PAD_LEFT}, {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, PAD_RIGHT},
-    };
-    for (size_t i = 0; i < sizeof map / sizeof *map; i++)
-        if (SDL_GetGamepadButton(g, map[i].b)) out->buttons |= map[i].button;
-    uint8_t l2 = trigger_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
-    uint8_t r2 = trigger_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
-    if (l2 > 30) out->buttons |= PAD_L2;
-    if (r2 > 30) out->buttons |= PAD_R2;
-    out->left_x = axis_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX));
-    out->left_y = axis_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY));
-    out->right_x = axis_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX));
-    out->right_y = axis_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY));
-    for (int i = 0; i < 12; i++)
-        out->pressure[i] = pressure_order[i] == PAD_L2 ? l2 : pressure_order[i] == PAD_R2 ? r2
-                         : out->buttons & pressure_order[i] ? 255 : 0;
+    for (int i = 0; i < CONTROL_PAD_INPUTS; i++) {
+        const ControlPadInput *in = &control_pad_inputs[i];
+        if (in->sdl >= 0 && SDL_GetGamepadButton(g, (SDL_GamepadButton)in->sdl)) raw->buttons |= 1u << in->id;
+    }
+    raw->trigger[0] = trigger_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFT_TRIGGER));
+    raw->trigger[1] = trigger_byte(SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER));
+    raw->axis[0] = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTX);
+    raw->axis[1] = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_LEFTY);
+    raw->axis[2] = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTX);
+    raw->axis[3] = SDL_GetGamepadAxis(g, SDL_GAMEPAD_AXIS_RIGHTY);
 }
 
 /* The default mapping for a joystick without a gamepad mapping (see the top). */
-static void read_joystick(SDL_Joystick *j, HostPad *out)
+static void read_joystick(SDL_Joystick *j, GamepadRaw *raw)
 {
-    static const uint16_t buttons[12] = {PAD_CROSS, PAD_CIRCLE, PAD_SQUARE, PAD_TRIANGLE, PAD_L1, PAD_R1,
-                                         PAD_L2, PAD_R2, PAD_SELECT, PAD_START, PAD_L3, PAD_R3};
+    static const char *const buttons[12] = {"south", "east", "west", "north", "lb", "rb", "lt", "rt", "back", "start", "ls", "rs"};
     int n = SDL_GetNumJoystickButtons(j), axes = SDL_GetNumJoystickAxes(j);
-    for (int i = 0; i < n && i < 12; i++)
-        if (SDL_GetJoystickButton(j, i)) out->buttons |= buttons[i];
+    for (int i = 0; i < n && i < 12; i++) {
+        if (!SDL_GetJoystickButton(j, i)) continue;
+        if (i == 6 || i == 7) raw->trigger[i - 6] = 255;
+        else raw->buttons |= 1u << gamepad_input_id(buttons[i]);
+    }
     if (SDL_GetNumJoystickHats(j) > 0) {
         Uint8 hat = SDL_GetJoystickHat(j, 0);
-        if (hat & SDL_HAT_UP) out->buttons |= PAD_UP;
-        if (hat & SDL_HAT_DOWN) out->buttons |= PAD_DOWN;
-        if (hat & SDL_HAT_LEFT) out->buttons |= PAD_LEFT;
-        if (hat & SDL_HAT_RIGHT) out->buttons |= PAD_RIGHT;
+        if (hat & SDL_HAT_UP) raw->buttons |= 1u << gamepad_input_id("dpad_up");
+        if (hat & SDL_HAT_DOWN) raw->buttons |= 1u << gamepad_input_id("dpad_down");
+        if (hat & SDL_HAT_LEFT) raw->buttons |= 1u << gamepad_input_id("dpad_left");
+        if (hat & SDL_HAT_RIGHT) raw->buttons |= 1u << gamepad_input_id("dpad_right");
     }
-    if (axes > 1) out->left_x = axis_byte(SDL_GetJoystickAxis(j, 0)), out->left_y = axis_byte(SDL_GetJoystickAxis(j, 1));
-    if (axes > 3) out->right_x = axis_byte(SDL_GetJoystickAxis(j, 2)), out->right_y = axis_byte(SDL_GetJoystickAxis(j, 3));
-    for (int i = 0; i < 12; i++) out->pressure[i] = out->buttons & pressure_order[i] ? 255 : 0;
+    if (axes > 1) raw->axis[0] = SDL_GetJoystickAxis(j, 0), raw->axis[1] = SDL_GetJoystickAxis(j, 1);
+    if (axes > 3) raw->axis[2] = SDL_GetJoystickAxis(j, 2), raw->axis[3] = SDL_GetJoystickAxis(j, 3);
 }
 
 /* What its buttons say: the kind SDL knows it as, else the bottom face button's label (a Steam
@@ -130,28 +152,57 @@ static int slot_of(SDL_JoystickID id)
 
 static void attach(SDL_JoystickID id)
 {
-    int i = slot_of(id);
-    if (i >= 0 || (i = slot_of(0)) < 0) return;  /* already there, or four are */
-    Slot *s = &slots[i];
+    if (slot_of(id) >= 0) return;
+    Slot candidate = {0};
+    Slot *s = &candidate;
+    GamepadDevice device = {0};
+    char *mapping = NULL;
     const char *name, *how;
     if (SDL_IsGamepad(id)) {
         if (!(s->gamepad = SDL_OpenGamepad(id))) return;
         name = SDL_GetGamepadName(s->gamepad);
-        how = SDL_GetGamepadStringForType(SDL_GetGamepadType(s->gamepad));
-        SDL_SetAtomicInt(&kinds[i], gamepad_kind_of(SDL_GetGamepadType(s->gamepad),
-                                                    SDL_GetGamepadButtonLabel(s->gamepad, SDL_GAMEPAD_BUTTON_SOUTH)));
+        device.type = SDL_GetGamepadType(s->gamepad);
+        device.real_type = SDL_GetRealGamepadType(s->gamepad);
+        device.mapping = mapping = SDL_GetGamepadMapping(s->gamepad);
+        /* Even an allocation failure must use mapped capabilities, never raw button counts. */
+        if (!device.mapping) device.mapping = "";
+        for (int b = 0; b < SDL_GAMEPAD_BUTTON_COUNT; b++)
+            if (SDL_GamepadHasButton(s->gamepad, (SDL_GamepadButton)b)) device.buttons |= 1u << b;
+        for (int a = 0; a < SDL_GAMEPAD_AXIS_COUNT; a++)
+            if (SDL_GamepadHasAxis(s->gamepad, (SDL_GamepadAxis)a)) device.axes |= 1u << a;
+        how = SDL_GetGamepadStringForType(device.type);
     } else {
         if (!(s->joystick = SDL_OpenJoystick(id))) return;
         name = SDL_GetJoystickName(s->joystick);
         how = "no mapping: default layout";
     }
+    SDL_Joystick *j = s->gamepad ? SDL_GetGamepadJoystick(s->gamepad) : s->joystick;
+    device.joystick_type = SDL_GetJoystickType(j);
+    device.raw_buttons = SDL_GetNumJoystickButtons(j);
+    device.raw_axes = SDL_GetNumJoystickAxes(j);
+    device.hats = SDL_GetNumJoystickHats(j);
+    unsigned occupied = 0;
+    for (int n = 0; n < SLOTS; n++) if (slots[n].id) occupied |= 1u << n;
+    int i = gamepad_device_slot(&device, occupied);
+    if (i < 0) {
+        if (gamepad_device_slot(&device, 0) < 0) log_skipped(id, name, &device);
+        SDL_free(mapping);
+        if (s->gamepad) SDL_CloseGamepad(s->gamepad);
+        if (s->joystick) SDL_CloseJoystick(s->joystick);
+        return;
+    }
+    SDL_free(mapping);
+    slots[i] = candidate;
+    s = &slots[i];
+    if (s->gamepad) SDL_SetAtomicInt(&kinds[i], gamepad_kind_of(device.type,
+                                      SDL_GetGamepadButtonLabel(s->gamepad, SDL_GAMEPAD_BUTTON_SOUTH)));
     s->id = id;
     s->light = s->heavy = 0;
     if (s->gamepad) SDL_SetGamepadPlayerIndex(s->gamepad, i);
     SDL_PropertiesID props = s->gamepad ? SDL_GetGamepadProperties(s->gamepad) : SDL_GetJoystickProperties(s->joystick);
     int motors = SDL_GetBooleanProperty(props, SDL_PROP_JOYSTICK_CAP_RUMBLE_BOOLEAN, false);
-    fprintf(stderr, "controller: %s (%s%s) is player %d\n", name ? name : "?", how ? how : "gamepad",
-            motors ? ", vibration" : "", i + 1);
+    fprintf(stderr, "controller: %s (%s%s) is player %d [SDL id=%u]\n", name ? name : "?", how ? how : "gamepad",
+            motors ? ", vibration" : "", i + 1, (unsigned)id);
 }
 
 static void detach(SDL_JoystickID id)
@@ -165,14 +216,15 @@ static void detach(SDL_JoystickID id)
     present[i] = 0;
     SDL_SetAtomicInt(&kinds[i], PAD_KIND_NONE);
     SDL_UnlockMutex(lock);
-    fprintf(stderr, "controller: player %d disconnected\n", i + 1);
+    fprintf(stderr, "controller: player %d disconnected [SDL id=%u]\n", i + 1, (unsigned)id);
 }
 
 /* A joystick that turns out to be a gamepad (a mapping added) is opened again as one. */
 static void remap(SDL_JoystickID id)
 {
     int i = slot_of(id);
-    if (i >= 0 && slots[i].joystick && SDL_IsGamepad(id)) {
+    if (i < 0) { attach(id); return; }  /* a skipped device may gain an explicit mapping */
+    if (slots[i].joystick && SDL_IsGamepad(id)) {
         detach(id);
         attach(id);
     }
@@ -208,7 +260,6 @@ int gamepad_thread_start(void)
         return 0;
     }
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");  /* the window may not have the focus */
-    gamepad_dead_zone(stick_dead_zone_of(getenv("DHD_STICK_DEAD_ZONE")));
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "controller: SDL didn't start (%s); no controllers (the keyboard still plays)\n", SDL_GetError());
         SDL_SetAtomicInt(&running, -1);
@@ -229,7 +280,7 @@ int gamepad_thread_start(void)
     SDL_free(ids);
     SDL_SetAtomicInt(&running, 1);
     gamepad_thread_update();  /* the pads there at the start have a state */
-    if (!registered++) atexit(stop_vibration);
+    if (!registered++) host_end_add(HOST_END_DEVICES, "vibration", stop_vibration);
     return 1;
 }
 
@@ -238,28 +289,60 @@ void gamepad_device(int change, unsigned id)
 {
     if (SDL_GetAtomicInt(&running) != 1) return;
     if (change == PADDEV_ADDED) attach(id);
-    else if (change == PADDEV_REMOVED) detach(id);
+    else if (change == PADDEV_REMOVED) { forget_skipped(id); detach(id); }
     else if (change == PADDEV_REMAPPED) remap(id);
+    fprintf(stderr, "controller: device %s SDL id=%u; players=%u/%u/%u/%u claimed=%d\n",
+            change == PADDEV_ADDED ? "added" : change == PADDEV_REMOVED ? "removed" : "remapped", id,
+            (unsigned)slots[0].id, (unsigned)slots[1].id, (unsigned)slots[2].id, (unsigned)slots[3].id, claimed);
 }
 
 /* Every pass of the SDL thread: the pads' states for the game, and the vibration asked for. */
 void gamepad_thread_update(void)
 {
     if (SDL_GetAtomicInt(&running) != 1) return;
+    GamepadRaw raw[SLOTS] = {0};
+    unsigned pressed[SLOTS] = {0};
     for (int i = 0; i < SLOTS; i++) {
         Slot *s = &slots[i];
-        HostPad p;
         if (!s->id) continue;
-        memset(&p, 0, sizeof p);
-        p.left_x = p.left_y = p.right_x = p.right_y = 128;
-        if (s->gamepad) read_gamepad(s->gamepad, &p);
-        else read_joystick(s->joystick, &p);
-        SDL_LockMutex(lock);
-        latest[i] = p;
-        present[i] = 1;
-        SDL_UnlockMutex(lock);
-        rumble(s, SDL_GetAtomicInt(&want_light[i]), SDL_GetAtomicInt(&want_heavy[i]));
+        if (s->gamepad) read_gamepad(s->gamepad, &raw[i]);
+        else read_joystick(s->joystick, &raw[i]);
+        unsigned buttons = 0;
+        for (int b = 0; b < CONTROL_PAD_INPUTS; b++) {
+            const ControlPadInput *in = &control_pad_inputs[b];
+            if (in->sdl >= 0 && (raw[i].buttons & (1u << in->id))) buttons |= 1u << in->sdl;
+        }
+        pressed[i] = buttons & ~s->previous_buttons;
+        s->previous_buttons = buttons;
     }
+    /* No controller can take over an empty player 1 slot; normal attach already fills it. */
+    int was_claimed = claimed;
+    int swap = slots[0].id ? gamepad_claim_slot(pressed, !SDL_GetAtomicInt(&multiplayer), &claimed) : -1;
+    SDL_LockMutex(lock);
+    if (swap > 0) {
+        Slot old = slots[0]; slots[0] = slots[swap]; slots[swap] = old;
+        GamepadRaw old_raw = raw[0]; raw[0] = raw[swap]; raw[swap] = old_raw;
+        uint32_t old_held = held_since[0]; held_since[0] = held_since[swap]; held_since[swap] = old_held;
+        int kind = SDL_GetAtomicInt(&kinds[0]);
+        SDL_SetAtomicInt(&kinds[0], SDL_GetAtomicInt(&kinds[swap]));
+        SDL_SetAtomicInt(&kinds[swap], kind);
+        if (slots[0].gamepad) SDL_SetGamepadPlayerIndex(slots[0].gamepad, 0);
+        if (slots[swap].gamepad) SDL_SetGamepadPlayerIndex(slots[swap].gamepad, swap);
+        const char *name = slots[0].gamepad ? SDL_GetGamepadName(slots[0].gamepad) : SDL_GetJoystickName(slots[0].joystick);
+        const char *other = slots[swap].gamepad ? SDL_GetGamepadName(slots[swap].gamepad) : SDL_GetJoystickName(slots[swap].joystick);
+        fprintf(stderr, "controller: %s pressed first: now player 1 (%s is player %d)\n",
+                name ? name : "?", other ? other : "?", swap + 1);
+    }
+    for (int i = 0; i < SLOTS; i++) {
+        latest[i] = raw[i];
+        held_since[i] |= raw[i].buttons;
+        present[i] = slots[i].id != 0;
+    }
+    SDL_UnlockMutex(lock);
+    if (!was_claimed && claimed)
+        fprintf(stderr, "controller: player 1 claimed [SDL id=%u]\n", (unsigned)slots[0].id);
+    for (int i = 0; i < SLOTS; i++)
+        if (slots[i].id) rumble(&slots[i], SDL_GetAtomicInt(&want_light[i]), SDL_GetAtomicInt(&want_heavy[i]));
 }
 
 /* At exit: no pad left vibrating (the motors keep the last command when the game ends mid-rumble). */
@@ -283,26 +366,30 @@ int gamepad_start(void)
     return SDL_GetAtomicInt(&running) > 0;
 }
 
-int gamepad_read(int player, HostPad *out)
+void gamepad_set_multiplayer(int local_multiplayer)
+{
+    SDL_SetAtomicInt(&multiplayer, local_multiplayer != 0);
+}
+
+static int read_raw(int player, GamepadRaw *out, int take)
 {
     if (player < 0 || player >= SLOTS || !gamepad_start()) return 0;
     SDL_LockMutex(lock);
     int ok = present[player];
     if (ok) *out = latest[player];
+    if (ok && take) out->buttons |= held_since[player];
+    if (take) held_since[player] = 0;
     SDL_UnlockMutex(lock);
     return ok;
 }
 
+int gamepad_raw(int player, GamepadRaw *out) { return read_raw(player, out, 0); }
+
+int gamepad_raw_take(int player, GamepadRaw *out) { return read_raw(player, out, 1); }
+
 int gamepad_kind(int player)
 {
     return player >= 0 && player < SLOTS ? SDL_GetAtomicInt(&kinds[player]) : PAD_KIND_NONE;
-}
-
-/* The sticks' dead zone from now on (stick.h: STICK_GAME or a percentage); host.c follows
-   DHD_STICK_DEAD_ZONE, which PC SETTINGS changes while the game runs. */
-void gamepad_dead_zone(int dead)
-{
-    SDL_SetAtomicInt(&dead_zone, dead);
 }
 
 void gamepad_vibrate(int player, int light, int heavy)

@@ -19,6 +19,7 @@
 #include <mach/mach_time.h>
 #include <mach/thread_policy.h>
 #include <sys/sysctl.h>     /* the system's names (host_os_system) */
+#include <TargetConditionals.h>  /* TARGET_OS_IPHONE: the iOS app (finding 224) */
 #else
 #include <elf.h>
 #endif
@@ -57,6 +58,14 @@ unsigned host_exe_path(char *out, unsigned size)
     int k = snprintf(out, size, "%s", android_exe_path());
     return k > 0 && (unsigned)k < size ? (unsigned)k : 0;
 #elif defined(__APPLE__)
+#if TARGET_OS_IPHONE
+    /* iOS: the app's Documents folder stands for the executable's (dhd.ini, saves, dhd.log) */
+    const char *ios_documents_dir(void) __attribute__((weak));
+    if (ios_documents_dir) {
+        int k = snprintf(out, size, "%sdhd64", ios_documents_dir());
+        return k > 0 && (unsigned)k < size ? (unsigned)k : 0;
+    }
+#endif
     char given[4096], real[PATH_MAX];
     uint32_t length = sizeof given;
     int k = _NSGetExecutablePath(given, &length) == 0 && realpath(given, real)
@@ -175,6 +184,9 @@ int host_mem_protect(uint32_t at, uint32_t size, int protection)
    address). Only the installing thread is guarded. The module guards 4 KiB
    pages; where the OS page is larger, a fault anywhere in it is offered for
    each 4 KiB page it holds. */
+/* port/host64/guest_memory.c: the guest address of a host address in its reservation (each part's
+   own base on iOS, finding 267) */
+int host64_memory_guest(uintptr_t host, uint64_t *at);
 static _Thread_local int (*guard_on_fault)(uint32_t address);
 static _Thread_local int guard_armed;
 static struct sigaction guard_old_segv, guard_old_bus;
@@ -185,8 +197,9 @@ static void guard_fault(int sig, siginfo_t *info, void *ctx)
 {
     uintptr_t host = (uintptr_t)info->si_addr;
     (void)ctx;
-    if (guard_armed && guard_on_fault && host >= guest_base && host - guest_base < 0x100000000ull) {
-        uint32_t at = (uint32_t)(host - guest_base), page = (uint32_t)os_page();
+    uint64_t guest = 0;
+    if (guard_armed && guard_on_fault && host64_memory_guest(host, &guest) && guest < 0x100000000ull) {
+        uint32_t at = (uint32_t)guest, page = (uint32_t)os_page();
         if (guard_on_fault(at)) return; /* retry the access */
         for (uint32_t sub = at & ~(page - 1); page > 4096 && sub < (at & ~(page - 1)) + page; sub += 4096)
             if (sub != (at & ~4095u) && guard_on_fault(sub)) return;
@@ -293,34 +306,6 @@ void host_code_range(uintptr_t *lo, uintptr_t *hi)
     }
 }
 
-/* The host process's memory regions (state_trace.c, opt-in: DHD_STATE_NORM=host). */
-void host_memory_regions(void (*visit)(uintptr_t base, uintptr_t end, int host_memory))
-{
-    char self[4096], line[1024];
-    ssize_t n = readlink("/proc/self/exe", self, sizeof self - 1);
-    FILE *maps;
-    if (n > 0) self[n] = 0;
-    else self[0] = 0;
-    maps = fopen("/proc/self/maps", "r");
-    if (!maps) return;
-    while (fgets(line, sizeof line, maps)) {
-        unsigned long lo, hi;
-        char perms[8], path[512];
-        int fields;
-        path[0] = 0;
-        fields = sscanf(line, "%lx-%lx %7s %*s %*s %*s %511[^\n]", &lo, &hi, perms, path);
-        if (fields < 3 || hi <= 0x10000) continue;
-        if (lo < 0x10000) lo = 0x10000;
-        if (hi <= lo) continue;
-        /* The program's own image is not host memory (its AllocationBase on
-           Windows); every other mapping is (anonymous, shared, special and
-           other images alike). */
-        int self_image = path[0] && !strcmp(path, self);
-        visit((uintptr_t)lo, (uintptr_t)hi, !self_image);
-    }
-    fclose(maps);
-}
-
 /* ---- the heartbeat (autopad.c): a host thread calls beat() every 30 s ---- */
 static void (*heartbeat_beat)(void);
 
@@ -394,7 +379,7 @@ static void text_value(const char *path, const char *key, char sep, char *out, s
 }
 #endif
 
-/* macOS: its product version and the CPU's brand string by sysctl; Android: the release, the
+/* macOS and iOS: the product version and the CPU's brand string by sysctl; Android: the release, the
    phone and its chip from the system properties; Linux: os-release's name, the kernel and
    /proc/cpuinfo's model name. */
 void host_os_system(char *out, unsigned size)
@@ -406,7 +391,13 @@ void host_os_system(char *out, unsigned size)
     char version[32] = "";
     size_t n = sizeof version;
     sysctlbyname("kern.osproductversion", version, &n, NULL, 0);
+#if TARGET_OS_SIMULATOR
+    snprintf(os, sizeof os, "iOS Simulator %s", version);
+#elif TARGET_OS_IPHONE  /* the product version is the iPhone's or iPad's own (finding 258) */
+    snprintf(os, sizeof os, "%s %s", strncmp(u.machine, "iPad", 4) ? "iOS" : "iPadOS", version);
+#else
     snprintf(os, sizeof os, "macOS %s", version);
+#endif
     n = sizeof cpu;
     if (sysctlbyname("machdep.cpu.brand_string", cpu, &n, NULL, 0)) cpu[0] = 0;
 #elif defined(__ANDROID__)
@@ -414,7 +405,8 @@ void host_os_system(char *out, unsigned size)
     __system_property_get("ro.build.version.release", release);
     __system_property_get("ro.product.manufacturer", maker);
     __system_property_get("ro.product.model", model);
-    __system_property_get("ro.soc.model", cpu);
+    if (__system_property_get("ro.soc.model", cpu) <= 0)  /* Android 12+; before: the board platform */
+        __system_property_get("ro.board.platform", cpu);
     snprintf(os, sizeof os, "Android %s, %s %s", release, maker, model);
 #else
     char name[96];

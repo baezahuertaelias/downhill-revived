@@ -46,7 +46,18 @@ struct Native {
     tex_offset: vec2<i32>, tex_size: vec2<u32>,
     wrap: vec4<u32>,
     region: vec4<u32>,
+    // A mesh draw's (flag 4096, native_mesh_vertex; zero for every other draw): the draw offset
+    // (GS 12.4 units), the largest Z, the Z scale; the loop's guard band (x, y and w offsets, the
+    // bound); its fog (A, B, max).
+    mesh_offset: vec4<f32>,
+    mesh_clip: vec4<f32>,
+    mesh_fog: vec4<f32>,
 }
+// The draw's constants: a uniform block at group 0's dynamic offset (render.rs binds it again only
+// when a draw's constants differ from the last one's). Not an array indexed per draw (finding 172's
+// step): a pixel reading its constants through a varying index cannot keep them in uniform
+// registers, which on a Mali-G52 cost the commonest scene shader 15 % more arithmetic and two
+// loads a pixel, and the vertex stage 5 loads a vertex (finding 195).
 @group(0) @binding(0) var<uniform> nat: Native;
 @group(1) @binding(0) var native_texture: texture_2d<f32>;
 @group(1) @binding(1) var native_replace_sampler: sampler;   // texture packs (flag 2048)
@@ -88,14 +99,61 @@ struct Varyings {
 fn native_vertex(@location(0) position_in: vec3<f32>, @location(1) stqf: vec4<f32>,
                  @location(2) color: vec4<u32>) -> Varyings {
     var o: Varyings;
-    var position = position_in;
-    // Upscaled sprites (flag 1024) cover whole GS pixels, as at 1x (raster.hlsl native_vertex).
-    if ((nat.flags & 1024u) != 0u && (nat.scale & 255u) > 1u) {
-        position = vec3<f32>(ceil(position.xy - 0.5), position.z);
-    }
+    // Upscaled sprites sampled by whole texels (copies, nearest-magnified sprites) cover whole
+    // GS pixels, as at 1x; bilinear sprites keep sub-GS-pixel corners and smooth UVs, since
+    // snapping those collapses a few-pixel billboard (grass, canopies, dirt) to one flat
+    // sample per GS pixel (finding 196). A select and `&`, not a branch: a vertex stage with
+    // no-perspective outputs has none (finding 260, native_spirv checks it).
+    let snap = ((nat.flags & 1024u) != 0u) & ((nat.flags & 32u) == 0u) & ((nat.scale & 255u) > 1u);
+    let position = select(position_in, vec3<f32>(ceil(position_in.xy - 0.5), position_in.z), snap);
     o.position = vec4<f32>(position.xy / nat.target_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), position.z, 1.0);
     o.stqf = stqf;
     o.color = vec4<f32>(color);
+    return o;
+}
+
+// A translated VU1 world-mesh batch (native_core.inc's native_mesh, port/hle/vu1_mesh.inc; findings
+// 164, 249): VU1 loop 0170's maths on the batch's vertex, from its matrix product on. clip: the
+// clip-space position (the loop's matrix times the pool position, made on the VU thread in the
+// loop's own order); uvq: u, v (the object's UV offset already added) and the Q factor; color: the
+// colour the loop kicks (scaled or lit, clamped, truncated: vu1_mesh.inc).
+// q = 1 / w; XYZ = clip.xyz q; fog = clamp(A + B q, 0, max); STQ = (u, v, uz) q. A vertex inside
+// the program's guard band (its CLIP against the draw's guard band: x, y and the near bound on w)
+// is placed as the GS would place the kicked one, at FTOI4's 1/16 pixel and Z's integer, through
+// native_vertex's mapping. A vertex off the guard band sideways goes out as the plain projection;
+// both forms homogeneous (times w), so the GPU clips the triangles where the VU's clipper would
+// cut them into fans. No triangle has a vertex below the near bound: the VU thread clips those as
+// the program's clipper does and sends the fans' vertices (vu1_mesh.inc, finding 253).
+//
+// The GS interpolates STQ, colour and fog linearly in screen space, and so does the GPU: the mesh's
+// varyings are native_vertex's (Varyings, no perspective), so its pixels run the same fragment
+// stages as a draw the VU kicked. That needs w > 0 at every vertex a triangle uses, which
+// vu1_mesh.inc's near-bound test gives.
+@vertex
+fn native_mesh_vertex(@location(0) clip: vec4<f32>, @location(1) uvq: vec3<f32>,
+                      @location(2) color: vec4<u32>) -> Varyings {
+    var o: Varyings;
+    let q = 1.0 / clip.w;
+    let screen = clip.xyz * q;
+    let fog = max(min(nat.mesh_fog.x + nat.mesh_fog.y * q, nat.mesh_fog.z), 0.0);
+    o.stqf = vec4<f32>(uvq * q, floor(fog) / 255.0);
+    o.color = vec4<f32>(color);
+    let k = nat.mesh_clip;
+    let bound = abs(k.w);
+    let inside = (clip.w > 0.0) & (abs(screen.x + k.x) <= bound) & (abs(screen.y + k.y) <= bound) & (clip.w + k.z >= -bound);
+    // Both forms are made and one is chosen, and the tests above are `&`, not the short-circuit
+    // `&&` (naga writes that as branches): no branch in this stage. Mali-G52's r26 compiler crashes
+    // on a branch placing the position in a vertex stage with no-perspective outputs (finding 260).
+    let gs_xy = trunc(screen.xy * 16.0);
+    let xy = (gs_xy - nat.mesh_offset.xy) * 0.0625 + 0.5;
+    let z = min(max(trunc(screen.z), 0.0), nat.mesh_offset.z);
+    let placed = vec4<f32>(xy / nat.target_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), z * nat.mesh_offset.w, 1.0)
+                 * clip.w;
+    // (x / w - offset / 16 + 0.5) / size * 2 - 1, times w; y likewise, flipped; z / w * scale, times w
+    let at = clip.xy - (nat.mesh_offset.xy * 0.0625 - 0.5) * clip.w;
+    let projected = vec4<f32>(at / nat.target_size * vec2<f32>(2.0, -2.0) + vec2<f32>(-clip.w, clip.w),
+                              clip.z * nat.mesh_offset.w, clip.w);
+    o.position = select(projected, placed, inside);
     return o;
 }
 
@@ -198,7 +256,7 @@ fn fetch(i: Varyings, uv_in: vec2<f32>, across: vec2<f32>, down: vec2<f32>) -> v
     else {
         let T = nat.scale & 255u;
         let E = select(nat.scale >> 16u & 255u, native_texel_scale, native_texel_scale != 0u);
-        if ((flags & 1024u) != 0u && T > 1u && E == 1u) {
+        if ((flags & 1024u) != 0u && (flags & 32u) == 0u && T > 1u && E == 1u) {
             let corner = floor(i.position.xy / f32(T)) * f32(T) - i.position.xy;
             uv += across * corner.x + down * corner.y;
         }
@@ -221,7 +279,7 @@ fn fetch_u(i: Varyings, uv_in: vec2<f32>, across: vec2<f32>, down: vec2<f32>) ->
     var t: vec4<f32>;
     let T = nat.scale & 255u;
     let E = select(nat.scale >> 16u & 255u, native_texel_scale, native_texel_scale != 0u);
-    if ((flags & 1024u) != 0u && T > 1u && E == 1u) {
+    if ((flags & 1024u) != 0u && (flags & 32u) == 0u && T > 1u && E == 1u) {
         let corner = floor(i.position.xy / f32(T)) * f32(T) - i.position.xy;
         uv += across * corner.x + down * corner.y;
     }
@@ -603,7 +661,10 @@ fn native_convert(@builtin(global_invocation_id) tid: vec3<u32>) {
 // (source: its uv rectangle, a movie's rows only) down to a small texture, then present_fill draws
 // that over the whole window, the content's rectangle scaled to cover it (cover, window pixels),
 // before present_pixel draws the sharp picture in the middle.
-struct Present { rect: vec4<f32>, cover: vec4<f32>, source: vec4<f32>, }
+// present_direct's (finding 247): map is the picture's size in display pixels, then its origin in
+// present_source, its display surface (texels); mode.x is 1 when the display doubles the
+// surface's rows, mode.zw one over the surface texture's size.
+struct Present { rect: vec4<f32>, cover: vec4<f32>, source: vec4<f32>, map: vec4<f32>, mode: vec4<f32>, }
 @group(0) @binding(0) var<uniform> present: Present;
 @group(1) @binding(0) var present_source: texture_2d<f32>;
 @group(1) @binding(1) var present_sampler: sampler;
@@ -615,6 +676,29 @@ const FILL_SHADE: f32 = 0.45;
 @fragment
 fn present_pixel(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
     let uv = (position.xy - present.rect.xy) / present.rect.zw;
+    return vec4<f32>(textureSampleLevel(present_source, present_sampler, uv, 0.0).rgb, 1.0);
+}
+
+// present_pixel for a picture that lies as one rectangle in its display surface (scanout.rs's
+// plain_rect): the same filtered sample, taken from the surface, so the scanout's copy of the
+// picture into the display texture is not made (finding 247). p is the pixel's place in the
+// picture in display pixels, held to the outer texels' centres as the display texture's clamped
+// edges hold it. An interlaced display shows each surface row twice: display rows 2k and 2k + 1
+// are surface row k. A sample between display rows 2k and 2k + 1 is that row itself (its centre:
+// weight 0), one between rows 2k + 1 and 2k + 2 mixes surface rows k and k + 1 with the same
+// weight, so the sampler filters the surface as it filtered the doubled picture.
+@fragment
+fn present_direct(@builtin(position) position: vec4<f32>) -> @location(0) vec4<f32> {
+    let size = present.map.xy;
+    let p = clamp((position.xy - present.rect.xy) / present.rect.zw * size, vec2<f32>(0.5), size - 0.5);
+    var y = p.y;
+    if (present.mode.x != 0.0) {
+        let t = p.y - 0.5;
+        let row = floor(t);
+        let pair = floor(row * 0.5);
+        y = pair + 0.5 + select(0.0, t - row, row - pair * 2.0 == 1.0);
+    }
+    let uv = (present.map.zw + vec2<f32>(p.x, y)) * present.mode.zw;
     return vec4<f32>(textureSampleLevel(present_source, present_sampler, uv, 0.0).rgb, 1.0);
 }
 

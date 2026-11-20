@@ -25,6 +25,7 @@ static inline void fp_set_control(unsigned v) { if (v != fp_control()) __asm__ v
 #endif
 #include "hle.h"
 #include "../gs/gs.h"
+#include "../host/host_end.h"
 #include "graphics_profile.h"
 
 #ifdef GRAPHICS_QUEUE_TEST
@@ -154,6 +155,11 @@ static void idle_wait(_Atomic uint32_t *p, uint32_t at, _Atomic uint32_t *flag, 
     if (!budget && spin_seconds > 0) spin_returned = host_wall_seconds();
 #endif
 }
+
+/* present.c (finding 236): a phone's app left the screen while the game thread waits here for
+   the drawing; the hook waits out the absence (the renderer is held, so this wait would not end). */
+void (*graphics_away_wait)(const char *where);
+static inline void away_turn(const char *where) { if (graphics_away_wait) graphics_away_wait(where); }
 
 /* Retired-side waits share one auto-reset event; the short timeout covers two waiters. */
 /* Wait on the same observation that failed the caller's predicate. A fresh load here
@@ -286,8 +292,10 @@ void graphics_wait(void)
     int64_t start = tl_begin();
     int pending = (int32_t)(position(&consumed) - target) < 0;
     uint32_t observed;
-    while ((int32_t)((observed = position(&consumed)) - target) < 0)
+    while ((int32_t)((observed = position(&consumed)) - target) < 0) {
+        away_turn("a wait for the drawing");
         wait_retired(observed);
+    }
     tl_add(TL_EE_VU, start);
 #if !defined(GRAPHICS_QUEUE_TEST) || defined(GS_QUEUE_TEST)
     int64_t gs_start = tl_begin();
@@ -349,7 +357,7 @@ static void initialize(void)
 #endif
         hle_log("graphics: worker unavailable, using inline execution\n");
     } else {
-        atexit(graphics_shutdown);
+        host_end_add(HOST_END_WORKERS, "graphics queues", graphics_shutdown);
         hle_log("graphics: VIF1/GIF worker enabled\n");
     }
 }
@@ -376,8 +384,10 @@ static void feed_words(int unit, const uint32_t *words, uint32_t count)
         if (RING_BYTES - (at - position(&consumed)) < bytes + wrap) {
             int64_t full = tl_begin();
             uint32_t observed;
-            while (RING_BYTES - (at - (observed = position(&consumed))) < bytes + wrap)
+            while (RING_BYTES - (at - (observed = position(&consumed))) < bytes + wrap) {
+                away_turn("a full drawing queue");
                 wait_retired(observed);
+            }
             tl_add(TL_EE_FULL, full);
         }
         if (wrap) {
@@ -429,6 +439,7 @@ static void wait_mark(uint32_t sequence)
 {
     uint32_t done;
     while ((int32_t)((done = position(&marks_done)) - sequence) < 0) {
+        away_turn("a wait for an earlier picture");
         if (gs_worker) idle_wait(&marks_done, done, &gs_waiting, gs_retired, 1, NULL);
         else idle_wait(&marks_done, done, &waiting, retired, 1, NULL);
     }

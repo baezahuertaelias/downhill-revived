@@ -44,10 +44,11 @@ use std::mem::{offset_of, size_of, MaybeUninit};
 // ------------------------------------------------------------------------------------ format
 
 const MAGIC: &[u8; 8] = b"DHDNTRC\0";
-const VERSION: u32 = 1;
+/// 2 since the command head is `DhdrCommand`'s current one (NTRACE.md, "Versions").
+const VERSION: u32 = 2;
 const NONE: u32 = 0xFFFF_FFFF;
-/// `DhdrCommand`'s bytes before its pointers.
-const COMMAND_HEAD: usize = 168;
+/// `DhdrCommand`'s bytes before its pointers, taken from the struct itself (abi.rs pins its layout).
+const COMMAND_HEAD: usize = offset_of!(DhdrCommand, texture);
 const HEADER_FIXED: usize = 88;
 
 const T_TEXTURE: u32 = 1;
@@ -67,7 +68,7 @@ const SURFACE_BYTES: usize = 40 + 4;
 const CONVERT_BYTES: usize = 8 + 1632 + 4;
 
 const _: () = {
-    assert!(offset_of!(DhdrCommand, texture) == COMMAND_HEAD);
+    assert!(size_of::<DhdrCommand>() == COMMAND_HEAD + 3 * size_of::<*const u8>(), "three pointers end DhdrCommand");
     assert!(size_of::<DhdrSurfaceInfo>() == 40);
     assert!(size_of::<DhdrVertex>() == 32);
     assert!(size_of::<DhdrConvertConstants>() == 1632);
@@ -109,7 +110,7 @@ fn pod_bytes<T: Pod>(v: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(v as *const T as *const u8, size_of::<T>()) }
 }
 
-/// A command from its 168 head bytes; its pointers NULL.
+/// A command from its `COMMAND_HEAD` head bytes; its pointers NULL.
 fn command_from_head(b: &[u8]) -> DhdrCommand {
     assert_eq!(b.len(), COMMAND_HEAD);
     let mut k = MaybeUninit::<DhdrCommand>::zeroed();
@@ -122,7 +123,7 @@ fn command_from_head(b: &[u8]) -> DhdrCommand {
 }
 
 fn command_head(k: &DhdrCommand) -> &[u8] {
-    // SAFETY: the first 168 bytes are the pointer-free head, with no implicit padding (abi.rs).
+    // SAFETY: the first COMMAND_HEAD bytes are the pointer-free head, with no implicit padding (abi.rs).
     unsafe { std::slice::from_raw_parts(k as *const DhdrCommand as *const u8, COMMAND_HEAD) }
 }
 
@@ -712,7 +713,7 @@ impl<R: Read + Seek> Trace<R> {
                 return Ok(t);
             }
             if !(T_TEXTURE..=T_RESULT).contains(&tag) {
-                return invalid(pos, format!("tag {tag} is not valid in version 1"));
+                return invalid(pos, format!("tag {tag} is not valid in version {VERSION}"));
             }
             let padded = (bytes as u64 + 3) & !3;
             if pos + 8 + padded > len {
@@ -962,33 +963,6 @@ trait Backend {
     fn dual_source(&self) -> bool;
     /// Draws one picture on its own: fresh renderer state, the surfaces from their `before` blobs.
     fn draw(&mut self, p: &PictureInput, dual: bool, inputs: &mut dyn Inputs) -> Result<Drawn, String>;
-}
-
-/// The surface contents a replay sets and reads back. The native renderer's surface module (task
-/// N4, `src/native/surfaces.rs`) provides them as inherent methods of `Native` with these
-/// signatures, and method resolution then picks those over this trait's. Until it does, the
-/// trait's versions fail, so no picture can pass without them.
-///
-/// - `surface_fill(index, texels)`: surface `index`'s whole texture replaced by `texels`
-///   (`size[0] * size[1] * 4` bytes, rows unpadded: RGBA8, or depth32float bit patterns).
-/// - `surface_read(index)`: its whole texture read back in the same layout, after the work
-///   submitted so far (blocks).
-#[allow(dead_code)]
-trait SurfaceContents {
-    fn surface_fill(&mut self, index: u32, texels: &[u8]) -> Result<(), String>;
-    fn surface_read(&mut self, index: u32) -> Result<Vec<u8>, String>;
-}
-
-#[allow(dead_code)]
-impl SurfaceContents for dhd_render::native::Native {
-    fn surface_fill(&mut self, index: u32, texels: &[u8]) -> Result<(), String> {
-        let _ = (index, texels);
-        Err("native::Native::surface_fill is not in the native API yet (task N4)".into())
-    }
-    fn surface_read(&mut self, index: u32) -> Result<Vec<u8>, String> {
-        let _ = index;
-        Err("native::Native::surface_read is not in the native API yet (task N4)".into())
-    }
 }
 
 /// dhd_render's native renderer on the process's device.
@@ -1799,7 +1773,7 @@ mod selftest {
 
     pub(super) fn header() -> Header {
         Header {
-            version: 1,
+            version: VERSION,
             header_bytes: 0,
             flags: 0,
             api: 1,
@@ -2057,10 +2031,15 @@ mod selftest {
         cases.push(c);
 
         // Refusals.
-        let mut v2 = base.clone();
-        v2[8] = 2;
-        let mut c = case("unknown version refused", v2, EXIT_REFUSED);
-        (c.drawn, c.says) = (Some(0), vec!["REFUSED: trace version 2"]);
+        let mut v1 = base.clone();
+        v1[8] = 1;
+        let mut c = case("old version 1 (168-byte command head) refused", v1, EXIT_REFUSED);
+        (c.drawn, c.says) = (Some(0), vec!["REFUSED: trace version 1"]);
+        cases.push(c);
+        let mut v3 = base.clone();
+        v3[8] = 3;
+        let mut c = case("unknown version refused", v3, EXIT_REFUSED);
+        (c.drawn, c.says) = (Some(0), vec!["REFUSED: trace version 3"]);
         cases.push(c);
         let tweaks: [(&'static str, fn(&mut Identity)); 6] = [
             ("adapter (vendor) mismatch refused", |i| i.vendor_id ^= 1),

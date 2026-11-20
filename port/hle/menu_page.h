@@ -18,7 +18,7 @@
 
    The mouse (menu_mouse_*, below; any of the game's popups gets the same): the row under the
    pointer is selected when the mouse moves, a left click is Cross (on a value picker: its arrows,
-   else the next value), a right click is Triangle, the wheel moves the cursor or changes the value.
+   else the next value; on an ACTION value: Cross), a right click is Triangle, the wheel moves the cursor or changes the value.
    PC SETTINGS (pc_settings.c), EXIT GAME (exit_menu.c) and the online pages (online_menu.c) are
    such pages. */
 #ifndef MENU_PAGE_H
@@ -34,6 +34,10 @@
 
 enum { MENU_PAGE_ROWS = 24, MENU_PAGE_TEXT = 80 };
 enum { MENU_ROW_BUTTON, MENU_ROW_VALUE, MENU_ROW_TEXT };
+/* menu_page_value's arrows: FIXED can't be changed (shown without arrows), ARROWS left/right
+   change it, ACTION is shown without arrows and Cross acts on it (a click is Cross, as on a row:
+   the Controls page's bindings). */
+enum { MENU_VALUE_FIXED, MENU_VALUE_ARROWS, MENU_VALUE_ACTION };
 
 typedef struct MenuPage MenuPage;
 struct MenuPage {
@@ -53,14 +57,19 @@ struct MenuPage {
     int rebuild_row;           /* and the cursor's row then */
     int armed;                 /* the buttons were all released since the page opened */
     unsigned char kind[MENU_PAGE_ROWS];     /* MENU_ROW_* of each row */
+    unsigned char arrows[MENU_PAGE_ROWS];   /* a value row's MENU_VALUE_* */
     char text[MENU_PAGE_ROWS][MENU_PAGE_TEXT];  /* the value rows' text */
+    const char *dim[MENU_PAGE_ROWS];        /* a dimmed row's text (menu_page_dim), NULL: drawn by the game */
     /* A page that lays itself out (the race room): it has no rows and draws in update with the
        menu_draw_* calls below. mouse: once a field when the mouse did something, the pointer in
        the view's coordinates; a right click still presses Triangle. */
     void (*mouse)(MenuPage *, int x, int y, int moved, int left, int wheel);
     void (*draw)(MenuPage *);  /* every frame after the game's update (which starts the popups'
                                   frame afresh): the menu_draw_* calls */
+    int (*header_mouse)(MenuPage *, int x, int y);  /* consumes a click above the rows */
     int title_y;               /* above 0: the title's y, instead of above the rows */
+    int rows_last;             /* above 0: the last row's y at most this (a page that draws a line
+                                  under its rows: the rows and their panel move up for it) */
 } __attribute__((aligned(16)));  /* the game stores a u128 at +0x490 with aligned SSE moves */
 
 void menu_page_run(MenuPage *p);       /* modally, until it closes */
@@ -76,8 +85,30 @@ void menu_page_rebuild_at(MenuPage *p, int row);  /* the same, the cursor on tha
 int menu_page_cursor(const MenuPage *p);
 void menu_page_set_cursor(MenuPage *p, int row);
 int menu_page_rows(const MenuPage *p);
+void menu_page_suffix(MenuPage *p, int row, const char *text);  /* dim text after a row */
 void menu_page_enable(MenuPage *p, int row, int enabled);  /* a row's flag, without building again */
+/* An unavailable row (finding 218): the cursor skips it (as menu_page_enable 0) and it is drawn
+   dimmed, so it doesn't look like the rows that change. Until the rows are built again. */
+void menu_page_dim(MenuPage *p, int row);
 void menu_page_sound(int next);        /* S_NEXT / S_PREVIOUS, as the value rows play them */
+/* Both pads' buttons held, the left stick at its edge as the d-pad, as the game's menus take it
+   (func_002209A8); -1 for a field whose word reads all ones (an edge the popup manager just
+   took clears the pad's entry). For a page that reads the pads itself (menu_pads.c). */
+int menu_pads_held(void);
+/* A game popup with no row to choose (all disabled, or none): a message waiting for one button,
+   which a tap anywhere answers with Cross (finding 266). `enabled`: the first row's flag, the rows
+   `stride` bytes apart. */
+int menu_is_message(const char *enabled, int count, int stride);
+/* A legend's buttons where a tap takes them (menu_pads.c, finding 266): left / glyph_right / right
+   the drawn glyph and word, [from, to) the tap range, padded outside but never overlapping a
+   neighbour. prefix[i]: the drawn width of the first i characters. */
+enum { MENU_LEGEND_BUTTONS = 8 };
+typedef struct { int left, glyph_right, right, from, to; uint16_t button; } MenuLegendRange;
+int menu_legend_ranges(const char *text, int length, const int *prefix, MenuLegendRange *out, int max);
+uint16_t menu_legend_hit(const MenuLegendRange *ranges, int n, int x);
+/* A tap at x beside a line whose words span [left, right): Left left of them, Right right of them, 0 on
+   them (menu_pads.c, finding 268). left == right: the line's two halves. */
+uint16_t menu_side_button(int x, int left, int right);
 
 /* ---- drawing, for a page that lays itself out (in its draw) ----
    In the popup's view, x across 0..640 and y down 0..224 as the rows are (menu_draw_size),
@@ -91,7 +122,16 @@ enum { MENU_LEFT, MENU_CENTRE, MENU_RIGHT };
 #define GLYPH_SQUARE "\xA0"
 #define GLYPH_CIRCLE "\xAB"
 MenuStyle menu_page_style(const MenuPage *p, int which);
+MenuStyle menu_game_style(int which);  /* the same without a page (a menu drawn over a race) */
+int menu_popup_up(void);               /* a popup is up (the game's or ours) */
+const char *menu_game_text(int id);    /* the game's text of an id ("" none) */
 MenuStyle menu_style(MenuStyle s, int percent, int r, int g, int b);  /* sized; colour r < 0: kept */
+/* The font's glyphs are white (0xFF) at alpha 0x40 in its texture, and the GS multiplies both by
+   the style's colour and alpha (0x80 = 1.0): at the game's alpha 0x80 a glyph is drawn at half
+   cover, its colour twice the style's. Over the game's lit menus that is their soft look; over a
+   dark page it halves every colour (finding 271). A solid style (alpha 0xFF) covers fully: its
+   colour then shows as given on a 0..0x80 scale (0x80 = full). */
+MenuStyle menu_solid(MenuStyle s);
 void menu_draw_size(int *width, int *height);  /* the popup view's size */
 void menu_draw_begin(void);            /* each frame, before the first box */
 void menu_draw_box(int x, int y, int w, int h, int level);  /* level 90: the popups' own */
@@ -102,7 +142,15 @@ enum { MENU_PICTURE_W = 256, MENU_PICTURE_H = 160 };
 uint16_t *menu_picture_new(void);
 void menu_draw_picture(int x, int y, int w, int h, const uint16_t *picture);  /* bilinear, one sprite */
 void menu_draw_bar(int x, int y, int w, int h);  /* the cursor's bar */
+/* A triangle strip of n (3 or 4) points in one flat colour (0-255), each x, y in 1/16 of the
+   view's pixels from its top left: a slanted shape with clean edges at every resolution scale. */
+void menu_draw_strip(const int *xy16, int n, int r, int g, int b);
 void menu_draw_text(int align, int x, int y, const char *text, const MenuStyle *s);
+/* The font's glyphs carry a dark edge (black in its texture) round a white body: dark text on a
+   light box ran into one blob with it (lane 272). Ink text leaves the edge out: LIGHT adds the
+   style's colour to what is under the body, DARK takes it away (0x80 each: white, or black). */
+enum { MENU_INK_LIGHT, MENU_INK_DARK };
+void menu_draw_text_ink(int align, int x, int y, const char *text, const MenuStyle *s, int ink);
 int menu_text_width(const char *text, const MenuStyle *s);
 void menu_play(const char *sound);     /* a front-end sound by name: "S_SELECT", "S_BACK"... */
 

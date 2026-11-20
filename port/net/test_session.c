@@ -1,13 +1,24 @@
 /* Session wire parsing and serializers without a server or game data. */
 #include "client.h"
 #include "lobby_row.h"
+#include "../hle/state_bundle.h"
+#include <SDL3/SDL_timer.h>
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
 
 static char sent[4096];
 static void text(void *ctx, const char *s) { (void)ctx; snprintf(sent,sizeof sent,"%s",s); }
-static void binary(void *ctx, const void *s, size_t n) { (void)ctx; (void)s; (void)n; }
+static int binaries;
+static unsigned char last_binary[64];
+static size_t last_binary_n;
+static void binary(void *ctx, const void *s, size_t n)
+{
+    (void)ctx;
+    binaries++;
+    last_binary_n = n < sizeof last_binary ? n : sizeof last_binary;
+    memcpy(last_binary, s, last_binary_n);
+}
 int main(void)
 {
     NetClient c;
@@ -22,6 +33,9 @@ int main(void)
         "\"members\":[{\"id\":7,\"name\":\"Test\",\"ready\":true,\"inRace\":false,\"raceState\":\"finished\",\"finishTicks\":300,\"place\":4}],"
         "\"lastRace\":{\"id\":2,\"track\":3,\"entrants\":[{\"id\":7,\"name\":\"Test\",\"rider\":5,\"ticks\":300,\"place\":4},"
         "{\"id\":8,\"name\":\"Other\",\"dnfReason\":\"time_up\",\"place\":5}]}}";
+    /* dhd.log shows a P2P room's code only by its first two characters (finding 180) */
+    if (!getenv("DHD_NET_LOG_CODE")) assert(!strcmp(net_log_code("ABCDEFG").text,"AB*****"));
+    assert(!strcmp(net_log_code("TEST22").text,"TEST22") && !strcmp(net_log_code("").text,""));
     client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     memset(&t,0,sizeof t); t.send_text=text; t.send_binary=binary;
     client_connected(&c,&t);
@@ -34,7 +48,7 @@ int main(void)
     assert(l.rotation_count==3 && l.rotation[2]==5 && l.member[0].finish_ticks==300);
     assert(l.last_race_id==2 && l.nresults==2 && l.result[1].ticks==-1 && !strcmp(l.result[1].dnf_reason,"time_up"));
     assert(c.ready && !c.racing && l.state==NET_LOBBY);
-    client_finish(&c,321,4); assert(strstr(sent,"\"ticks\":321,\"place\":4"));
+    client_finish(&c,321,4,-1); assert(strstr(sent,"\"ticks\":321,\"place\":4"));
     client_back(&c); assert(!strcmp(sent,"{\"type\":\"back\"}"));
     client_rules(&c,60,1,2); assert(strstr(sent,"\"nextRace\":\"host\"") && strstr(sent,"\"then\":\"random\""));
     client_rotation(&c,rotation,3); assert(strstr(sent,"[1,3,5]"));
@@ -58,6 +72,61 @@ int main(void)
     client_on_text(&c,ten,strlen(ten)); client_lobby(&c,&l);
     assert(l.nslots == 10 && l.local_slot == 9 && l.racer[9].member_id == 9);
     client_free(&c);
+    {   /* the race's start moment over the room (finding 187): asked for in the hello, sent only to a
+           server that lists it, taken only for this race, once */
+        const char *older = "{\"type\":\"welcome\",\"memberId\":1,\"code\":\"GOGO22\",\"serverTime\":1000}";
+        const char *newer = "{\"type\":\"welcome\",\"memberId\":1,\"code\":\"GOGO22\",\"serverTime\":1000,"
+            "\"features\":[\"sfu_silent\",\"race_go\"]}";
+        const char *start = "{\"type\":\"start\",\"yourSlot\":0,\"startAt\":5000,\"serverTime\":2000,"
+            "\"players\":[{\"slot\":0,\"memberId\":1,\"name\":\"Test\"},{\"slot\":1,\"memberId\":2,\"name\":\"B\"}]}";
+        const char *other = "{\"type\":\"race_go\",\"race\":4000,\"at\":9000}";
+        const char *go = "{\"type\":\"race_go\",\"race\":5000,\"at\":9500.5}";
+        const char *again = "{\"type\":\"race_go\",\"race\":5000,\"at\":12000}";
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        assert(strstr(sent,"\"race_rejoin\",\"race_go\",\"p2p\"]"));
+        client_on_text(&c,older,strlen(older));
+        client_on_text(&c,start,strlen(start));
+        sent[0] = 0;
+        client_race_go(&c,9500); assert(!sent[0]);  /* a 0.7.13 server would refuse it */
+        client_on_text(&c,newer,strlen(newer));
+        client_race_go(&c,9500.5); assert(!strcmp(sent,"{\"type\":\"race_go\",\"race\":5000,\"at\":9500.500}"));
+        client_on_text(&c,other,strlen(other)); client_lobby(&c,&l); assert(l.race_go_at == 0);
+        client_on_text(&c,go,strlen(go)); client_on_text(&c,again,strlen(again));
+        client_lobby(&c,&l); assert(l.race_go_at == 9500.5);
+        assert(l.ended == NET_ENDED_NONE);
+        client_on_text(&c,"{\"type\":\"ended\"}",16); client_lobby(&c,&l); assert(l.race_go_at == 0);
+        assert(l.ended == NET_ENDED_UNKNOWN);  /* an older server: no reason (finding 211) */
+        sent[0] = 0; client_race_go(&c,9500); assert(!sent[0]);  /* no race */
+        /* the race's last seconds on screen: its frames still go both ways (finding 202 round 4), until
+           the game leaves the race screen, longer than the 2 s it stays (finding 216), not after back;
+           a room snapshot with this member out of the race keeps the frames already here */
+        {
+            unsigned char frame[4] = {1, 2, 3, 4}, in[4] = {NET_FRAME_EVENT, 1, 9, 9}, got[NET_FRAME_MAX];
+            const char *out = "{\"type\":\"room\",\"phase\":\"open\",\"members\":[{\"id\":1,\"name\":\"Test\",\"inRace\":false}]}";
+            assert(c.race_frames_until > net_now_ms() + 5000 && client_send_frame(&c, NET_FRAME_STATE, frame, sizeof frame));
+            client_on_binary(&c, in, sizeof in);
+            client_on_text(&c, out, strlen(out));
+            assert(client_receive_frame(&c, got, sizeof got) == sizeof in && got[1] == 1);
+            client_on_binary(&c, in, sizeof in);
+            client_back(&c);
+            assert(!client_send_frame(&c, NET_FRAME_STATE, frame, sizeof frame));
+            assert(!client_receive_frame(&c, got, sizeof got));
+            client_on_binary(&c, in, sizeof in);
+            assert(!client_receive_frame(&c, got, sizeof got));
+        }
+        client_on_text(&c,start,strlen(start)); client_lobby(&c,&l); assert(l.race_go_at == 0);
+        /* the reason is kept from the message itself: the room snapshot with the result comes after
+           it, and the state is the lobby's already (finding 211) */
+        const char *done = "{\"type\":\"ended\",\"reason\":\"done\"}", *voided = "{\"type\":\"ended\",\"reason\":\"void\"}";
+        assert(l.ended == NET_ENDED_NONE && l.state == NET_RACING);
+        client_on_text(&c,done,strlen(done)); client_lobby(&c,&l);
+        assert(l.ended == NET_ENDED_DONE && l.state == NET_LOBBY && l.last_race_id == 0);
+        client_on_text(&c,start,strlen(start)); client_lobby(&c,&l); assert(l.ended == NET_ENDED_NONE);
+        client_on_text(&c,voided,strlen(voided)); client_lobby(&c,&l);
+        assert(l.ended == NET_ENDED_VOID && l.state == NET_LOBBY);
+        client_free(&c);
+    }
     {   /* where this PC and the room are (finding 135): the welcome's fields, the where message's
            regions kept across room snapshots, and the net: lines on stderr */
         const char *located = "{\"type\":\"welcome\",\"memberId\":1,\"host\":false,\"code\":\"WHERE2\",\"serverTime\":1000,"
@@ -89,6 +158,56 @@ int main(void)
         client_on_text(&c,welcome,strlen(welcome));
         client_lobby(&c,&l);
         assert(!l.edge_colo[0] && !l.country[0] && !l.room_region[0]);
+        client_free(&c);
+    }
+    {   /* the room's area and its creator's pick (finding 181): from the welcome, then the where
+           message; the list's rows; the race ping's samples and their net: line */
+        const char *picked = "{\"type\":\"welcome\",\"memberId\":0,\"host\":true,\"code\":\"AREA22\",\"serverTime\":1000,"
+            "\"edgeColo\":\"MRS\",\"country\":\"DZ\",\"continent\":\"AF\",\"roomColo\":\"\",\"roomRegion\":\"ASIA\","
+            "\"roomArea\":\"ASIA SE\",\"roomChosen\":true}";
+        const char *where = "{\"type\":\"where\",\"region\":\"ASIA\",\"area\":\"ASIA SE\",\"colo\":\"SIN\",\"members\":[{\"id\":0,\"region\":\"AF\"}]}";
+        const char *list = "{\"protocol\":4,\"lobbies\":[{\"code\":\"AREA22\",\"region\":\"EU\",\"area\":\"EU WEST\",\"colo\":\"MRS\"},"
+            "{\"code\":\"OLD222\",\"region\":\"NA\"}]}";
+        NetLobbyInfo rows[2];
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert(client_race_ms(&c) == -1);
+        client_connected(&c,&t);
+        client_on_text(&c,picked,strlen(picked));  /* net: in room AREA22 (host): ... ASIA SE (location not known yet, picked by its creator) */
+        client_lobby(&c,&l);
+        assert(!strcmp(l.room_area,"ASIA SE") && l.room_chosen && !strcmp(l.room_region,"ASIA"));
+        client_on_text(&c,where,strlen(where));  /* net: room AREA22 runs in SIN (ASIA SE, picked by its creator) */
+        client_lobby(&c,&l);
+        assert(!strcmp(l.room_colo,"SIN") && !strcmp(l.room_area,"ASIA SE"));
+        /* the race ping: one sample a second, the counter shows the median of the last 5 */
+        client_race_rtt(&c, 40);
+        assert(client_race_ms(&c) == 40 && c.race_window_n == 1);
+        client_race_rtt(&c, 900);  /* within the same second: not a sample */
+        assert(client_race_ms(&c) == 40 && c.race_window_n == 1);
+        for (int ms = 41; ms <= 44; ms++) { c.next_race_sample = 0; client_race_rtt(&c, ms); }
+        assert(client_race_ms(&c) == 42 && c.race_window_n == 5);
+        c.next_race_sample = 0; client_race_rtt(&c, 500);  /* one slow check moves the median by one */
+        assert(client_race_ms(&c) == 43);
+        c.next_log = 0;
+        client_tick(&c);  /* net: room AREA22, last 0 s: no pings; race network 42 ms median, 500 worst (6 samples)... */
+        assert(c.race_window_n == 0);
+        client_race_rtt(&c, -1);  /* the association is gone */
+        assert(client_race_ms(&c) == -1);
+        client_free(&c);
+        /* the list: the area when the server sends one, else nothing (an older server: the region) */
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert(client_read_lobbies(&c, list, net_now_ms(), net_now_ms(), rows, 2) == 2);
+        assert(!strcmp(rows[0].area, "EU WEST") && !strcmp(rows[0].region, "EU") && !rows[1].area[0] && !strcmp(rows[1].region, "NA"));
+        client_free(&c);
+        /* a 0.7.13 server's welcome: no area, not picked */
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        {
+            const char *old = "{\"type\":\"welcome\",\"memberId\":1,\"code\":\"OLD222\",\"serverTime\":1000,"
+                "\"edgeColo\":\"WAW\",\"country\":\"PL\",\"continent\":\"EU\",\"roomColo\":\"FRA\",\"roomRegion\":\"EU\"}";
+            client_on_text(&c,old,strlen(old));
+        }
+        client_lobby(&c,&l);
+        assert(!l.room_area[0] && !l.room_chosen && !strcmp(l.room_region,"EU"));
         client_free(&c);
     }
     {   /* the public list in no room (finding 135): its "now" sets the clock, so a racing room's
@@ -149,8 +268,11 @@ int main(void)
         assert(strstr(sent,"\"type\":\"hello\"") && !strstr(sent,"rejoinToken"));
         client_on_text(&c,tokened,strlen(tokened));
         assert(client_on_closed(&c,1006,"") == 1);  /* a drop in the room: rejoin */
+        assert(c.lobby.state == NET_RECONNECTING && !strcmp(c.lobby.notice,"Connection lost, reconnecting..."));
         client_connected(&c,&t);
         assert(strstr(sent,"\"type\":\"hello\"") && strstr(sent,",\"rejoinToken\":\"0123456789abcdef0123456789abcdef\"}"));
+        client_on_text(&c,tokened,strlen(tokened));
+        assert(c.lobby.state == NET_LOBBY && !c.lobby.notice[0]);
         client_free(&c);
         client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         client_connected(&c,&t);  /* the next room: no token from the last one */
@@ -159,6 +281,391 @@ int main(void)
         assert(client_on_closed(&c,1006,"") == 1);
         client_connected(&c,&t);
         assert(strstr(sent,"\"type\":\"hello\"") && !strstr(sent,"rejoinToken"));
+        client_free(&c);
+    }
+    {   /* HOLD (finding 202): the network thread says "no snapshot of mine since T" while our game's
+           thread gives no bundles, every 100 ms, and never between races */
+        unsigned char bundle[STATE_BUNDLE_HEADER] = {STATE_BUNDLE_VERSION, 0, 1};
+        double stamp = 123456.5, held, quiet;
+        memcpy(bundle + 3, &stamp, sizeof stamp);
+        client_init(&c,"Test","test","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        c.racing = 1;
+        c.next_ping = net_now_ms() + 1e9;  /* no race PING in these ticks: the last frame sent is ours */
+        assert(client_send_frame(&c, NET_FRAME_STATE, bundle, sizeof bundle));
+        int before = binaries;
+        client_tick(&c);
+        assert(c.holds_sent == 0);                    /* the game is sending: nothing */
+        c.state_sent_at = net_now_ms() - 200;           /* ... until it stops */
+        client_tick(&c);
+        assert(c.holds_sent == 1 && binaries > before && last_binary_n == 2 + STATE_HOLD_SIZE &&
+               last_binary[0] == NET_FRAME_STATE && state_hold_check(last_binary + 2, STATE_HOLD_SIZE, &held, &quiet) &&
+               held == stamp && quiet >= 199 && quiet < 400);
+        client_tick(&c);
+        assert(c.holds_sent == 1);                    /* at most one every 100 ms */
+        c.hold_sent_at -= 150;
+        client_tick(&c);
+        assert(c.holds_sent == 2);
+        c.racing = 0;                                 /* after the race: none */
+        c.hold_sent_at -= 150;
+        client_tick(&c);
+        assert(c.holds_sent == 2 && !c.state_sending);
+        client_free(&c);
+    }
+    {   /* Snapshot freshness and long gaps are per sender and sampled on network ticks. */
+        /* A bundle's header (port/hle/state_bundle.h): its version, index, riders, the stamp. */
+        unsigned char state[13] = {NET_FRAME_STATE, 2, STATE_BUNDLE_VERSION, 0, 1};
+        double stamp = 100000 + net_now_ms() - 150, newer = stamp + 1;
+        client_init(&c,"Test","test","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        c.racing = 1;
+        c.clock_offset = 100000;
+        memcpy(state + 5, &stamp, sizeof stamp);
+        c.snapshot[2].arrived = net_now_ms() - 150;
+        client_on_binary(&c,state,sizeof state);
+        assert(c.snapshot[2].gaps == 1 && c.snapshot[1].gaps == 0 && c.snapshot[2].messages == 1);
+        client_tick(&c);
+        assert(c.snapshot[2].samples == 1 && c.snapshot[1].samples == 0);
+        {   /* about 150 ms old (a loaded PC may take a little longer between the two lines) */
+            unsigned near = 0;
+            for (int ms = 145; ms < 400; ms++) near += c.snapshot[2].age[ms];
+            assert(c.snapshot[2].epoch == stamp && near == 1);
+        }
+        {
+            unsigned char later[13];
+            memcpy(later, state, sizeof later);
+            memcpy(later + 5, &newer, sizeof newer);
+            client_on_binary(&c,later,sizeof later);
+            assert(c.snapshot[2].epoch == newer);
+            client_on_binary(&c,state,sizeof state);  /* an older unordered message */
+            assert(c.snapshot[2].epoch == newer && c.snapshot[2].messages == 3);
+        }
+        c.snapshot[2].epoch = c.clock_offset + net_now_ms() - 2000;
+        client_tick(&c);
+        assert(c.snapshot[2].age[1001] == 1);
+        client_free(&c);
+    }
+    {   /* The shared clock (finding 169): a race PONG with the server's time sets the offset, then
+           follows it by at most 2 ms a pong; a slow round trip or a PONG without the clock changes
+           nothing. */
+        unsigned char pong[2 + 16] = {NET_FRAME_PONG, 0};
+        double sent, server;
+        client_init(&c,"Test","test","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+#define PONG(rtt, offset) (sent = net_now_ms() - (rtt), server = sent + (rtt) / 2 + (offset), \
+                           memcpy(pong + 2, &sent, 8), memcpy(pong + 10, &server, 8))
+        PONG(10, 1000.0);
+        client_on_binary(&c,pong,sizeof pong);
+        assert(c.have_offset && fabs(c.clock_offset - 1000) < 1.5);
+        PONG(10, 1100.0);
+        client_on_binary(&c,pong,sizeof pong);
+        assert(fabs(c.clock_offset - 1002) < 1.5);
+        PONG(400, 900.0);                  /* slower than the usual round trip: not trusted */
+        client_on_binary(&c,pong,sizeof pong);
+        assert(fabs(c.clock_offset - 1002) < 1.5);
+        PONG(10, 500.0);
+        client_on_binary(&c,pong,10);      /* no server clock: not a PONG */
+        assert(fabs(c.clock_offset - 1002) < 1.5);
+        /* round trips slow for a long time, one way (a busy uplink: the server's time is read
+           late on the way out, so it looks 60 ms ahead): the median follows them, the clock
+           must not (the 45 ms skew of finding 169's PC-Mac run) */
+        for (int i = 0; i < 40; i++) {
+            PONG(160, 1062.0);
+            client_on_binary(&c,pong,sizeof pong);
+        }
+        assert(c.lobby.ping_ms >= 150 && fabs(c.clock_offset - 1002) < 1.5);
+        PONG(11, 1003.0);                  /* a quick one again: trusted */
+        client_on_binary(&c,pong,sizeof pong);
+        assert(fabs(c.clock_offset - 1003) < 1.5);
+        /* DHD_NET_TEST_PONG_DELAY (finding 175): a pong is held, then counts at its time */
+        c.pong_delay_ms = 50, c.pong_delay_from_s = 0, c.joined_at = net_now_ms() - 1;
+        PONG(11, 1004.0);
+        client_on_binary(&c,pong,sizeof pong);
+        assert(c.held_count == 1 && fabs(c.clock_offset - 1003) < 1.5);
+        {
+            double until = net_now_ms() + 1000;
+            while (c.held_count && net_now_ms() < until) { SDL_Delay(5); client_tick(&c); }
+        }
+        assert(!c.held_count && c.lobby.ping_ms >= 50);  /* its round trip includes the hold */
+#undef PONG
+        client_free(&c);
+    }
+    {   /* the install id (finding 161): in every hello once set, only when it is 32 lowercase hex;
+           none (an id never made) sends a hello without it, as older releases do */
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        assert(strstr(sent,"\"type\":\"hello\"") && !strstr(sent,"installId"));
+        client_free(&c);
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_set_install_id(&c,"0123456789abcdef0123456789abcdef");
+        client_connected(&c,&t);
+        assert(strstr(sent,",\"installId\":\"0123456789abcdef0123456789abcdef\""));
+        client_set_install_id(&c,"0123456789ABCDEF0123456789abcdef");
+        client_connected(&c,&t);
+        assert(!strstr(sent,"installId"));
+        client_set_install_id(&c,"\",\"x\":\"0123456789abcdef01234567");
+        client_connected(&c,&t);
+        assert(!strstr(sent,"installId"));
+        client_free(&c);
+    }
+    {   /* The arena's scored round (finding 204): a finish carries its score only to a server that
+           lists "score" (an older one would rank the round by its length), a rejoin says it again,
+           and the room's scores reach the lobby copy (-1: none). */
+        const char *scored = "{\"type\":\"welcome\",\"memberId\":1,\"code\":\"MOSH22\",\"serverTime\":1000,"
+            "\"rejoinToken\":\"0123456789abcdef0123456789abcdef\",\"features\":[\"sfu_silent\",\"race_go\",\"score\"]}";
+        const char *plain = "{\"type\":\"welcome\",\"memberId\":1,\"code\":\"MOSH22\",\"serverTime\":1000,"
+            "\"features\":[\"sfu_silent\",\"race_go\"]}";
+        const char *start = "{\"type\":\"start\",\"yourSlot\":1,\"track\":23,\"startAt\":5000,\"serverTime\":2000,\"players\":["
+            "{\"slot\":0,\"memberId\":0,\"name\":\"A\"},{\"slot\":1,\"memberId\":1,\"name\":\"Test\"}]}";
+        const char *back_in = "{\"type\":\"welcome\",\"memberId\":1,\"code\":\"MOSH22\",\"serverTime\":9000,"
+            "\"rejoinToken\":\"0123456789abcdef0123456789abcdef\",\"sfu\":\"ready\",\"race\":{\"startAt\":5000},"
+            "\"features\":[\"score\"]}";
+        const char *room = "{\"type\":\"room\",\"phase\":\"racing\",\"members\":["
+            "{\"id\":0,\"name\":\"A\",\"inRace\":true,\"raceState\":\"finished\",\"place\":1,\"score\":1350},"
+            "{\"id\":1,\"name\":\"Test\",\"inRace\":true,\"raceState\":\"racing\"},"
+            "{\"id\":2,\"name\":\"Late\",\"inRace\":false,\"raceState\":\"finished\",\"place\":2,\"score\":1000000}],"
+            "\"lastRace\":{\"id\":4,\"track\":23,\"entrants\":[{\"id\":0,\"name\":\"A\",\"rider\":1,\"place\":1,\"ticks\":7201,\"score\":900},"
+            "{\"id\":1,\"name\":\"Test\",\"rider\":2,\"place\":3,\"ticks\":7199,\"score\":0},"
+            "{\"id\":2,\"name\":\"Gone\",\"rider\":3,\"place\":4,\"dnfReason\":\"left\"}]}}";
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,plain,strlen(plain));
+        client_lobby(&c,&l);
+        assert(!l.server_scores);
+        client_on_text(&c,start,strlen(start));
+        client_finish(&c, 7200, 2, 1350);  /* a server without scores: the plain finish */
+        assert(!strcmp(sent,"{\"type\":\"finish\",\"ticks\":7200,\"place\":2}"));
+        client_free(&c);
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,scored,strlen(scored));
+        client_lobby(&c,&l);
+        assert(l.server_scores);
+        client_on_text(&c,start,strlen(start));
+        client_on_text(&c,room,strlen(room));
+        client_lobby(&c,&l);
+        assert(l.member_score[0] == 1350 && l.member_score[1] == -1 && l.member_score[2] == -1);  /* past six digits: none */
+        assert(l.member_score[3] == -1 && l.nresults == 3);
+        assert(l.result_score[0] == 900 && l.result_score[1] == 0 && l.result_score[2] == -1 && l.result_score[9] == -1);
+        client_finish(&c, 7200, 2, 1350);
+        assert(!strcmp(sent,"{\"type\":\"finish\",\"ticks\":7200,\"place\":2,\"score\":1350}"));
+        assert(client_on_closed(&c,1006,"") == 1);
+        client_connected(&c,&t);
+        client_on_text(&c,back_in,strlen(back_in));
+        assert(!strcmp(sent,"{\"type\":\"finish\",\"ticks\":7200,\"place\":2,\"score\":1350}"));  /* said again */
+        client_free(&c);
+    }
+    {   /* A drop in the race (finding 175): the race goes on (state, frames), the rejoin's hello
+           names the race, the welcome keeps it racing and what the drop may have lost goes again;
+           a refusal or the end of the attempts leaves it racing alone, offline. */
+        const char *tokened = "{\"type\":\"welcome\",\"memberId\":1,\"code\":\"RACE22\",\"serverTime\":1000,"
+            "\"rejoinToken\":\"0123456789abcdef0123456789abcdef\"}";
+        const char *start = "{\"type\":\"start\",\"yourSlot\":1,\"startAt\":5000,\"serverTime\":2000,\"players\":["
+            "{\"slot\":0,\"memberId\":0,\"name\":\"A\"},{\"slot\":1,\"memberId\":1,\"name\":\"Test\"}]}";
+        const char *back_in = "{\"type\":\"welcome\",\"memberId\":1,\"code\":\"RACE22\",\"serverTime\":9000,"
+            "\"rejoinToken\":\"0123456789abcdef0123456789abcdef\",\"sfu\":\"ready\",\"race\":{\"startAt\":5000}}";
+        const char *no_race = "{\"type\":\"welcome\",\"memberId\":1,\"code\":\"RACE22\",\"serverTime\":9000,"
+            "\"rejoinToken\":\"0123456789abcdef0123456789abcdef\"}";
+        const char *out = "{\"type\":\"room\",\"phase\":\"racing\",\"raceStartedAt\":5000,\"members\":[{\"id\":1,\"name\":\"Test\",\"inRace\":false}]}";
+        /* the race over while away (finding 254 review): its results list this member, left (the seat
+           let go) or with its finish (the seat kept) */
+        const char *no_race_new = "{\"type\":\"welcome\",\"memberId\":2,\"code\":\"RACE22\",\"serverTime\":9000,"
+            "\"rejoinToken\":\"fedcba9876543210fedcba9876543210\"}";  /* the seat gone: a new member */
+        const char *over_left = "{\"type\":\"room\",\"phase\":\"open\",\"lastRace\":{\"id\":2,\"track\":0,\"entrants\":["
+            "{\"id\":0,\"name\":\"A\",\"place\":1,\"ticks\":3600},{\"id\":1,\"name\":\"Test\",\"place\":2,\"dnfReason\":\"left\"}]},"
+            "\"members\":[{\"id\":0,\"name\":\"A\",\"inRace\":false},{\"id\":2,\"name\":\"Test\",\"inRace\":false}]}";
+        const char *over_kept = "{\"type\":\"room\",\"phase\":\"open\",\"lastRace\":{\"id\":2,\"track\":0,\"entrants\":["
+            "{\"id\":0,\"name\":\"A\",\"place\":1,\"ticks\":3600},{\"id\":1,\"name\":\"Test\",\"place\":2,\"ticks\":3720}]},"
+            "\"members\":[{\"id\":0,\"name\":\"A\",\"inRace\":false},{\"id\":1,\"name\":\"Test\",\"inRace\":false}]}";
+        unsigned char payload[4] = {1, 2, 3, 4};
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        assert(strstr(sent,"\"race_rejoin\"") && !strstr(sent,"raceStartAt"));
+        client_on_text(&c,tokened,strlen(tokened));
+        client_on_text(&c,start,strlen(start));
+        assert(c.racing && c.race_at == 5000);
+        assert(client_on_closed(&c,1006,"") == 1);
+        client_lobby(&c,&l);
+        assert(c.rejoining && l.state == NET_RACING && !l.offline);
+        binaries = 0;
+        assert(client_send_frame(&c, NET_FRAME_STATE, payload, sizeof payload) && binaries == 1);  /* over the SFU */
+        assert(client_on_closed(&c,4011,"rate_limited") == 1);  /* a rejoin refused by the limits: again */
+        client_connected(&c,&t);
+        assert(strstr(sent,"\"rejoinToken\":\"0123456789abcdef0123456789abcdef\",\"raceStartAt\":5000}"));
+        client_lobby(&c,&l);
+        assert(l.state == NET_RACING);
+        client_finish(&c, 777, 2, -1);
+        assert(client_on_closed(&c,1006,"") == 1);
+        client_finish(&c, 777, 2, -1);  /* said while the socket was down: lost */
+        client_connected(&c,&t);
+        client_on_text(&c,back_in,strlen(back_in));
+        client_lobby(&c,&l);
+        assert(l.state == NET_RACING && c.racing && !c.rejoining && c.rejoin_tries == 0 && !l.seat_lost);
+        assert(!strcmp(sent,"{\"type\":\"finish\",\"ticks\":777,\"place\":2}"));  /* said again */
+        /* gave up while the socket was down: BACK again after the rejoin */
+        assert(client_on_closed(&c,1006,"") == 1);
+        client_back(&c);
+        client_connected(&c,&t);
+        assert(strstr(sent,"\"raceStartAt\":5000"));
+        client_on_text(&c,back_in,strlen(back_in));
+        assert(!strcmp(sent,"{\"type\":\"back\"}"));
+        client_free(&c);
+        /* back, but the race is over for us: the room's snapshot takes the game back to the room, and
+           the race screen says the connection was lost (finding 254); the next start clears that */
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,tokened,strlen(tokened));
+        client_on_text(&c,start,strlen(start));
+        assert(client_on_closed(&c,1006,"") == 1);
+        client_connected(&c,&t);
+        client_on_text(&c,no_race,strlen(no_race));
+        client_on_text(&c,out,strlen(out));
+        client_lobby(&c,&l);
+        assert(!c.racing && l.state == NET_LOBBY && c.race_at == 0 && l.seat_lost);
+        client_on_text(&c,start,strlen(start));
+        client_lobby(&c,&l);
+        assert(c.racing && !l.seat_lost);
+        client_free(&c);
+        /* the race ended while away and the room had let the seat go: CONNECTION LOST */
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,tokened,strlen(tokened));
+        client_on_text(&c,start,strlen(start));
+        assert(client_on_closed(&c,1006,"") == 1);
+        client_connected(&c,&t);
+        client_on_text(&c,no_race_new,strlen(no_race_new));
+        client_on_text(&c,over_left,strlen(over_left));
+        client_lobby(&c,&l);
+        assert(!c.racing && l.state == NET_LOBBY && l.seat_lost);
+        client_free(&c);
+        /* the race ended normally while away, the seat kept: the normal words, not CONNECTION LOST */
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,tokened,strlen(tokened));
+        client_on_text(&c,start,strlen(start));
+        assert(client_on_closed(&c,1006,"") == 1);
+        client_connected(&c,&t);
+        client_on_text(&c,no_race,strlen(no_race));
+        client_lobby(&c,&l);
+        assert(!l.seat_lost);  /* nothing said yet: the room's snapshot decides */
+        client_on_text(&c,over_kept,strlen(over_kept));
+        client_lobby(&c,&l);
+        assert(!c.racing && l.state == NET_LOBBY && !l.seat_lost);
+        client_free(&c);
+        /* a refusal in the race, or the attempts' end: racing alone, offline, as before */
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,tokened,strlen(tokened));
+        client_on_text(&c,start,strlen(start));
+        assert(client_on_closed(&c,1006,"") == 1);
+        assert(client_on_closed(&c,4006,"room_not_found") == 0);
+        client_lobby(&c,&l);
+        assert(l.offline && l.state == NET_FAILED && !c.rejoining);
+        client_free(&c);
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,tokened,strlen(tokened));
+        client_on_text(&c,start,strlen(start));
+        assert(client_on_closed(&c,1006,"") == 1);
+        client_rejoin_failed(&c);
+        client_lobby(&c,&l);
+        assert(l.offline && l.state == NET_FAILED);
+        binaries = 0;
+        assert(!client_send_frame(&c, NET_FRAME_STATE, payload, sizeof payload) && binaries == 0);
+        client_free(&c);
+        /* in the room, a first join refused by the limits stays refused */
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        assert(client_on_closed(&c,4011,"rate_limited") == 0);
+        client_free(&c);
+    }
+    {   /* the room restarts for new code (finding 184): its notice, its 1012 close, the rejoin */
+        const char *notice = "{\"type\":\"notice\",\"code\":\"server_update\",\"message\":\"Server updated, reconnecting...\"}";
+        const char *odd = "{\"type\":\"notice\",\"code\":\"server_update\",\"message\":\"café\n\"}";
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,welcome,strlen(welcome));
+        client_on_text(&c,notice,strlen(notice));
+        client_lobby(&c,&l);
+        assert(!strcmp(l.notice,"Server updated, reconnecting...") && l.state == NET_LOBBY);
+        assert(client_on_closed(&c,1012,"server_update") == 1);
+        client_lobby(&c,&l);
+        assert(l.state == NET_RECONNECTING && l.notice[0] && !l.error[0]);
+        client_connected(&c,&t);
+        client_on_text(&c,welcome,strlen(welcome));
+        client_lobby(&c,&l);
+        assert(l.state == NET_LOBBY && !l.notice[0]);
+        client_on_text(&c,odd,strlen(odd));  /* only what the game's font can draw */
+        client_lobby(&c,&l);
+        for (const char *q = l.notice; *q; q++) assert(*q >= 0x20 && *q <= 0x7e);
+        client_free(&c);
+    }
+    {   /* The race link can stay up while only the room socket blackholes. Its STATE/EVENT
+           traffic must not postpone the room's 10 s timeout and token rejoin (246). */
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,welcome,strlen(welcome));
+        c.racing = 1;
+        c.lobby.state = NET_RACING;
+        c.last_rx = net_now_ms() - 11000;
+        double quiet_since = c.last_rx;
+        unsigned char frame[] = {NET_FRAME_STATE, 0, 0};
+        client_on_binary(&c, frame, sizeof frame);
+        frame[0] = NET_FRAME_EVENT;
+        client_on_binary(&c, frame, sizeof frame);
+        assert(c.last_rx == quiet_since);
+        assert(client_tick(&c) == 1);
+        assert(client_on_closed(&c,1006,"") == 1 && c.rejoining && !c.lobby.offline);
+        client_connected(&c,&t);
+        client_on_text(&c,welcome,strlen(welcome));
+        c.last_rx = net_now_ms() - 11000;
+        unsigned char pong[2 + 2 * sizeof(double)] = {NET_FRAME_PONG, 0};
+        double now = net_now_ms(), server = now + 1000;
+        memcpy(pong + 2, &now, sizeof now);
+        memcpy(pong + 2 + sizeof now, &server, sizeof server);
+        client_on_binary(&c, pong, sizeof pong);
+        assert(c.last_rx > quiet_since && client_tick(&c) == 0);
+        client_free(&c);
+    }
+    {   /* Watching a running race (finding 269): only with a server that lists "watch"; the start with
+           "watch" has no slot of this PC's; the room's "watching" keeps it in the race (a member outside
+           it goes back to the room); ended and back end it. */
+        const char *plain = "{\"type\":\"welcome\",\"memberId\":3,\"code\":\"WATCH2\",\"serverTime\":1000}";
+        const char *watch_ok = "{\"type\":\"welcome\",\"memberId\":3,\"code\":\"WATCH2\",\"serverTime\":1000,\"features\":[\"race_go\",\"watch\"]}";
+        const char *start = "{\"type\":\"start\",\"yourSlot\":-1,\"watch\":true,\"startAt\":5000,\"serverTime\":2000,\"players\":["
+            "{\"slot\":0,\"memberId\":0,\"name\":\"A\"},{\"slot\":1,\"memberId\":1,\"name\":\"B\"}]}";
+        const char *watching = "{\"type\":\"room\",\"phase\":\"racing\",\"raceStartedAt\":5000,\"members\":["
+            "{\"id\":0,\"name\":\"A\",\"inRace\":true,\"raceState\":\"racing\"},{\"id\":1,\"name\":\"B\",\"inRace\":true,\"raceState\":\"racing\"},"
+            "{\"id\":3,\"name\":\"W\",\"inRace\":false,\"watching\":true}]}";
+        const char *not_watching = "{\"type\":\"room\",\"phase\":\"racing\",\"raceStartedAt\":5000,\"members\":["
+            "{\"id\":0,\"name\":\"A\",\"inRace\":true,\"raceState\":\"racing\"},{\"id\":3,\"name\":\"W\",\"inRace\":false}]}";
+        const char *ended = "{\"type\":\"ended\",\"reason\":\"done\"}";
+        client_init(&c,"Test","0.7.4","aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        client_connected(&c,&t);
+        client_on_text(&c,plain,strlen(plain));
+        sent[0] = 0;
+        client_watch(&c);
+        client_lobby(&c,&l);
+        assert(!l.server_watch && !sent[0]);  /* an older server: nothing said */
+        client_on_text(&c,watch_ok,strlen(watch_ok));
+        client_watch(&c);
+        client_lobby(&c,&l);
+        assert(l.server_watch && !strcmp(sent,"{\"type\":\"watch\"}"));
+        client_on_text(&c,start,strlen(start));
+        client_on_text(&c,watching,strlen(watching));
+        client_lobby(&c,&l);
+        assert(l.watching && l.local_slot == -1 && l.nslots == 2 && l.state == NET_RACING && c.racing && l.watchers == 1);
+        client_on_text(&c,not_watching,strlen(not_watching));  /* the room let the watching go */
+        client_lobby(&c,&l);
+        assert(l.state == NET_LOBBY && !c.racing && !l.watching && l.watchers == 0);
+        client_on_text(&c,start,strlen(start));
+        client_on_text(&c,ended,strlen(ended));
+        client_lobby(&c,&l);
+        assert(l.state == NET_LOBBY && !l.watching && l.ended == NET_ENDED_DONE);
+        client_on_text(&c,start,strlen(start));
+        client_back(&c);
+        client_lobby(&c,&l);
+        assert(l.state == NET_LOBBY && !l.watching && !c.gave_up && !strcmp(sent,"{\"type\":\"back\"}"));
         client_free(&c);
     }
     puts("test_session: session and ten-player checks passed");

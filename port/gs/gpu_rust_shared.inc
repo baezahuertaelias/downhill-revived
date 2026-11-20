@@ -21,9 +21,8 @@
    with a log line, keeping the old texture. */
 #define NATIVE_SCALE_MAX 8u
 #define NATIVE_SURFACE_MAX 2048u
-/* Phones stop at 6x: on a Snapdragon 888 (Mi 11i) 0.7.7 draws the bench race at 93 fields/s at 4x
-   and 33 at 8x, so 7x and 8x only make a phone slow and hot. */
-#define NATIVE_PHONE_SCALE_MAX 6u
+/* NATIVE_PHONE_SCALE_MAX, the phones' limit (6x), shared with the phone launchers */
+#include "../render/include/dhd_limits.h"
 /* What holds a device's scale limit below NATIVE_SCALE_MAX (Native scale_reason). */
 enum { NATIVE_SCALE_FREE, NATIVE_SCALE_MEMORY, NATIVE_SCALE_TEXTURE, NATIVE_SCALE_PHONE };
 
@@ -106,11 +105,14 @@ static void native_replace_release(void *view) { dhdr_texture_release(view); }
 
 /* ---- decoded textures (GS worker; dhdr_texture_* run on any thread) ---- */
 
+static uint8_t *native_pack_image(void *entry, unsigned *w, unsigned *h) { return texpack_image(entry, w, h); }
+
 static int native_texture_create(Native *n, NativeTexture *t, const uint32_t *pixels, unsigned w, unsigned h,
-                                 int sharp, uint64_t key)
+                                 int sharp, uint64_t key, TexPackEntry *pack)
 {
     if (!(t->gpu = dhdr_texture_create(pixels, w, h))) return 0;
-    if (sharp) t->sharp = font_sharp_view(&n->replace, pixels, w, h, key);
+    FontSharpPack replaced = {native_pack_image, pack};
+    if (sharp) t->sharp = font_sharp_view(&n->replace, pixels, w, h, key, pack ? &replaced : NULL);
     return 1;
 }
 
@@ -120,6 +122,7 @@ static void native_texture_release(NativeTexture *t)
     dhdr_texture_release(t->sharp);
     t->gpu = NULL; t->sharp = NULL;
 }
+
 
 /* ---- the picture (x64: render thread, context lock held) ---- */
 
@@ -190,6 +193,11 @@ static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertic
     static int spikes = -1;
     if (spikes < 0) spikes = getenv("DHD_SPIKES") != NULL;
     double start = n->trace_pictures || spikes ? host_wall_seconds() : 0;
+#ifdef DHD_IOS_RENDER
+    /* the picture's shape as the game had it at this field (iOS's live aspect, widescreen.c) */
+    n->wide = f->output_aspect > 0 ? (float)f->output_aspect : 0;
+    n->aspect = f->output_aspect < 0 ? 0 : n->wide ? n->wide : 4.0f / 3;
+#endif
     if (!n->scale) {
         unsigned wanted = n->scale_asked;
         char window[48] = "";
@@ -207,7 +215,6 @@ static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertic
     double snapped = spikes ? host_wall_seconds() : 0;
     native_rstat_add(RSTAT_SNAPSHOT, rs);
     rs = native_rstat_start();
-    if (native_fold_probe(n)) native_zread_start_picture(n);
     DhdrPictureResult r;
     memset(&r, 0, sizeof r);
     int shown = 0;
@@ -218,6 +225,10 @@ static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertic
         n->display_width = r.display_width; n->display_height = r.display_height;
         shown = r.shown != 0;
     }
+    /* Native VU (finding 194): a GPU that can't draw the translated meshes (the renderer logged why)
+       sends every batch back to the VU from its next run, for the rest of the session */
+    if (__atomic_load_n(&gs_mesh_mode, __ATOMIC_RELAXED) && !dhdr_native_meshes())
+        __atomic_store_n(&gs_mesh_mode, 0, __ATOMIC_RELAXED);
     native_note_flat(n, f);
     double encoded = spikes ? host_wall_seconds() : 0;
     native_rstat_add(RSTAT_DRAW, rs);
@@ -241,6 +252,9 @@ static void native_picture(Native *n, NativeFrame *f, const NativeVertex *vertic
     }
 }
 
+/* A present failed: per side, a lost device is noticed (x64: the game ends, finding 171). */
+static void native_device_lost(void);
+
 /* The displayed picture onto surface, configured to w x h (the window or the canvas): drawn in the
    rectangle that keeps its shape (native_present_rect), the sides filled for widescreen's 4:3
    pictures, resize when the size changed.
@@ -262,6 +276,7 @@ static int native_present_draw(Native *n, DhdrSurface *surface, unsigned w, unsi
     if (drawn < 0) {
         n->present_failed = 1;
         fprintf(stderr, "gs native: presenting failed; no more pictures are shown\n");
+        native_device_lost();
     }
     return drawn;
 }
@@ -286,6 +301,14 @@ static int native_read_display(Native *n, uint32_t *pixels)
     return 0;
 }
 
+/* A colour surface's GS pixels (finding 250), the same begin, wait and finish as the display's. */
+static int native_read_surface(Native *n, int index, const uint32_t rect[4], uint32_t *pixels, uint32_t size[2])
+{
+    if (index < 0 || !dhdr_native_surface_read_begin(n->r, (uint32_t)index, rect, size)) return 0;
+    int mapped = native_read_wait();
+    return dhdr_native_surface_read_finish(n->r, pixels) && mapped;
+}
+
 /* DHD_PRESENT_FILTER=point keeps the picture's pixels sharp; linear by default. Then DHD_ASPECT. */
 static void native_present_options(Native *n)
 {
@@ -308,7 +331,7 @@ static void native_scale_hold(Native *n, uint64_t memory)
     unsigned limit = NATIVE_SCALE_MAX, texture = dhdr_device_max_texture() / NATIVE_SURFACE_MAX;
     n->scale_reason = NATIVE_SCALE_FREE;
     if (texture && texture < limit) limit = texture, n->scale_reason = NATIVE_SCALE_TEXTURE;
-#ifdef __ANDROID__
+#if defined(__ANDROID__) || defined(DHD_IOS_RENDER)
     if (limit > NATIVE_PHONE_SCALE_MAX) limit = NATIVE_PHONE_SCALE_MAX, n->scale_reason = NATIVE_SCALE_PHONE;
 #endif
     while (memory && limit > 4 && (uint64_t)limit * limit * NATIVE_SCALED_BYTES > memory / 2)
@@ -319,8 +342,8 @@ static void native_scale_hold(Native *n, uint64_t memory)
     if (n->scale_setting > limit) n->scale_setting = limit;
 }
 
-/* native_init's common half: the Native over exact, the dual-source choice (DHD_WGPU_DUAL_SOURCE=0
-   turns it off), the Rust native renderer, the present options, the scale limit (native_scale_hold
+/* native_init's common half: the Native over exact, dual-source blending when the device has it
+   (the device decided: DHD_WGPU_DUAL_SOURCE, Intel GPUs; finding 188), the Rust native renderer, the present options, the scale limit (native_scale_hold
    with memory) and the replacements' device. NULL when unavailable (g keeps the exact renderer);
    *start: the time before Rust built its shaders and pipelines. */
 static Native *native_create_rust(NativeExact *exact, uint64_t memory, double *start)
@@ -332,8 +355,7 @@ static Native *native_create_rust(NativeExact *exact, uint64_t memory, double *s
        native_convert (init.rs inverse_table); C needs only color_pixel from it. */
     static uint32_t inverse[4096];
     native_inverse_table(n, inverse);
-    const char *dual = getenv("DHD_WGPU_DUAL_SOURCE");
-    n->dual = (dhdr_device_features() & DHDR_FEAT_DUAL_SOURCE) && !(dual && !atoi(dual));
+    n->dual = (dhdr_device_features() & DHDR_FEAT_DUAL_SOURCE) != 0;
     *start = host_wall_seconds();
     if (!(n->r = dhdr_native_create(n->dual ? DHDR_NATIVE_DUAL : 0)) ||
         !(n->snapshot = calloc(1, sizeof *n->snapshot))) {

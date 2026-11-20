@@ -4,6 +4,7 @@
     python port/tools/build_host64.py [build/wasm/dhd_core.wasm]                 # win-x64: dhd64.exe
     python3 port/tools/build_host64.py --target linux-x64 MODULE                 # Linux or WSL: dhd64 (ELF)
     python3 port/tools/build_host64.py --target macos-arm64 MODULE               # a Mac: dhd64 (Mach-O)
+    python3 port/tools/build_host64.py --target macos-x64 MODULE                 # an Intel Mac, for reference traces
     python port/tools/build_host64.py --target android-arm64 MODULE --jobs 2     # libmain.so (finding 091)
     python port/tools/build_host64.py [--target T] --fiber-test                  # the EE fibers alone
 
@@ -72,12 +73,16 @@ class Target:
         self.key, self.rust, self.out, self.exe, self.jobs, self.outputs = key, rust, out, exe, jobs, outputs
         self.fiber = fiber  # the fiber switch's adapter, port/host64/fiber_<fiber>.c (the CPU and its ABI)
         self.flags, self.wabt, self.simde = list(flags), Path(os.environ.get('WABT_DIR') or wabt), simde
-        self.windows, self.android, self.mac = key == 'win-x64', key == 'android-arm64', key == 'macos-arm64'
+        self.windows, self.android, self.mac = key == 'win-x64', key == 'android-arm64', key in ('macos-arm64', 'macos-x64')
+        self.ios = key.startswith('ios-')  # a static library the Xcode app links (port/ios, finding 224)
         self.posix = not self.windows
+        self.switch = key == 'switch-arm64'
 
 
 MAC_MIN = '11.0'  # the first macOS on Apple silicon (package_release.py's LSMinimumSystemVersion)
-ANDROID_API = 30  # sdl3.ANDROID_API: Android 11
+ANDROID_API = 29  # sdl3.ANDROID_API: Android 10 (finding 191)
+IOS_MIN = '17.0'  # sdl3.IOS_MIN and port/ios/project/Info.plist's MinimumOSVersion
+IOS_CPU = 'apple-a12'  # docs/PLAYING.md's minimum chip (iPhone XS/XR, iPad 8th gen); port/ios/cpu_floor.py checks it
 TARGETS = {t.key: t for t in (
     Target('win-x64', 'x86_64-pc-windows-msvc', 'build/host64-exe', 'dhd64.exe', 'win64'),
     Target('linux-x64', 'x86_64-unknown-linux-gnu', 'build/host64-linux', 'dhd64', 'sysv64',
@@ -86,6 +91,25 @@ TARGETS = {t.key: t for t in (
     Target('macos-arm64', 'aarch64-apple-darwin', 'build/host64-macos', 'dhd64', 'arm64', jobs=4,
            flags=['-arch', 'arm64', '-mmacosx-version-min=' + MAC_MIN, '-mcpu=apple-m1'],
            wabt='/opt/homebrew/opt/wabt', simde=Path.home() / 'DevCaches/simde-src'),
+    # iPhone and iPad: IOS_CPU, the oldest chip we support (docs/PLAYING.md's minimum), built on a
+    # Mac with Xcode's iphoneos SDK into libdhd_ios.a, which port/ios/build_ios.py links into the app.
+    # Never apple-m1 (A14): its SHA3 EOR3 closed the game on an A12 with SIGILL (finding 267);
+    # port/ios/cpu_floor.py refuses an IPA with an instruction above the A12.
+    Target('ios-arm64', 'aarch64-apple-ios', 'build/host64-ios', 'libdhd_ios.a', 'arm64', jobs=4,
+           flags=['-arch', 'arm64', '-miphoneos-version-min=' + IOS_MIN, '-mcpu=' + IOS_CPU, '-fPIC'],
+           wabt='/opt/homebrew/opt/wabt', simde=Path.home() / 'DevCaches/simde-src'),
+    # the same for the iOS Simulator on an Apple silicon Mac (its own SDK and platform; finding 224),
+    # with the phones' code selection, so the simulator runs what the phones run
+    Target('ios-sim-arm64', 'aarch64-apple-ios-sim', 'build/host64-ios-sim', 'libdhd_ios.a', 'arm64', jobs=4,
+           flags=['-arch', 'arm64', '-mios-simulator-version-min=' + IOS_MIN, '-mcpu=' + IOS_CPU, '-fPIC'],
+           wabt='/opt/homebrew/opt/wabt', simde=Path.home() / 'DevCaches/simde-src'),
+    # An Intel Mac: not released, the Switch port's reference for state traces and pictures
+    Target('macos-x64', 'x86_64-apple-darwin', 'build/host64-macos-x64', 'dhd64', 'sysv64', jobs=4,
+           flags=['-arch', 'x86_64', '-mmacosx-version-min=' + MAC_MIN, '-march=x86-64-v2']),
+    # The Switch: devkitA64's gcc and libnx; no Rust and no SDL (port/nx has what they give the others)
+    Target('switch-arm64', None, 'build/switch', 'dhd.elf', 'arm64', jobs=4, outputs=8,
+           flags=['-march=armv8-a+crc+crypto', '-mtune=cortex-a57', '-mtp=soft', '-ftls-model=local-exec', '-fPIE',
+                  '-D__SWITCH__', '-D_GNU_SOURCE']),
     # -march=armv8-a: every arm64 phone. ARMv8.2 (finding 091's first choice) closed the game at
     # start with SIGILL on ARMv8.0 cores, which budget chips still ship (the Snapdragon 680's
     # Cortex-A73/A53, issues #45 and #51; finding 155). -moutline-atomics keeps the ARMv8.1 atomics
@@ -99,31 +123,42 @@ TARGETS = {t.key: t for t in (
 # Off Windows: the POSIX host instead of the Win32 one
 POSIX_UNITS = {'port/host/host_win32.c': 'port/host/host_posix.c'}
 WINDOWS_ONLY = ('port/gs/replay.c',)  # Win32 calls (GS replay)
+# What both phone hosts share (port/host/phone.h, finding 227): SETTINGS' rows, the previous run's
+# lines, the launcher's update check, Share log's file and launcher.log, the disc import's rules
+# (finding 242)
+PHONE_UNITS = ['port/host/phone.c', 'port/net/update_check.c', 'port/host/log_bundle.c', 'port/host/disc_import.c']
 ANDROID_UNITS = ['port/host/android_main.c', 'port/host/android_perf.c', 'port/host/android_touch.c',
-                 'port/host/android_update.c', 'port/net/update_check.c']
-# Android: only SDL's entry leaves the library; everything else may be garbage-collected
-# (--gc-sections), as /opt:ref does for dhd64.exe.
-ANDROID_EXPORTS = '{\n  global: SDL_main;\n  local: *;\n};\n'
+                 'port/host/disc_check_jni.c', 'port/host/android_update.c', 'port/host/android_launcher.c'] + PHONE_UNITS
+# Android: only SDL's entry and the launcher's native calls (android_launcher.c, finding 225) leave
+# the library; everything else may be garbage-collected (--gc-sections), as /opt:ref does for dhd64.exe.
+ANDROID_EXPORTS = '{\n  global: SDL_main; Java_app_downhillrevived_Native_*; Java_app_downhillrevived_DiscImage_*;\n  local: *;\n};\n'
+# The Switch: port/nx in place of what stands on the OS (the rest is the shared host, over port/nx's SDL calls)
+SWITCH_UNITS = {'port/host/host_win32.c': 'port/nx/src/host_nx.c', 'port/host/sdl_host.c': 'port/nx/src/nx_host.c',
+                'port/hle/gamepad.c': 'port/nx/src/gamepad_nx.c',
+                'port/host/touch_host.c': 'port/nx/src/touch_nx.c'}
+SWITCH_EXTRA = ['port/nx/src/sdl_nx.c', 'port/nx/src/settings_nx.c', 'port/nx/src/stubs_nx.c', 'port/nx/src/exact_stub.c', 'port/nx/src/dhd_render_nx.c']
 
 
 def host_units(t):
     if t.windows:
         return list(HOST_UNITS)
-    return [POSIX_UNITS.get(u, u) for u in HOST_UNITS if u not in WINDOWS_ONLY] + (ANDROID_UNITS if t.android else [])
+    if t.switch:
+        return [SWITCH_UNITS.get(u, u) for u in HOST_UNITS if u not in WINDOWS_ONLY] + SWITCH_EXTRA
+    return [POSIX_UNITS.get(u, u) for u in HOST_UNITS if u not in WINDOWS_ONLY] + (ANDROID_UNITS if t.android else PHONE_UNITS if t.ios else [])
 
 
 def glue(t):
-    return [SOURCE / n for n in ('guest_memory.c', 'guest_memory_%s.c' % ('win32' if t.windows else 'posix'),
-                                 'fiber.c', 'fiber_%s.c' % t.fiber, 'fp_mode.c', 'bridge.c', 'diagnostics.c',
-                                 'launcher.c')]
+    return [SOURCE / n for n in ('guest_memory.c', 'guest_memory_%s.c' % ('win32' if t.windows else 'nx' if t.switch else 'posix'),
+                                 'fiber.c', 'fiber_%s.c' % t.fiber, 'fp_mode.c', 'guest_place.c', 'bridge.c',
+                                 'diagnostics.c', 'launcher.c')]
 
 
 def fiber_test(t, a, cc, wabt, out, env):
     """--fiber-test: port/host64/selftest_fiber.c with the target's compiler, guest memory and fiber
-    adapter (glue's first five units). Run here with its two guard-fault children (android-arm64:
+    adapter (glue's first six units). Run here with its two guard-fault children (android-arm64:
     built only)."""
     import signal
-    sources = [SOURCE/'selftest_fiber.c'] + glue(t)[:5]
+    sources = [SOURCE/'selftest_fiber.c'] + glue(t)[:6]
     flags = ['-DWASM_RT_STACK_DEPTH_COUNT=1', '-I'+str(wabt/'include'), '-I'+str(SOURCE)]
     exe = out/('selftest_fiber.exe' if t.windows else 'selftest_fiber')
     if t.windows:
@@ -134,6 +169,8 @@ def fiber_test(t, a, cc, wabt, out, env):
                'onecore.lib', '/subsystem:console']
     else:
         cmd = [cc, *t.flags, '-O2', '-pthread', *flags, *sources, '-o', exe] + (['-rdynamic'] if not t.mac else [])
+        if t.android:  # guest RAM's ashmem region on Android 10 (guest_memory_posix.c)
+            cmd.append('-landroid')
     r = subprocess.run(list(map(str, cmd)), cwd=out, env=env, capture_output=True, text=True, timeout=300)
     if r.returncode:
         raise RuntimeError(' '.join(map(str, cmd)) + '\n' + r.stdout + r.stderr)
@@ -178,12 +215,44 @@ def rust_library(t, work):
     return rep
 
 
+def pgo_keys(profile, tools):
+    """Refuses a profile whose static functions are keyed by a path, as every profile recorded
+    before finding 195 is (and one recorded by another tool may be): this build looks its static
+    functions up by file name, would find none of them, and would say nothing (the compiles run
+    with -w), so most of what the profile is for would be lost unnoticed. Read once per profile (a
+    note beside its copy in the work folder); without an llvm-profdata to read it with (the NDK has
+    one) nothing is checked."""
+    note = profile.with_suffix('.keys')
+    if note.exists():
+        return
+    show = tools / 'llvm-profdata.exe' if tools else shutil.which('llvm-profdata')
+    if not show or not Path(show).exists():
+        return
+    r = subprocess.run([str(show), 'show', '--all-functions', str(profile)], capture_output=True, text=True,
+                       encoding='utf-8', errors='replace')
+    if r.returncode:
+        raise RuntimeError('--pgo-use: llvm-profdata cannot read the profile: ' + r.stderr.strip()[-300:])
+    names = [line[2:-1] for line in r.stdout.splitlines()
+             if line.startswith('  ') and not line.startswith('   ') and line.endswith(':')]
+    static = [n.rsplit(';', 1)[0] for n in names if ';' in n]
+    with_path = sum('/' in unit or chr(92) in unit for unit in static)   # chr(92): a backslash
+    if with_path:
+        raise RuntimeError("--pgo-use: %d of the profile's %d static functions are keyed by a path, not by a file "
+                           'name: it was recorded by a build without -static-func-full-module-prefix=false '
+                           '(before finding 195), and this build would find none of them. Record a new one '
+                           '(docs/BUILDING.md, "Build times").' % (with_path, len(static)))
+    note.write_text('%d functions, %d static, keyed by file name\n' % (len(names), len(static)))
+    print('pgo: %d functions in the profile, %d static, keyed by file name' % (len(names), len(static)), flush=True)
+
+
 def sdl(t, a):
     """(SDL3's library, its include directory, the libraries it needs at link time)."""
     import sdl3
     if t.android:
         lib, include, _java = sdl3.android_build()
         return lib, include, []
+    if t.ios:
+        return sdl3.ios_build(simulator=t.key == 'ios-sim-arm64')
     if a.sdl_lib and not a.sdl_include:
         raise ValueError('--sdl-lib needs --sdl-include')
     if t.windows:
@@ -247,7 +316,7 @@ def main():
     pgo.add_argument('--pgo-generate', action='store_true',
                      help='instrumented build (clang targets): an Android run writes files/dhd-<pid>.profraw at its exit')
     pgo.add_argument('--pgo-use', type=Path, metavar='PROFDATA',
-                     help='optimize with this profile (llvm-profdata merge of the .profraw files)')
+                     help="optimize with this profile (llvm-profdata merge of the .profraw files; switch-arm64: a folder of .gcda files)")
     a = p.parse_args()
     t = TARGETS[a.target]
     if not a.fiber_test and not a.fake and not a.module:
@@ -292,16 +361,35 @@ def main():
         cc, ar = tools / 'clang.exe', tools / 'llvm-ar.exe'
         if not cc.exists():
             p.error('no NDK clang at %s' % cc)
+    elif t.ios:
+        # Apple's clang (xcrun's), not a wasm-only clang a wasi-sdk may put first on PATH; the SDK's
+        # headers and libraries through -isysroot
+        if sys.platform != 'darwin':
+            p.error('--target %s builds on a Mac with Xcode' % t.key)
+        sdk_name = 'iphonesimulator' if t.key == 'ios-sim-arm64' else 'iphoneos'
+        sdk = subprocess.run(['xcrun', '--sdk', sdk_name, '--show-sdk-path'], capture_output=True, text=True)
+        if sdk.returncode:
+            p.error('no %s SDK (xcrun): %s' % (sdk_name, sdk.stderr.strip()))
+        t.flags = ['-isysroot', sdk.stdout.strip()] + t.flags
+        ndk, tools, cc, ar = None, None, '/usr/bin/clang', '/usr/bin/ar'
+    elif t.switch:
+        kit = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
+        ndk, tools = None, kit / 'devkitA64/bin'
+        cc, ar = tools / 'aarch64-none-elf-gcc', tools / 'aarch64-none-elf-ar'
     elif t.posix:
         ndk, tools, cc, ar = None, None, 'clang', 'ar'
     if a.fiber_test:
         return fiber_test(t, a, None if t.windows else cc, wabt, work, env)
     try:
         # SDL3 and the Rust library first: their checks are quick to fail, the module's C is not
-        sdl_lib, sdl_include, sdl_libs = sdl(t, a)
-        step('SDL3')
-        report = rust_library(t, work)
-        step('Rust library')
+        if t.switch:
+            sdl_lib, sdl_include, sdl_libs = None, ROOT / 'port/nx/include', []
+            report = {'native_static_libs': []}
+        else:
+            sdl_lib, sdl_include, sdl_libs = sdl(t, a)
+            step('SDL3')
+            report = rust_library(t, work)
+            step('Rust library')
         if a.fake:
             wasm = work / 'fake.wasm'
             run([a.wasi/'bin/clang.exe', '-O2', '-nostdlib', '-ffp-contract=off',
@@ -389,8 +477,14 @@ def main():
         # guest address and ends the process, as the trap did. WABT's own fault-to-trap handler stays
         # off (WASM_RT_SKIP_SIGNAL_RECOVERY): ours handle faults. Traps can come from any EE fiber:
         # report and end (launcher.c).
+        # iOS gives an app no 8 GiB reservation without an entitlement that unsigned and free-account
+        # installs lack: there the module's memory is at most 2 GiB, the guest reserved in two parts with
+        # a 64 KiB window above (guest_memory.c, finding 258), and
+        # wasm2c's own guard-page checks are off (prepare_wasm2c.py's MEMCHECK_SKIP; finding 224)
+        memcheck = (['-DWASM_RT_MEMCHECK_BOUNDS_CHECK=1', '-DWASM_RT_SKIP_BOUNDS_CHECKS=1'] if t.ios
+                    else ['-DWASM_RT_MEMCHECK_GUARD_PAGES=1'])
         defines = ['-DWASM_RT_STACK_DEPTH_COUNT=1', '-DWASM_RT_MAX_CALL_STACK_DEPTH=512', '-DWASM_RT_THREAD_LOCAL=',
-                   '-DWASM_RT_MEMCHECK_GUARD_PAGES=1', '-DWASM_RT_SKIP_SIGNAL_RECOVERY=1']
+                   *memcheck, '-DWASM_RT_SKIP_SIGNAL_RECOVERY=1']
         defines += ['-DHOST64_FAKE_MODULE=1'] if a.fake else ['-DWASM_RT_TRAP_HANDLER=host64_trap']
         includes = ['-I'+str(work), '-I'+str(wabt/'include'), '-I'+str(rt), '-I'+str(SOURCE),
                     '-I'+str(ROOT/'port/runtime'), '-I'+str(ROOT/'port/include'), '-I'+str(ROOT/'port/host'),
@@ -401,14 +495,37 @@ def main():
         maps += [(a.llvm, 'llvm')] if t.windows else [(ndk, 'ndk')] if t.android else [(simde, 'simde')]
         prefix_maps = ['-ffile-prefix-map=%s=%s' % (spelling, new) for old, new in maps
                        for spelling in dict.fromkeys((str(old), str(old).replace('\\', '/')))]  # a set's order varies
-        pgo_flags = []
-        if a.pgo_generate:
-            pgo_flags = ['-fprofile-generate']
+        # A static function's key in a profile is "<its unit's path>;<name>", the path as the compiler
+        # was given it, and -ffile-prefix-map does not touch it: a profile recorded in one checkout
+        # or build folder then matches no static function of a build made in another (finding 195:
+        # the VU1 kernels and translated blocks, the GS and graphics queue's helpers and every static
+        # function of the module's C went unprofiled in every build but the recording lane's own).
+        # With this the key is "<file name>;<name>", the same wherever the build is made; the
+        # recording build and the using build must both have it (pgo_flags[0] alone goes to the link).
+        pgo_flags, pgo_names = [], ['-mllvm', '-static-func-full-module-prefix=false']
+        if a.pgo_generate and t.switch:  # gcc; the console writes one .gcda per object to the card
+            pgo_flags = ['-fprofile-generate=sdmc:/dhd-pgo', '-fprofile-update=single']
+        elif a.pgo_generate:
+            pgo_flags = ['-fprofile-generate', *pgo_names]
+        elif a.pgo_use and t.switch:  # a folder of .gcda files, copied under its hash for the object cache
+            digest = hashlib.sha256()
+            gcda = sorted(a.pgo_use.rglob('*.gcda'))  # gcc looks under the object's whole path
+            if not gcda:
+                raise SystemExit('no .gcda files in %s' % a.pgo_use)
+            for f in gcda:
+                digest.update(f.relative_to(a.pgo_use).as_posix().encode() + f.read_bytes())
+            profile = work / ('pgo-%s' % digest.hexdigest()[:16])
+            for f in gcda:
+                copy = profile / f.relative_to(a.pgo_use)
+                copy.parent.mkdir(parents=True, exist_ok=True)
+                copy.write_bytes(f.read_bytes())
+            pgo_flags = ['-fprofile-use=' + str(profile), '-fprofile-correction', '-Wno-missing-profile']
         elif a.pgo_use:  # copied under its hash, so the object cache keys follow its content
             data = a.pgo_use.read_bytes()
             profile = work / ('pgo-%s.profdata' % hashlib.sha256(data).hexdigest()[:16])
             profile.write_bytes(data)
-            pgo_flags = ['-fprofile-use=' + str(profile)]
+            pgo_keys(profile, tools if t.android else None)
+            pgo_flags = ['-fprofile-use=' + str(profile), *pgo_names]
         if t.windows:
             common = [a.llvm/'clang-cl.exe', '--target=x86_64-pc-windows-msvc', '/nologo',
                       '/O2', '/clang:-O3', '/clang:-march=x86-64-v2', '/clang:-mtune=znver3',
@@ -420,6 +537,17 @@ def main():
             common += ['/clang:' + m for m in prefix_maps]
             if a.debug:
                 common += ['/clang:-gline-tables-only', '/clang:-gcodeview']
+        elif t.switch:
+            # gcc: no -ffp-model; -frounding-math keeps float work on the mode the fibers set
+            kit = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
+            common = [cc, *t.flags, '-c', '-O3', '-frounding-math', '-ffp-contract=off', '-fno-fast-math',
+                      '-ftrivial-auto-var-init=zero', '-fno-strict-aliasing', '-ffunction-sections', '-fdata-sections',
+                      '-fwrapv', '-w', '-fno-working-directory', *pgo_flags, *defines, *includes, '-I'+str(kit/'libnx/include'),
+                      '-I'+str(ROOT/'port/render/include'), '-I'+str(ROOT/'port/hle'), '-I'+str(ROOT/'port/nx/include'),
+                      *prefix_maps, '-g']
+            # deko3d's shaders, compiled now (nx_shaders.py: naga and uam)
+            import nx_shaders
+            run([sys.executable, ROOT/'port/tools/nx_shaders.py', work/'nx_shaders.inc'])
         else:
             # one section per function and datum, as the Windows build's /Gy: the link
             # garbage-collects what nothing references (/opt:ref there)
@@ -438,14 +566,22 @@ def main():
                 extra += ['-DPS2_VU_AOT']
             if rel.endswith('gs/gpu_rust.c'):
                 extra += ['-I'+str(ROOT/'port/render/include')]  # dhd_render.h
+            if rel.endswith('host64/launcher.c') and t.switch:
+                extra += ['-Dmain=dhd_launcher_main']  # main is nx_host.c's
             if rel.endswith('host64/launcher.c') and t.android:
                 extra += ['-Dmain=dhd_launcher_main']  # SDL_main (android_main.c) calls it
+            if rel.endswith('host64/launcher.c') and t.ios:
+                extra += ['-Dmain=dhd_main']  # the app's game thread calls it (port/ios/host/ios_main.m)
             if 'libmpeg2/' in rel:
                 extra += ['-I'+str(ROOT/'port/third_party/libmpeg2')]
             obj = objdir/(rel.replace('/', '_') + suffix)
-            cmd = common + extra + (['/c', source, '/Fo'+str(obj)] if t.windows else [source, '-o', obj])
+            flags = common
+            # the Switch's profile covers the game's code and VU only: instrumented, the host's start hangs
+            if t.switch and pgo_flags and not (source.name.startswith('core_') or rel.endswith('vu0_interp.c')):
+                flags = [x for x in common if x not in pgo_flags]
+            cmd = flags + extra + (['/c', source, '/Fo'+str(obj)] if t.windows else [source, '-o', obj])
             # the shared object cache (objcache.py); this output folder is a token
-            objcache.compile(list(map(str, cmd)), str(obj), lambda c: run(c, timeout=timeout) and None,
+            objcache.compile(list(map(str, cmd)), str(obj), lambda c: run(c, timeout=14400 if t.switch and pgo_flags else timeout) and None,
                              roots=[(work, 'out')], cwd=work, env=env, hit='')
             return obj
         # VU1's straight-line blocks as C (vu1_aot.inc and vu1_native_clip.inc, from the game's
@@ -465,8 +601,10 @@ def main():
         # not start last); the link keeps the units' own order
         sources = units + [rt/'wasm-rt-impl.c', work/'imports_gen.c'] + glue(t)
         host_sources = [] if a.host_library else [ROOT/u for u in host_units(t)]
+        # devkitA64's gcc -O3 takes over 15 minutes on vu0_interp.c alone (its VU1 blocks, finding 270)
+        host_timeout = 7200 if t.switch else 900
         with ThreadPoolExecutor(jobs) as pool:
-            done = {s: pool.submit(compile_one, s, 900 if s in host_sources else 1800)
+            done = {s: pool.submit(compile_one, s, host_timeout if s in host_sources else 1800)
                     for s in sorted(sources + host_sources, key=lambda s: -Path(s).stat().st_size)}
             objects = [done[s].result() for s in sources]
             host_objects = [done[s].result() for s in host_sources]
@@ -507,6 +645,19 @@ def main():
             if a.debug:
                 link += ['/debug', '/pdb:'+str(out/'dhd64.pdb')]
             (work/'link.log').write_text(run(link))
+        elif t.switch:
+            kit = Path(os.environ.get('DEVKITPRO') or '/opt/devkitpro')
+            gcov_tls = []
+            if a.pgo_generate:  # before libgcov, which reads TLS from tpidr_el0 (0 here): port/nx/pgo/gcov_tls.c
+                gcov_tls = [objdir/'gcov_tls.o']
+                run([cc, *t.flags[:5], '-O2', '-c', ROOT/'port/nx/pgo/gcov_tls.c', '-o', gcov_tls[0]])
+            run([cc, '-specs='+str(kit/'libnx/switch.specs'), *t.flags[:4], '-fPIE', '-g', '-Wl,--gc-sections',
+                 *gcov_tls, *(['-fprofile-generate', '-Wl,-u,__gcov_dump'] if a.pgo_generate else []),
+                 '-L'+str(kit/'libnx/lib'), *objects, library, '-ldeko3d', '-lnx', '-lm', '-o', exe,
+                 '-Wl,-Map,'+str(out/'dhd.map')], timeout=3600)
+            nacp, nro = out/'dhd.nacp', out/'downhill-revived.nro'
+            run([kit/'tools/bin/nacptool', '--create', 'Downhill Revived', 'skuza-oss', '0.7.6', nacp])
+            run([kit/'tools/bin/elf2nro', exe, nro, '--nacp='+str(nacp), '--icon='+str(ROOT/'port/nx/icon.jpg')])
         elif t.android:
             exports_map = work/'exports.map'
             exports_map.write_text(ANDROID_EXPORTS)
@@ -518,6 +669,10 @@ def main():
                                      objects + [library, report['lib'], sdl_lib]))
             run([cc, t.flags[0], '-shared', *pgo_flags[:1], '-o', debug, '@'+str(rsp),
                  '-Wl,-soname,libmain.so', '-Wl,--version-script='+str(exports_map),
+                 # the launcher's native calls (android_launcher.c, finding 225): nothing in the
+                 # library calls them, so their member of libhost64.a is pulled in by name
+                 '-Wl,--undefined-glob=Java_app_downhillrevived_Native_*',
+                 '-Wl,--undefined-glob=Java_app_downhillrevived_DiscImage_*',
                  '-Wl,--gc-sections', '-Wl,--no-undefined', '-Wl,--build-id=sha1',
                  '-Wl,-z,max-page-size=16384', '-Wl,-z,noexecstack', '-Wl,-z,relro', '-Wl,-z,now',
                  '-landroid', *rust_libs, '-lm'], timeout=1800)
@@ -531,6 +686,11 @@ def main():
             run([cc, *t.flags[:3], *pgo_flags[:1], '-Wl,-dead_strip', '-Wl,-S', *objects, library, report['lib'], sdl_lib,
                  *[w for x in sdl_libs for w in x.split()], *[w for x in rust_libs for w in x.split()],
                  '-o', exe], timeout=900)
+        elif t.ios:
+            # one static archive (the module, the host, the Rust library and SDL3) for the Xcode app;
+            # Xcode's link garbage-collects and strips it
+            exe.unlink(missing_ok=True)
+            run(['/usr/bin/libtool', '-static', '-o', exe, *objects, library, report['lib'], sdl_lib], timeout=900)
         else:
             # LLVM's lld: GNU ld on a tree under /mnt (WSL's 9p) took minutes, past the timeout;
             # lld links the same objects there in about 2 s
@@ -545,13 +705,13 @@ def main():
         print(f'PASS: {imports} generated imports; {host_summary}; {exe} ({exe.stat().st_size / 1048576:.1f} MB)',
               flush=True)
         print('steps: ' + step.summary(), flush=True)
-        if a.run and not t.android:
+        if a.run and not t.android and not t.ios:
             if a.fake:
                 (work/'fixture.txt').write_bytes(b'host64-proof')
             env.update(DHD_HEADLESS='1', DHD_SND_OFF='1')
             result = run([exe], timeout=60)
             if a.fake:
-                for test in range(1,12):
+                for test in (1,2,3,4,5,7,8,9,10,11):
                     result += run([exe,'--negative',test],timeout=30)
             (work/'run.log').write_text(result)
             print(result, end='')

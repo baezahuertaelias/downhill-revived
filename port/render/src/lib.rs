@@ -14,6 +14,7 @@
 //! | `abi` | F0a | the `#[repr(C)]` mirrors of the header (frozen) |
 //! | `ffi`, `guard`, `host`, `log`, `shaders` | F0b | exports, MXCSR guard and `Owned`, host log, logger, WGSL |
 //! | `device` | A2 | the process's one device |
+//! | `lost` | 171 | a lost device: noticed, its reason logged once (the game then ends) |
 //! | `exact::pipelines` | A2 | raster.wgsl's compute pipelines |
 //! | `exact::{buffers, encoder, readback}` | A3 (B1: wasm readback) | the 11 buffers, the open encoder and pass, reads |
 //! | `exact::display` | A4 | the display texture, scanout's bind group, capture |
@@ -37,7 +38,12 @@ pub mod ffi;
 pub mod guard;
 pub mod host;
 pub mod log;
+pub mod lost;
+mod loss_context;
 pub mod shaders;
+pub mod startup;
+#[cfg(target_os = "android")]
+mod phone_defaults;
 
 /// The texture packs' PNG decoder (port/gs/texpack.c), on every native platform.
 #[cfg(feature = "native")]
@@ -119,6 +125,7 @@ pub mod native {
     pub mod render;
     pub mod scanout;
     pub mod shared;
+    pub mod surface_read;
     pub mod surfaces;
     pub mod textures;
     pub mod zread;
@@ -144,6 +151,8 @@ pub mod native {
         pub pass: render::Pass,
         pub presenter: present::Presenter,
         pub zread: zread::ZRead,
+        /// A colour surface's read for the EE in flight (`surface_read.rs`, finding 250).
+        pub surface_read: Option<surface_read::Reading>,
     }
 
     /// One picture as C handed it over (`DhdrPicture`), with its arrays as slices. Built by
@@ -153,7 +162,7 @@ pub mod native {
         pub commands: &'a [DhdrCommand],
         pub converts: &'a [DhdrConvert],
         pub surfaces: &'a [DhdrSurfaceInfo],
-        /// The scanned-out surface, or -1.
+        /// The scanned-out surface, -1 (none: the last picture stays) or `abi::DISPLAY_OFF` (black).
         pub display_surface: i32,
         pub display: [u32; 12],
         /// `movie_on`: the movie frame (width, height, RGBA8 pixels), shown instead.

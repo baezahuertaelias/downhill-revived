@@ -11,7 +11,9 @@
 //!   (`native_pixel_blend`), 3 alpha only (no blend state).
 //! Bits 25..28 are private: a power-of-two source scale (S=E), or zero for generic. Bit 29
 //! (`TEXELS`): the draw reads a decoded texture's R32Uint texels (the `_u` entry points and the
-//! texels layout).
+//! texels layout). Bit 30 (`MESH`): a translated VU1 mesh draw (flag 4096, finding 164): the vertex
+//! stage is `native_mesh_vertex`, which reads the vertex as a mesh item's (`MESH_ATTRIBUTES`), and
+//! back faces are culled; bit 31 (`MESH_TWO_SIDED`) with it: no culling (finding 167).
 //! The GS key's blend, depth and variant fields remain unchanged. The cache's key is 64 bits: this
 //! key, and above it (`SPEC_SHIFT`) the fragment stage's specialisation, `spec` (native.wgsl's
 //! `native_spec`; zero for the generic shader).
@@ -26,7 +28,7 @@
 //!
 //! Referee: `rustgs.py test ... -- --test native_keys`, and `--test device_smoke native`.
 use crate::device::Gpu;
-use crate::native::init::{scoped, Objects};
+use crate::native::init::{scoped_pipeline, Objects};
 use std::collections::HashMap;
 
 pub const VARIANT_PLAIN: u32 = 0;
@@ -36,6 +38,10 @@ pub const VARIANT_ALPHA_ONLY: u32 = 3;
 pub const TEXEL_SCALE_SHIFT: u32 = 25;
 /// The draw reads a decoded texture's texels (native.wgsl's `_u` entry points).
 pub const TEXELS: u32 = 1 << 29;
+/// A translated VU1 mesh draw (native.wgsl's `native_mesh_vertex`, back faces culled; finding 164).
+pub const MESH: u32 = 1 << 30;
+/// With MESH: both sides drawn (the loops without back-face culling; finding 167).
+pub const MESH_TWO_SIDED: u32 = 1 << 31;
 /// Where a cache key holds the draw's fragment specialisation (`spec`).
 pub const SPEC_SHIFT: u32 = 32;
 
@@ -140,6 +146,23 @@ pub fn blend_operation(d3d: u32) -> Option<wgpu::BlendOperation> {
     }
 }
 
+/// A draw's blend key and colour write mask without a blend that keeps the colour: Cs * 0 + Cd * 1
+/// (or Cd * 1 - Cs * 0) leaves every colour channel as it was, so the draw is the same without
+/// blending and with only its alpha channel written (the alpha blend is One / Zero, a plain write).
+/// Exact: a UNORM target clamps Cs to [0, 1] before blending, so Cs * 0 is 0. The GS makes it
+/// with A = B ((Cs - Cs) * As + Cd, native_blend), a draw that only writes Z or alpha. PowerVR
+/// Rogue's driver (1.13), which blends in the fragment program, does not create that pipeline
+/// (finding 176). A draw left with no channel and no Z write draws nothing (`render.rs` skips it).
+pub fn without_kept_colour(blend_key: u32, mask: u32) -> (u32, u32) {
+    let (src, dst, op) = (blend_key >> 1 & 31, blend_key >> 6 & 31, blend_key >> 11 & 7);
+    // D3D11 ZERO (1) and ONE (2); operations 0 and 1 are Add, 3 ReverseSubtract (blend_operation).
+    if blend_key & 1 != 0 && src == 1 && dst == 2 && matches!(op, 0 | 1 | 3) {
+        (0, mask & 8)
+    } else {
+        (blend_key, mask)
+    }
+}
+
 /// The depth function of a key's depth field (0-4: never, always, gequal, greater, equal; 5-7
 /// always).
 fn depth_compare(function: u32) -> wgpu::CompareFunction {
@@ -229,6 +252,24 @@ pub fn describe(key: u32) -> Result<PipelineDesc, String> {
     })
 }
 
+/// What a failed pipeline was (its log line, finding 176): the fragment entry point and
+/// specialisation, the blend state, the write mask and the depth state.
+fn summary(full: u64, d: &PipelineDesc) -> String {
+    let key = full as u32;
+    let blend = match &d.color.blend {
+        Some(b) => format!("{:?}/{:?} {:?}", b.color.src_factor, b.color.dst_factor, b.color.operation),
+        None => "none".into(),
+    };
+    let depth = match &d.depth {
+        Some(z) => format!("{:?}{}", z.depth_compare.unwrap_or(wgpu::CompareFunction::Always),
+                           if z.depth_write_enabled == Some(true) { " write" } else { "" }),
+        None => "none".into(),
+    };
+    format!("fs {}{} spec {:X} texel scale {}, blend {blend}, write mask {:X}, depth {depth}",
+            d.entry, if key & TEXELS != 0 { " (texels)" } else { "" }, full >> SPEC_SHIFT,
+            key >> TEXEL_SCALE_SHIFT & 15, d.color.write_mask.bits())
+}
+
 /// The vertex layout of every draw (`DhdrVertex`, 32 bytes): position xyz, stqf, rgba bytes.
 const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
@@ -236,6 +277,13 @@ const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 3] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint8x4, offset: 28, shader_location: 2 },
 ];
 const _: () = assert!(std::mem::size_of::<crate::abi::DhdrVertex>() == 32);
+/// The same 32 bytes as a mesh item's vertex (gs_mesh.h's GsMeshVertex, finding 249): the
+/// clip-space position, the texture coordinates with the Q factor, the colour's bytes.
+const MESH_ATTRIBUTES: [wgpu::VertexAttribute; 3] = [
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 0, shader_location: 0 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 16, shader_location: 1 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint8x4, offset: 28, shader_location: 2 },
+];
 
 /// What a draw pipeline is built from (cloned handles, so a worker thread can build one).
 #[derive(Clone)]
@@ -249,8 +297,25 @@ struct Sources {
 impl Sources {
     fn of(objects: &Objects) -> Sources {
         Sources { module: objects.module.clone(), dual_module: objects.dual_module.clone(),
-                  layout: objects.draw_layout.clone(), texels_layout: objects.texels_draw_layout.clone() }
+                  layout: objects.native_draw_layout.clone(), texels_layout: objects.native_texels_draw_layout.clone() }
     }
+}
+
+/// Runtime pipeline breadcrumbs for #68's GPU, after the startup recorder retires.
+/// A returned call can still have an error in the enclosing pipeline scope.
+fn trace_build<T>(enabled: bool, key: u64, detail: impl FnOnce() -> String,
+                  mut log: impl FnMut(&str), create: impl FnOnce() -> T) -> T {
+    if !enabled { return create(); }
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    log(&format!("gs pipeline: begin {id} key={key:X}: {}", detail()));
+    let result = create();
+    log(&format!("gs pipeline: returned {id} key={key:X} (check pipeline errors for success)"));
+    result
+}
+
+fn trace_gpu(backend: wgpu::Backend, name: &str) -> bool {
+    backend == wgpu::Backend::Vulkan && matches!(name, "PowerVR Rogue GE8320" | "PowerVR GE8320")
 }
 
 /// Builds the pipeline of `key` (no cache, no scope).
@@ -258,6 +323,8 @@ fn build(gpu: &Gpu, objects: &Sources, full: u64, d: &PipelineDesc) -> Result<wg
     let key = full as u32;
     let spec = (full >> SPEC_SHIFT) as u32;
     let texels = key & TEXELS != 0;
+    let mesh = key & MESH != 0;
+    // A mesh draw's fragment stage is the GS draws' (native.wgsl's native_mesh_vertex gives Varyings).
     let entry = match (d.entry, texels) {
         ("native_pixel", true) => "native_pixel_u",
         ("native_pixel_blend", true) => "native_pixel_blend_u",
@@ -275,7 +342,7 @@ fn build(gpu: &Gpu, objects: &Sources, full: u64, d: &PipelineDesc) -> Result<wg
     let vertex = wgpu::VertexBufferLayout {
         array_stride: std::mem::size_of::<crate::abi::DhdrVertex>() as u64,
         step_mode: wgpu::VertexStepMode::Vertex,
-        attributes: &VERTEX_ATTRIBUTES,
+        attributes: if mesh { &MESH_ATTRIBUTES } else { &VERTEX_ATTRIBUTES },
     };
     let targets = [Some(d.color.clone())];
     let texel_scale = key >> TEXEL_SCALE_SHIFT & 15;
@@ -290,18 +357,34 @@ fn build(gpu: &Gpu, objects: &Sources, full: u64, d: &PipelineDesc) -> Result<wg
         constants: &constants,
         zero_initialize_workgroup_memory: crate::native::init::compilation_options().zero_initialize_workgroup_memory,
     };
-    Ok(gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+    let layout = if texels { &objects.texels_layout } else { &objects.layout };
+    // a pipeline the driver died building in an earlier run is not built; this one is written
+    // down while the driver builds it (list, finding 260)
+    #[cfg(not(target_arch = "wasm32"))]
+    let _building = {
+        if list::refused(full) {
+            return Err(format!("native pipeline {full:X}: not built, the driver died building it in an earlier run \
+                                (pipelines.txt)"));
+        }
+        list::building(full)
+    };
+    Ok(trace_build(cfg!(target_os = "android") && trace_gpu(gpu.info.backend, &gpu.info.name), full,
+        || format!("vs={} fs={entry}; {}", if mesh { "native_mesh_vertex" } else { "native_vertex" }, summary(full, d)),
+        crate::host::log, || gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
         label: Some("native draw"),
-        layout: Some(if texels { &objects.texels_layout } else { &objects.layout }),
+        layout: Some(layout),
         vertex: wgpu::VertexState {
             module: &objects.module,
-            entry_point: Some("native_vertex"),
+            entry_point: Some(if mesh { "native_mesh_vertex" } else { "native_vertex" }),
             compilation_options: crate::native::init::compilation_options(),
             buffers: &[vertex],
         },
+        // A mesh's triangles come in the winding that leaves the VU's back faces with a positive
+        // area in GS pixels (y down): clockwise in clip space (vu1_mesh.inc).
         primitive: wgpu::PrimitiveState {
             topology: wgpu::PrimitiveTopology::TriangleList,
-            cull_mode: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: if mesh && key & MESH_TWO_SIDED == 0 { Some(wgpu::Face::Back) } else { None },
             ..Default::default()
         },
         depth_stencil: d.depth.clone(),
@@ -314,7 +397,40 @@ fn build(gpu: &Gpu, objects: &Sources, full: u64, d: &PipelineDesc) -> Result<wg
         }),
         multiview_mask: None,
         cache: None,
-    }))
+    })))
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+    #[test]
+    fn only_the_reported_gpu_family() {
+        assert!(trace_gpu(wgpu::Backend::Vulkan, "PowerVR Rogue GE8320"));
+        assert!(trace_gpu(wgpu::Backend::Vulkan, "PowerVR GE8320"));
+        assert!(!trace_gpu(wgpu::Backend::Gl, "PowerVR Rogue GE8320"));
+        for name in ["PowerVR Rogue GE8322", "Mali-G52 MC2", "Adreno (TM) 505", "unknown"] {
+            assert!(!trace_gpu(wgpu::Backend::Vulkan, name));
+        }
+    }
+    #[test]
+    fn begin_precedes_creation_and_error_result_is_preserved() {
+        use std::cell::RefCell;
+        let lines = RefCell::new(Vec::new());
+        let result: Result<(), &str> = trace_build(true, 0x123456789, || "test draw state".into(),
+            |line| lines.borrow_mut().push(line.to_owned()), || {
+                assert_eq!(lines.borrow().len(), 1);
+                Err("driver refused")
+            });
+        assert_eq!(result, Err("driver refused"));
+        let lines = lines.into_inner();
+        assert!(lines[0].contains("key=123456789: test draw state"));
+        let id = lines[0].split_whitespace().nth(3).unwrap();
+        assert!(lines[1].starts_with(&format!("gs pipeline: returned {id} key=123456789")));
+    }
+    #[test]
+    fn disabled_trace_neither_formats_nor_logs() {
+        assert_eq!(trace_build(false, 1, || panic!("no formatting"), |_| panic!("no log"), || 42), 42);
+    }
 }
 
 /// Built pipelines by key (failures are kept too, so a bad key is reported once, not per draw).
@@ -325,28 +441,58 @@ pub struct Pipelines {
     worker: Option<Worker>,
 }
 
-/// The thread that builds specialised pipelines, and the keys it has not answered yet.
+/// What the worker thread is asked.
+#[cfg(not(target_arch = "wasm32"))]
+enum Job {
+    /// Build this key's pipeline and answer with it.
+    Build(u64, PipelineDesc),
+    /// The render thread built this key itself: it goes into the pipeline list.
+    Learned(u64),
+}
+
+/// The thread that builds pipelines off the frame (the specialised ones, and the listed ones of
+/// earlier runs), and the keys it has not answered yet.
 #[cfg(not(target_arch = "wasm32"))]
 struct Worker {
-    jobs: std::sync::mpsc::Sender<(u64, PipelineDesc)>,
+    jobs: std::sync::mpsc::Sender<Job>,
     done: std::sync::mpsc::Receiver<(u64, Result<wgpu::RenderPipeline, String>)>,
+    /// Specialised keys a draw asked for.
     waiting: std::collections::HashSet<u64>,
+    /// Listed keys sent at the start (`Pipelines::build_ahead`).
+    ahead: std::collections::HashSet<u64>,
+    /// When they were sent and how many, until the last one is back (one log line then).
+    ahead_sent: Option<(std::time::Instant, usize)>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Worker {
-    fn start(gpu: &'static Gpu, sources: Sources) -> Worker {
-        let (jobs, inbox) = std::sync::mpsc::channel::<(u64, PipelineDesc)>();
+    /// `list`: the pipeline list, to which the thread adds every key that builds (it alone writes
+    /// the file, so no write is ever on the render thread).
+    fn start(gpu: &'static Gpu, sources: Sources, mut list: Option<list::File>) -> Worker {
+        let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
         let (outbox, done) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new().name("dhd-pipelines".into()).spawn(move || {
             // Ends when the Pipelines (the sender) is dropped.
-            while let Ok((key, d)) = inbox.recv() {
+            while let Ok(job) = inbox.recv() {
+                let (key, d) = match job {
+                    Job::Build(key, d) => (key, d),
+                    Job::Learned(key) => {
+                        if let Some(list) = list.as_mut() {
+                            list.learn(key);
+                        }
+                        continue;
+                    }
+                };
                 let start = std::time::Instant::now();
-                let pipe = scoped(gpu, &format!("native pipeline {key:X}"), || build(gpu, &sources, key, &d))
-                    .and_then(|r| r);
+                let pipe = scoped_pipeline(gpu, &format!("native pipeline {key:X}"), || build(gpu, &sources, key, &d))
+                    .and_then(|r| r)
+                    .map_err(|e| format!("{e} ({})", summary(key, &d)));
                 let took = start.elapsed().as_secs_f64();
                 if took > 0.25 {
-                    crate::host::log(&format!("gs native: specialised pipeline {key:X} built in {took:.2} s (worker)"));
+                    crate::host::log(&format!("gs native: pipeline {key:X} built in {took:.2} s (worker)"));
+                }
+                if let (Ok(_), Some(list)) = (&pipe, list.as_mut()) {
+                    list.learn(key);
                 }
                 if outbox.send((key, pipe)).is_err() {
                     break;
@@ -354,10 +500,770 @@ impl Worker {
             }
         });
         if let Err(e) = spawned {
-            crate::host::log(&format!("gs native: no pipeline worker ({e}); specialised pipelines are built at first use"));
+            crate::host::log(&format!("gs native: no pipeline worker ({e}); pipelines are built at first use"));
         }
-        Worker { jobs, done, waiting: std::collections::HashSet::new() }
+        Worker { jobs, done, waiting: std::collections::HashSet::new(), ahead: std::collections::HashSet::new(),
+                 ahead_sent: None }
     }
+}
+
+/// The pipeline list (finding 256): the keys of the draw pipelines this device built in earlier
+/// runs, `pipelines.txt` in the player's data folder. A draw state the game uses for the first
+/// time needs its generic pipeline at once, and the render thread stops for the driver's compile
+/// (about 150 ms each on a weak phone: the title's first pictures, the flight over the track, four
+/// times in a race). The keys are the same in every run, so each one that builds is written down,
+/// and the next start builds them all on the worker thread while the game boots and shows its
+/// menus (`Pipelines::build_ahead`); a draw then finds its pipeline made. Only keys this device
+/// built itself are listed, so nothing is compiled ahead that it would not compile anyway, and a
+/// listed key that no longer builds is left to its first draw. The first line names the list's
+/// format, the GPU with its driver and the shaders' hash: another GPU, driver or shader source
+/// starts a new list. `DHD_PIPELINE_LIST=0` turns the building ahead off (comparisons).
+///
+/// The guard (finding 260): a driver whose shader compiler crashes on a pipeline ends the game at
+/// every start that builds it (0.8.6's mesh pipelines on the Redmi 9's Mali-G52). So each draw
+/// pipeline's key is written to `pipelines-building.txt` beside the list while the driver builds
+/// it (`building`), under the list's first line, and taken out when the build returns. A key left
+/// there proves only that the run ended during the build (a crash, or the player or the system
+/// closing the game), so the next start (`recover`) refuses a key for good only on evidence:
+/// the game's crash handler (port/hle/host.c `crashed`) writes `pipelines-crash.txt` with the key
+/// its own thread was building (`dhdr_native_pipeline_crash`). A key so named goes into the list
+/// as a refused key, `!KEY`, and is not built again on this GPU, driver and shaders (`refused`); a
+/// refused mesh key turns Native VU off at the renderer's create. A key left without that evidence
+/// (killed, closed, a crash on another thread or one the handler did not see) becomes a suspect,
+/// `?KEY` in the marker: built again, but alone (no other build at the same time, so a second
+/// death names one key), and refused only when it is left behind a second time with no build of
+/// it returning in between. A crash that names a key builds the other keys left with it again. A
+/// listed key is one this device built before with the same driver and shaders: logged, never
+/// refused. Each step is a line in dhd.log; the crash itself is in the run before's log
+/// (dhd-previous.log). The way back needs no file: a new driver or a release with other native
+/// shaders is a new first line, and every refused key is tried again.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod list {
+    use std::collections::HashSet;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::{Mutex, RwLock};
+
+    /// The keys' format: a change of a key's meaning (the module's first comment) takes a new number.
+    /// 2: the shaders' hash in the first line, and refused keys (finding 260).
+    const FORMAT: u32 = 2;
+    /// More keys than any session builds; a list this long is not added to.
+    const MOST: usize = 4096;
+    /// The largest list file read, in bytes: MOST keys of 17 bytes and a header, with room.
+    const LARGEST: u64 = 256 * 1024;
+
+    static PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+    /// `dhdr_native_pipeline_list`: where the list is (None: no list).
+    pub fn set_path(path: Option<PathBuf>) {
+        *PATH.lock().unwrap_or_else(|p| p.into_inner()) = path;
+    }
+
+    /// The list's file, unless there is none or `DHD_PIPELINE_LIST=0`.
+    pub fn path() -> Option<PathBuf> {
+        if std::env::var("DHD_PIPELINE_LIST").is_ok_and(|v| v == "0") {
+            return None;
+        }
+        PATH.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// The first line for this GPU, driver and shaders.
+    pub fn header(info: &wgpu::AdapterInfo) -> String {
+        let text = format!("dhd-pipelines {FORMAT} {:?} {:04X}:{:04X} {} | {} | {} | shaders {:016X}", info.backend,
+                           info.vendor, info.device, info.name, info.driver, info.driver_info, shaders_hash());
+        text.replace(['\n', '\r'], " ")
+    }
+
+    /// FNV-1a of the native renderer's shader sources: a new shader is a new list (and its refused
+    /// keys are tried again).
+    fn shaders_hash() -> u64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in crate::shaders::NATIVE.bytes().chain(crate::shaders::NATIVE_DUAL.bytes()) {
+            h = (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    }
+
+    /// The keys a list's text refuses (`!KEY` lines), when its first line is `header`.
+    pub fn parse_refused(text: &str, header: &str) -> Vec<u64> {
+        let mut lines = text.lines();
+        if lines.next() != Some(header) {
+            return Vec::new();
+        }
+        lines.filter_map(|l| l.trim().strip_prefix('!')).filter_map(|k| u64::from_str_radix(k.trim(), 16).ok()).collect()
+    }
+
+    /// The guard's state: the first line and the marker's path (None until `recover` ran: nothing
+    /// is written), the keys being built now (any thread), the suspects (left by the run before
+    /// without a crash note, not built since), the refused keys, and whether the marker can't be
+    /// written.
+    struct Guard {
+        header: Option<String>,
+        marker: Option<PathBuf>,
+        flying: Vec<u64>,
+        suspects: Vec<u64>,
+        refused: Option<HashSet<u64>>,
+        failed: bool,
+    }
+    static GUARD: Mutex<Guard> = Mutex::new(Guard {
+        header: None,
+        marker: None,
+        flying: Vec::new(),
+        suspects: Vec::new(),
+        refused: None,
+        failed: false,
+    });
+
+    fn guard() -> std::sync::MutexGuard<'static, Guard> {
+        GUARD.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Which pipeline each thread is in the driver's build of, for the crash handler: atomics
+    /// only, read without a lock or an allocation (`crash_note`).
+    struct Slot {
+        thread: AtomicUsize,
+        key: AtomicU64,
+    }
+    static SLOTS: [Slot; 8] = [const { Slot { thread: AtomicUsize::new(0), key: AtomicU64::new(0) } }; 8];
+    /// `pipelines-crash.txt`'s path, NUL-terminated (set by `recover`, never freed).
+    static CRASH_PATH: AtomicPtr<std::ffi::c_char> = AtomicPtr::new(std::ptr::null_mut());
+    /// A suspect's build takes it for writing (alone), every other build for reading.
+    static TURNS: RwLock<()> = RwLock::new(());
+
+    /// The calling thread's id, the same in `building` and in a signal handler.
+    fn thread_id() -> usize {
+        #[cfg(unix)]
+        {
+            extern "C" {
+                fn pthread_self() -> usize;
+            }
+            // SAFETY: no arguments; async-signal-safe in practice (a register or TLS read).
+            unsafe { pthread_self() }
+        }
+        #[cfg(windows)]
+        {
+            extern "system" {
+                fn GetCurrentThreadId() -> u32;
+            }
+            // SAFETY: no arguments.
+            unsafe { GetCurrentThreadId() as usize }
+        }
+    }
+
+    /// The crash handler's question: the crash note's path (NULL before `recover`) and the key the
+    /// calling thread is building (0: none). No lock, no allocation: a signal handler calls it.
+    pub fn crash_note() -> (*const std::ffi::c_char, u64) {
+        let me = thread_id();
+        let key = SLOTS.iter().find(|s| s.thread.load(Ordering::Acquire) == me).map_or(0, |s| s.key.load(Ordering::Acquire));
+        (CRASH_PATH.load(Ordering::Acquire), key)
+    }
+
+    /// What `recover` decides about the keys a run left in the marker.
+    #[derive(Debug, Default, PartialEq)]
+    pub struct Judged {
+        /// Named by the crash note: refused.
+        pub crashed: Vec<u64>,
+        /// Suspects left behind again: refused.
+        pub twice: Vec<u64>,
+        /// Built again as before (listed, or another thread's crash).
+        pub again: Vec<u64>,
+        /// Built again alone, refused if left behind again.
+        pub suspects: Vec<u64>,
+    }
+
+    /// `recover`'s judgement of a marker and a crash note. Nothing when the marker is another
+    /// GPU's, driver's or shaders'. The note is `crash KEY` (the crashing thread's build) or
+    /// `crash` (a crash on a thread that built nothing).
+    pub fn judge(marker: &str, crash: &str, list: &str, header: &str) -> Judged {
+        let mut j = Judged::default();
+        let mut lines = marker.lines();
+        if lines.next() != Some(header) {
+            return j;
+        }
+        let hex = |t: &str| u64::from_str_radix(t.trim(), 16).ok();
+        let (mut flying, mut before) = (Vec::new(), Vec::new());
+        for line in lines {
+            match line.trim().strip_prefix('?') {
+                Some(k) => before.extend(hex(k)),
+                None => flying.extend(hex(line)),
+            }
+        }
+        let named = crash.lines().find_map(|l| l.trim().strip_prefix("crash")).and_then(hex);
+        let listed: HashSet<u64> = parse(list, header).unwrap_or_default().into_iter().collect();
+        let refused: HashSet<u64> = parse_refused(list, header).into_iter().collect();
+        let mut seen = HashSet::new();
+        for key in flying {
+            if refused.contains(&key) || !seen.insert(key) {
+                continue;
+            }
+            if listed.contains(&key) {
+                j.again.push(key);
+            } else if named == Some(key) {
+                j.crashed.push(key);
+            } else if before.contains(&key) {
+                j.twice.push(key);
+            } else if named.is_some() {
+                j.again.push(key);
+            } else {
+                j.suspects.push(key);
+            }
+        }
+        // a suspect not built again stays one
+        j.suspects.extend(before.into_iter().filter(|k| !refused.contains(k) && seen.insert(*k)));
+        j
+    }
+
+    /// At the native renderer's create, before any draw pipeline is built: the keys the run before
+    /// left are judged (`judge`), the list gets the refused ones, the marker and the crash note are
+    /// removed, and from now on every build is written down (`building`). Returns every refused key.
+    pub fn recover(info: &wgpu::AdapterInfo) -> Vec<u64> {
+        let Some(list) = PATH.lock().unwrap_or_else(|p| p.into_inner()).clone() else { return Vec::new() };
+        {
+            // once a process: a renderer made again (a lost device) finds its own builds in the marker
+            let g = guard();
+            if g.header.is_some() {
+                let mut refused: Vec<u64> = g.refused.iter().flatten().copied().collect();
+                refused.sort_unstable();
+                return refused;
+            }
+        }
+        let (marker, crash) = (list.with_file_name("pipelines-building.txt"), list.with_file_name("pipelines-crash.txt"));
+        let owner = take_guard(&list.with_file_name("pipelines-guard.lock"), crate::host::log);
+        recover_files(&list, &marker, &crash, &header(info), owner, crate::host::log)
+    }
+
+    /// The lock held for a run's whole life by the game that owns the guard's files in its data
+    /// folder (`claim`). The system frees it when the process ends in any way (a crash, a kill), so
+    /// a marker is judged only when the run that wrote it is over.
+    static OWNER: Mutex<Option<std::fs::File>> = Mutex::new(None);
+
+    /// The guard's lock file, taken without waiting: Some(file) to keep while the game runs, None when
+    /// another live game holds it; an error when the lock can't be used here at all.
+    pub fn claim(path: &std::path::Path) -> std::io::Result<Option<std::fs::File>> {
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(e)) => Err(e),
+        }
+    }
+
+    /// Whether this game owns the guard's files: it holds the lock (kept in `OWNER` until the process
+    /// ends), or the lock can't be used here (a file system without locks, a folder where the lock
+    /// file can't be made): then this game is assumed alone, as before the lock (0.8.7), so a
+    /// pipeline the driver dies on is still refused. Only a lock another live game holds makes it a
+    /// non-owner.
+    pub fn take_guard(path: &std::path::Path, mut log: impl FnMut(&str)) -> bool {
+        match claim(path) {
+            Ok(Some(lock)) => {
+                *OWNER.lock().unwrap_or_else(|p| p.into_inner()) = Some(lock);
+                true
+            }
+            Ok(None) => {
+                log("gs native: another game runs from this data folder (pipelines-guard.lock is held); its \
+                     pipelines-building.txt is not judged and this game writes none");
+                false
+            }
+            Err(e) => {
+                log(&format!("gs native: pipelines-guard.lock can't be used ({e}); this game is taken to be the \
+                              only one in its data folder and keeps the pipeline guard"));
+                true
+            }
+        }
+    }
+
+    /// `recover` on these files (the tests use their own). `owner`: this game holds the guard's lock
+    /// (`claim`); else another live game in the same folder owns the marker and the crash note, and
+    /// this one only reads the refused keys and writes neither.
+    pub fn recover_files(list: &std::path::Path, marker: &std::path::Path, crash: &std::path::Path, header: &str,
+                         owner: bool, mut log: impl FnMut(&str)) -> Vec<u64> {
+        let read = |path: &std::path::Path| {
+            std::fs::metadata(path).is_ok_and(|m| m.len() <= LARGEST).then(|| std::fs::read_to_string(path).ok()).flatten()
+        };
+        let mut text = read(list).unwrap_or_default();
+        if !owner {
+            let refused = refused_in(&text, header, &mut log);
+            let mut g = guard();
+            g.header = Some(header.to_string());
+            g.marker = None; // nothing is written (write_marker)
+            g.refused = Some(refused.iter().copied().collect());
+            g.suspects = Vec::new();
+            g.failed = false;
+            return refused;
+        }
+        let note = read(crash).unwrap_or_default();
+        let mut suspects = Vec::new();
+        let mut failed = false;
+        // a marker is judged only when it can be taken away: one that stays (a folder this game can't
+        // write) would be judged again at every start, and a stale one must never become a refusal
+        let dead = read(marker).filter(|_| match std::fs::remove_file(marker) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                log(&format!("gs native: pipelines-building.txt can't be removed ({e}); it is not judged, and \
+                              the guard is off in this run"));
+                failed = true;
+                false
+            }
+            _ => true,
+        });
+        if let Some(dead) = dead {
+            let j = judge(&dead, &note, &text, header);
+            for key in &j.again {
+                log(&format!("gs native: the run before ended while pipeline {key:X} was built, not in its build \
+                              (built before, or another thread's crash); it is built again (pipelines-building.txt)"));
+            }
+            for key in &j.suspects {
+                log(&format!("gs native: the run before ended while pipeline {key:X} was built, with no crash in its \
+                              build on record (closed, killed, or not seen); it is built again, alone, and refused \
+                              only if a run ends in its build again (pipelines-building.txt: ?{key:X})"));
+            }
+            let refuse: Vec<(u64, &str)> = j.crashed.iter().map(|&k| (k, "the run before crashed inside the driver's build of"))
+                .chain(j.twice.iter().map(|&k| (k, "a second run in a row ended inside the driver's build of")))
+                .collect();
+            if !refuse.is_empty() {
+                if parse(&text, header).is_none() {
+                    text = format!("{header}\n"); // a new list for this GPU, driver and shaders
+                }
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                for (key, why) in &refuse {
+                    text.push_str(&format!("!{key:X}\n"));
+                    log(&format!("gs native: {why} pipeline {key:X}; it is not built again on this GPU, driver and \
+                                  shaders (pipelines.txt: !{key:X})"));
+                }
+                if let Err(e) = std::fs::write(list, &text) {
+                    log(&format!("gs native: the pipeline list can't be written ({e}); the refused pipelines are \
+                                  refused in this run only"));
+                }
+            }
+            suspects = j.suspects;
+        }
+        let _ = std::fs::remove_file(crash);
+        let refused = refused_in(&text, header, &mut log);
+        if let Some(path) = crash.to_str().and_then(|p| std::ffi::CString::new(p).ok()) {
+            CRASH_PATH.store(path.into_raw(), Ordering::Release); // an earlier one is left (a handler may read it)
+        }
+        let mut g = guard();
+        g.header = Some(header.to_string());
+        g.marker = Some(marker.to_path_buf());
+        g.refused = Some(refused.iter().copied().collect());
+        g.suspects = suspects;
+        g.failed = failed;
+        write_marker(&mut g); // the suspects stay suspects until they build
+        refused
+    }
+
+    /// The refused keys of a list's text, sorted, and their log line.
+    fn refused_in(text: &str, header: &str, log: &mut impl FnMut(&str)) -> Vec<u64> {
+        let mut refused = parse_refused(text, header);
+        refused.sort_unstable();
+        refused.dedup();
+        if !refused.is_empty() {
+            let keys: Vec<String> = refused.iter().map(|k| format!("{k:X}")).collect();
+            log(&format!("gs native: pipelines refused on this GPU, driver and shaders (the driver died building them \
+                          in an earlier run; pipelines.txt): {}", keys.join(" ")));
+        }
+        refused
+    }
+
+    /// Whether `key` died in the driver's build in an earlier run (`recover`).
+    pub fn refused(key: u64) -> bool {
+        guard().refused.as_ref().is_some_and(|r| r.contains(&key))
+    }
+
+    /// The marker: the first line, the suspects (`?KEY`) and the keys being built, or no file when
+    /// there are none. Two small writes per pipeline build: a build is a driver compile of tens to
+    /// hundreds of ms, and in a race the listed ones are built ahead by the worker thread.
+    fn write_marker(g: &mut Guard) {
+        let (Some(header), Some(marker)) = (&g.header, &g.marker) else { return };
+        if g.failed {
+            return;
+        }
+        let written = if g.flying.is_empty() && g.suspects.is_empty() {
+            match std::fs::remove_file(marker) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+                _ => Ok(()),
+            }
+        } else {
+            let mut text = format!("{header}\n");
+            for key in &g.suspects {
+                text.push_str(&format!("?{key:X}\n"));
+            }
+            for key in &g.flying {
+                text.push_str(&format!("{key:X}\n"));
+            }
+            std::fs::write(marker, text)
+        };
+        if let Err(e) = written {
+            // once a run; what an earlier write left would be stale, so it goes (when it can: a
+            // marker the next start can't remove is not judged there)
+            g.failed = true;
+            let _ = std::fs::remove_file(marker);
+            crate::host::log(&format!("gs native: pipelines-building.txt can't be written ({e}); a pipeline the driver \
+                                       dies on is not refused next time"));
+        }
+    }
+
+    /// `key` is in the marker, and in a slot for the crash handler, while this lives (the driver's
+    /// build of it); a suspect is built alone. No sync to the disk: a process that dies leaves its
+    /// written file to the system.
+    pub struct Building {
+        key: u64,
+        slot: Option<&'static Slot>,
+        _turn: Turn,
+    }
+
+    /// The build's hold on `TURNS` (only held, never read).
+    #[allow(dead_code)]
+    enum Turn {
+        Shared(std::sync::RwLockReadGuard<'static, ()>),
+        Alone(std::sync::RwLockWriteGuard<'static, ()>),
+    }
+
+    pub fn building(key: u64) -> Building {
+        let alone = guard().suspects.contains(&key);
+        let turn = if alone {
+            Turn::Alone(TURNS.write().unwrap_or_else(|p| p.into_inner()))
+        } else {
+            Turn::Shared(TURNS.read().unwrap_or_else(|p| p.into_inner()))
+        };
+        {
+            let mut g = guard();
+            g.flying.push(key);
+            write_marker(&mut g);
+        }
+        let me = thread_id();
+        let slot = SLOTS.iter().find(|s| s.thread.compare_exchange(0, me, Ordering::AcqRel, Ordering::Relaxed).is_ok());
+        if let Some(s) = slot {
+            s.key.store(key, Ordering::Release);
+        }
+        Building { key, slot, _turn: turn }
+    }
+
+    impl Drop for Building {
+        fn drop(&mut self) {
+            if let Some(s) = self.slot {
+                s.key.store(0, Ordering::Release);
+                s.thread.store(0, Ordering::Release);
+            }
+            let mut g = guard();
+            if let Some(at) = g.flying.iter().position(|&k| k == self.key) {
+                g.flying.remove(at);
+            }
+            g.suspects.retain(|&k| k != self.key); // its build returned
+            write_marker(&mut g);
+        } // then the turn ends
+    }
+
+    /// The keys of a list's text in the order to build them: the generic ones first (a draw
+    /// cannot wait for those), then the specialised ones (their draws run the generic pipeline
+    /// meanwhile), each in the order it was first used. None when the first line is not `header`.
+    pub fn parse(text: &str, header: &str) -> Option<Vec<u64>> {
+        let mut lines = text.lines();
+        if lines.next() != Some(header) {
+            return None;
+        }
+        let mut seen = HashSet::new();
+        let mut keys: Vec<u64> = lines
+            .filter_map(|l| u64::from_str_radix(l.trim(), 16).ok())
+            .filter(|&k| seen.insert(k))
+            .take(MOST)
+            .collect();
+        keys.sort_by_key(|&k| k >> super::SPEC_SHIFT != 0); // stable: first-use order within each
+        Some(keys)
+    }
+
+    /// The list's file as the worker thread keeps it.
+    pub struct File {
+        path: PathBuf,
+        header: String,
+        known: HashSet<u64>,
+        /// The file starts with `header` (else the first key writes a new file).
+        valid: bool,
+        failed: bool,
+    }
+
+    impl File {
+        /// The file at `path` and its keys to build (none when it is absent or another GPU's).
+        pub fn open(path: PathBuf, header: String) -> (File, Vec<u64>) {
+            // A file far larger than MOST keys can be is not ours: it is not read (and the first
+            // key writes a new one).
+            let small = std::fs::metadata(&path).is_ok_and(|m| m.len() <= LARGEST);
+            let keys = if small { std::fs::read_to_string(&path).ok().and_then(|text| parse(&text, &header)) } else { None };
+            let valid = keys.is_some();
+            let keys = keys.unwrap_or_default();
+            (File { path, header, known: keys.iter().copied().collect(), valid, failed: false }, keys)
+        }
+
+        /// A key that built: one more line, once.
+        pub fn learn(&mut self, key: u64) {
+            if self.failed || self.known.len() >= MOST || !self.known.insert(key) {
+                return;
+            }
+            let written = if self.valid {
+                std::fs::OpenOptions::new().append(true).open(&self.path).and_then(|mut f| writeln!(f, "{key:X}"))
+            } else {
+                std::fs::write(&self.path, format!("{}\n{key:X}\n", self.header))
+            };
+            match written {
+                Ok(()) => self.valid = true,
+                Err(e) => {
+                    self.failed = true;
+                    crate::host::log(&format!("gs native: the pipeline list can't be written ({e}); pipelines are built at first use next time too"));
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn generic_keys_first_each_in_first_use_order() {
+            let text = "H\nE0180033E26BC000\n3C000\n\nE9C98B\nnot a key\n3C000\nE000000000E9C98B\n";
+            assert_eq!(parse(text, "H"), Some(vec![0x3C000, 0xE9C98B, 0xE0180033E26BC000, 0xE000000000E9C98B]));
+        }
+
+        #[test]
+        fn another_gpus_list_is_not_used() {
+            assert_eq!(parse("H\n3C000\n", "other"), None);
+            assert_eq!(parse("", "H"), None);
+            assert_eq!(parse("H\n", "H"), Some(vec![]));
+        }
+
+        #[test]
+        fn a_key_is_written_once_and_read_back() {
+            let path = std::env::temp_dir().join(format!("dhd-pipelines-test-{}.txt", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let (mut file, keys) = File::open(path.clone(), "H 1".into());
+            assert!(keys.is_empty());
+            file.learn(0x3C000);
+            file.learn(0xE0180033E26BC000);
+            file.learn(0x3C000);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "H 1\n3C000\nE0180033E26BC000\n");
+            let (mut again, keys) = File::open(path.clone(), "H 1".into());
+            assert_eq!(keys, vec![0x3C000, 0xE0180033E26BC000]);
+            again.learn(0x3C000);
+            again.learn(0x1C000);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "H 1\n3C000\nE0180033E26BC000\n1C000\n");
+            // another driver: the old keys are not built, and the first new key starts the file again
+            let (mut other, keys) = File::open(path.clone(), "H 2".into());
+            assert!(keys.is_empty());
+            other.learn(0x5);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "H 2\n5\n");
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        #[test]
+        fn only_a_crash_note_refuses_at_once() {
+            let list = "H\n3C000\n!E26BC000\n";
+            let j = |marker, crash| judge(marker, crash, list, "H");
+            // killed or closed during a build: no refusal, a suspect
+            assert_eq!(j("H\nE0180033E26BC000\n", ""), Judged { suspects: vec![0xE0180033E26BC000], ..Default::default() });
+            // the crash handler named the key: refused
+            assert_eq!(j("H\nE0180033E26BC000\n", "crash E0180033E26BC000\n"),
+                       Judged { crashed: vec![0xE0180033E26BC000], ..Default::default() });
+            // two keys in building, the crash in one: only that one; the other is built again
+            assert_eq!(j("H\nE0180033E26BC000\n1D20000\n", "crash 00000000001D20000\n"),
+                       Judged { crashed: vec![0x1D20000], again: vec![0xE0180033E26BC000], ..Default::default() });
+            // two keys, a crash on a thread that built nothing: both suspects, none refused
+            assert_eq!(j("H\nE0180033E26BC000\n1D20000\n", "crash\n"),
+                       Judged { suspects: vec![0xE0180033E26BC000, 0x1D20000], ..Default::default() });
+            // a suspect left behind again: refused; one not built again stays a suspect
+            assert_eq!(j("H\n?E0180033E26BC000\n?5\nE0180033E26BC000\n", ""),
+                       Judged { twice: vec![0xE0180033E26BC000], suspects: vec![5], ..Default::default() });
+            // listed: built before here, never refused; refused already: once
+            assert_eq!(j("H\n3C000\nE26BC000\n", "crash 3C000\n"), Judged { again: vec![0x3C000], ..Default::default() });
+            // another driver's or shaders' marker says nothing about this one
+            assert_eq!(j("old\nE0180033E26BC000\n", "crash E0180033E26BC000\n"), Judged::default());
+            assert_eq!(parse_refused(list, "H"), vec![0xE26BC000]);
+            assert_eq!(parse_refused(list, "other"), Vec::<u64>::new());
+            // a refused key is not built ahead
+            assert_eq!(parse(list, "H"), Some(vec![0x3C000]));
+        }
+
+        /// A run's end inside `building`: the marker as the dead process left it (the build never
+        /// returned), and the crash note if the crash handler wrote one.
+        fn die_in_build(marker: &std::path::Path, crash: &std::path::Path, key: u64, crashed: bool) {
+            let dying = building(key);
+            let left = std::fs::read_to_string(marker).unwrap();
+            if crashed {
+                // what host.c's crashed() writes, from the dying thread
+                let (path, named) = crash_note();
+                assert!(!path.is_null() && named == key);
+                // SAFETY: recover's NUL-terminated path.
+                let path = unsafe { std::ffi::CStr::from_ptr(path) }.to_str().unwrap();
+                assert_eq!(std::path::Path::new(path), crash);
+                std::fs::write(crash, format!("crash {named:016X}\n")).unwrap();
+            }
+            drop(dying);
+            std::fs::write(marker, left).unwrap();
+            assert_eq!(crash_note().1, 0);
+        }
+
+        /// The whole round on files (one test: the guard is the process's).
+        #[test]
+        fn a_run_that_died_building_is_judged_on_evidence() {
+            let dir = std::env::temp_dir().join(format!("dhd-pipeline-guard-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let (list, marker, crash) = (dir.join("pipelines.txt"), dir.join("pipelines-building.txt"),
+                                         dir.join("pipelines-crash.txt"));
+            std::fs::write(&list, "H\n3C000\n").unwrap();
+            let _ = std::fs::remove_file(&marker);
+            let _ = std::fs::remove_file(&crash);
+            let mut lines = Vec::new();
+            let start = |header: &str, lines: &mut Vec<String>| {
+                guard().header = None; // a new process
+                recover_files(&list, &marker, &crash, header, true, |l| lines.push(l.to_owned()))
+            };
+            assert!(start("H", &mut lines).is_empty());
+            {
+                let _ok = building(0x1D20000);
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), "H\n1D20000\n");
+            }
+            assert!(!marker.exists());
+
+            // killed during a build (no crash note): no refusal, a suspect, built alone
+            die_in_build(&marker, &crash, 0xE0180033E26BC000, false);
+            assert!(start("H", &mut lines).is_empty());
+            assert!(!refused(0xE0180033E26BC000));
+            assert!(lines.iter().any(|l| l.contains("pipeline E0180033E26BC000 was built, with no crash")));
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "H\n?E0180033E26BC000\n");
+            {
+                let _alone = building(0xE0180033E26BC000);
+                assert!(TURNS.try_read().is_err(), "a suspect builds alone");
+            }
+            assert!(!marker.exists(), "a suspect that built is cleared");
+            assert_eq!(std::fs::read_to_string(&list).unwrap(), "H\n3C000\n");
+
+            // two keys in building, the crash in one: only that one is refused
+            let (built, end) = (std::sync::mpsc::channel(), std::sync::mpsc::channel::<()>());
+            let other = std::thread::spawn(move || {
+                let _other = building(0x1D20000); // the worker thread's build
+                built.0.send(()).unwrap();
+                end.1.recv().unwrap();
+            });
+            built.1.recv().unwrap();
+            die_in_build(&marker, &crash, 0xE0180033E26BC000, true);
+            let left = std::fs::read_to_string(&marker).unwrap();
+            end.0.send(()).unwrap();
+            other.join().unwrap();
+            std::fs::write(&marker, left).unwrap();
+            assert_eq!(start("H", &mut lines), vec![0xE0180033E26BC000]);
+            assert!(refused(0xE0180033E26BC000) && !refused(0x1D20000));
+            assert!(!marker.exists() && !crash.exists());
+            assert_eq!(std::fs::read_to_string(&list).unwrap(), "H\n3C000\n!E0180033E26BC000\n");
+            assert!(lines.iter().any(|l| l.contains("crashed inside the driver's build of pipeline E0180033E26BC000")));
+            assert!(lines.iter().any(|l| l.contains("pipeline 1D20000 was built, not in its build")));
+
+            // the next start still refuses it, and a new driver or shader tries it again
+            assert_eq!(start("H", &mut lines), vec![0xE0180033E26BC000]);
+            assert!(start("H2", &mut lines).is_empty());
+            assert!(!refused(0xE0180033E26BC000));
+
+            // a key left behind by two runs in a row with no crash note: refused at the second
+            die_in_build(&marker, &crash, 0x77, false);
+            assert!(start("H2", &mut lines).is_empty());
+            die_in_build(&marker, &crash, 0x77, false);
+            assert_eq!(start("H2", &mut lines), vec![0x77]);
+
+            // a second game in the same folder while the first runs (it holds the lock): the first's
+            // live marker is neither judged nor written, twice in a row; the refusals still hold
+            let live = "H2\n?5\n99\n"; // the first game's: a suspect, and a build now
+            std::fs::write(&marker, live).unwrap();
+            let listed = std::fs::read_to_string(&list).unwrap();
+            for _ in 0..2 {
+                guard().header = None; // a new process, without the lock
+                assert_eq!(recover_files(&list, &marker, &crash, "H2", false, |l| lines.push(l.to_owned())), vec![0x77]);
+                assert!(refused(0x77) && !refused(0x99));
+                {
+                    let _second = building(0x99);
+                    assert_eq!(std::fs::read_to_string(&marker).unwrap(), live, "the second game writes no marker");
+                }
+                assert_eq!(std::fs::read_to_string(&marker).unwrap(), live);
+                assert_eq!(std::fs::read_to_string(&list).unwrap(), listed);
+            }
+            // the first run over (its lock freed): its marker is judged at last, a kill's way
+            assert_eq!(start("H2", &mut lines), vec![0x77]);
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), "H2\n?99\n?5\n");
+            assert_eq!(std::fs::read_to_string(&list).unwrap(), listed);
+            guard().header = None;
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// The guard's lock: one live holder per folder; free again once it is dropped (the
+        /// system does the same when a process ends).
+        #[test]
+        fn one_game_a_folder_holds_the_guard() {
+            let path = std::env::temp_dir().join(format!("dhd-pipelines-guard-{}.lock", std::process::id()));
+            let first = claim(&path).unwrap().expect("a free lock is taken");
+            assert!(claim(&path).unwrap().is_none(), "a second holder is refused");
+            drop(first);
+            let again = claim(&path).unwrap();
+            assert!(again.is_some(), "a dropped lock is free");
+            drop(again);
+            std::fs::remove_file(&path).unwrap();
+        }
+
+        /// Only a lock another game holds makes a non-owner; a lock that can't be used keeps the
+        /// guard (one game assumed, 0.8.7's way), with one line saying why.
+        #[test]
+        fn only_a_held_lock_gives_up_the_guard() {
+            let path = std::env::temp_dir().join(format!("dhd-pipelines-held-{}.lock", std::process::id()));
+            let other = claim(&path).unwrap().expect("a free lock is taken"); // another live game
+            let mut lines = Vec::new();
+            assert!(!take_guard(&path, |l| lines.push(l.to_owned())), "held by another game: not the owner");
+            assert!(lines.last().unwrap().contains("another game runs from this data folder"));
+            drop(other);
+            std::fs::remove_file(&path).unwrap();
+            // the lock file can't even be made (its folder is missing): an error, not contention
+            let missing = std::env::temp_dir().join(format!("dhd-no-such-folder-{}", std::process::id())).join("x.lock");
+            let mut lines = Vec::new();
+            assert!(take_guard(&missing, |l| lines.push(l.to_owned())), "a lock that can't be used keeps the guard");
+            assert_eq!(lines.len(), 1);
+            assert!(lines[0].contains("can't be used") && lines[0].contains("keeps the pipeline guard"), "{}", lines[0]);
+            // a direct claim's error is told apart from contention
+            assert!(claim(&missing).is_err());
+        }
+    }
+}
+
+/// `dhdr_native_pipeline_crash` (`dhd_render_ext.h`, finding 260): for the game's crash handler
+/// (port/hle/host.c `crashed`), the crash note's path (NULL: no list) and in `*key` the draw
+/// pipeline the calling thread is in the driver's build of (0: none). Atomics only, no lock and
+/// no allocation, so no `Guard::enter`: a signal handler calls it.
+///
+/// # Safety
+/// `key` is NULL or writable.
+#[cfg(not(target_arch = "wasm32"))]
+#[no_mangle]
+pub unsafe extern "C" fn dhdr_native_pipeline_crash(key: *mut u64) -> *const std::ffi::c_char {
+    let (path, building) = list::crash_note();
+    if !key.is_null() {
+        // SAFETY: the caller's writable u64.
+        unsafe { *key = building };
+    }
+    path
+}
+
+/// `dhdr_native_pipeline_list` (`dhd_render_ext.h`): the pipeline list's file (finding 256), a
+/// UTF-8 path, or NULL for none; before `dhdr_native_create`. The browser has no list.
+///
+/// # Safety
+/// `path` is NULL or a NUL-terminated string.
+#[no_mangle]
+pub unsafe extern "C" fn dhdr_native_pipeline_list(path: *const std::ffi::c_char) {
+    let _g = crate::guard::Guard::enter("dhdr_native_pipeline_list");
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // SAFETY: NULL or a NUL-terminated string (the caller's contract).
+        let path = (!path.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(path) });
+        list::set_path(path.and_then(|p| p.to_str().ok()).filter(|p| !p.is_empty()).map(std::path::PathBuf::from));
+    }
+    #[cfg(target_arch = "wasm32")]
+    let _ = path;
 }
 
 impl Pipelines {
@@ -376,19 +1282,21 @@ impl Pipelines {
     pub fn get_special(&mut self, gpu: &'static Gpu, objects: &Objects, key: u64)
                        -> Result<(u64, &wgpu::RenderPipeline), String> {
         let generic = key & 0xFFFF_FFFF;
+        #[cfg(not(target_arch = "wasm32"))]
+        self.receive();
         if key != generic {
             #[cfg(not(target_arch = "wasm32"))]
             {
                 if spec_mode() == SpecMode::Background {
-                    self.receive();
                     let (mut here, mut failed) = (false, None);
                     if !self.built.contains_key(&key) {
-                        let worker = self.worker.get_or_insert_with(|| Worker::start(gpu, Sources::of(objects)));
-                        if worker.waiting.insert(key) {
+                        let worker = self.worker.get_or_insert_with(|| Worker::start(gpu, Sources::of(objects), None));
+                        // a listed key is on its way already
+                        if !worker.ahead.contains(&key) && worker.waiting.insert(key) {
                             match describe(key as u32) {
                                 Ok(d) => {
                                     // No worker thread: build it here, as SpecMode::Sync does.
-                                    if worker.jobs.send((key, d)).is_err() {
+                                    if worker.jobs.send(Job::Build(key, d)).is_err() {
                                         worker.waiting.remove(&key);
                                         here = true;
                                     }
@@ -425,13 +1333,63 @@ impl Pipelines {
     #[cfg(not(target_arch = "wasm32"))]
     fn receive(&mut self) {
         let Some(worker) = self.worker.as_mut() else { return };
+        if worker.waiting.is_empty() && worker.ahead.is_empty() {
+            return;
+        }
         while let Ok((key, pipe)) = worker.done.try_recv() {
-            worker.waiting.remove(&key);
+            let asked = worker.waiting.remove(&key);
+            let ahead = worker.ahead.remove(&key);
+            if self.built.get(&key).is_some_and(|r| r.is_ok()) {
+                continue; // a draw needed it before the worker came to it, and built it
+            }
             if let Err(e) = &pipe {
+                if ahead && !asked {
+                    continue; // a listed key that no longer builds: its first draw decides and reports
+                }
                 crate::host::log(&format!("gs native: specialised pipeline {key:X}: {e}; the generic one draws"));
             }
             self.built.insert(key, pipe);
         }
+        if worker.ahead.is_empty() {
+            if let Some((sent, count)) = worker.ahead_sent.take() {
+                crate::host::log(&format!("gs native: the {count} listed pipelines were built {:.1} s after the renderer's start",
+                                          sent.elapsed().as_secs_f64()));
+            }
+        }
+    }
+
+    /// The pipeline list's keys (`list`, finding 256) go to the worker thread, which builds them
+    /// while the game starts; at the native renderer's create. Without a list: nothing.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn build_ahead(&mut self, gpu: &'static Gpu, objects: &Objects) {
+        let Some(path) = list::path() else { return };
+        let (file, keys) = list::File::open(path, list::header(&gpu.info));
+        let worker = self.worker.get_or_insert_with(|| Worker::start(gpu, Sources::of(objects), Some(file)));
+        let special = spec_mode() == SpecMode::Background;
+        let meshes = !crate::native::init::meshes_refused();
+        for &key in &keys {
+            let wanted = (key >> SPEC_SHIFT == 0 || special) && (key as u32 & MESH == 0 || meshes);
+            if !wanted || self.built.contains_key(&key) {
+                continue;
+            }
+            if let Ok(d) = describe(key as u32) {
+                if worker.jobs.send(Job::Build(key, d)).is_ok() {
+                    worker.ahead.insert(key);
+                }
+            }
+        }
+        if !worker.ahead.is_empty() {
+            worker.ahead_sent = Some((std::time::Instant::now(), worker.ahead.len()));
+        }
+        crate::host::log(&format!("gs native: pipelines.txt lists {} draw pipelines of earlier runs; {} are built ahead on a worker thread",
+                                  keys.len(), worker.ahead.len()));
+    }
+
+    /// Takes `other`'s pipelines into this cache (the browser's probed mesh pipelines, init.rs
+    /// `web_prepare`).
+    #[cfg_attr(not(feature = "web"), allow(dead_code))]
+    pub fn extend(&mut self, other: Pipelines) {
+        self.built.extend(other.built);
     }
 
     /// Pipelines built (or failed) so far.
@@ -446,18 +1404,26 @@ impl Pipelines {
     /// The pipeline for `key` (a cache key: `SPEC_SHIFT`), built on first use (Err: the key has
     /// none, or it failed).
     pub fn get(&mut self, gpu: &Gpu, objects: &Objects, key: u64) -> Result<&wgpu::RenderPipeline, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        let worker = &self.worker;
         let built = self.built.entry(key).or_insert_with(|| {
             #[cfg(not(target_arch = "wasm32"))]
             let _spike = SpikeTimer::new("pipeline", key as u32);
             let d = describe(key as u32)?;
             #[cfg(not(target_arch = "wasm32"))]
             let start = std::time::Instant::now();
-            let pipe = scoped(gpu, &format!("native pipeline {key:X}"), || build(gpu, &Sources::of(objects), key, &d))??;
+            let pipe = scoped_pipeline(gpu, &format!("native pipeline {key:X}"), || build(gpu, &Sources::of(objects), key, &d))
+                .and_then(|r| r)
+                .map_err(|e| format!("{e} ({})", summary(key, &d)))?;
             #[cfg(not(target_arch = "wasm32"))]
             {
                 let took = start.elapsed().as_secs_f64();
                 if took > 0.25 {
                     crate::host::log(&format!("gs native: draw pipeline {key:X} built in {took:.2} s"));
+                }
+                // built at its first use, on this thread: the next start builds it ahead
+                if let Some(worker) = worker {
+                    let _ = worker.jobs.send(Job::Learned(key));
                 }
             }
             Ok(pipe)
@@ -862,7 +1828,26 @@ pub(crate) mod gputimes {
 
 #[cfg(test)]
 mod tests {
-    use super::spec;
+    use super::{spec, without_kept_colour};
+
+    /// Cs * 0 + Cd * 1 (and Cd * 1 - Cs * 0) loses its blend and its colour channels; every other
+    /// blend stays as it is.
+    #[test]
+    fn kept_colour_is_not_blended() {
+        let key = |src: u32, dst: u32, op: u32| 1 | src << 1 | dst << 6 | op << 11;
+        assert_eq!(without_kept_colour(key(1, 2, 1), 15), (0, 8));
+        assert_eq!(without_kept_colour(key(1, 2, 1), 7), (0, 0));
+        assert_eq!(without_kept_colour(key(1, 2, 0), 7), (0, 0));
+        assert_eq!(without_kept_colour(key(1, 2, 3), 15), (0, 8));
+        // Cs * 0 - Cd is not Cd; other factors read Cs.
+        assert_eq!(without_kept_colour(key(1, 2, 2), 7), (key(1, 2, 2), 7));
+        assert_eq!(without_kept_colour(key(1, 6, 1), 7), (key(1, 6, 1), 7));
+        assert_eq!(without_kept_colour(key(2, 2, 1), 7), (key(2, 2, 1), 7));
+        assert_eq!(without_kept_colour(key(5, 6, 1), 15), (key(5, 6, 1), 15));
+        // Min and Max ignore the factors; no blend stays no blend.
+        assert_eq!(without_kept_colour(key(1, 2, 4), 7), (key(1, 2, 4), 7));
+        assert_eq!(without_kept_colour(1 << 1 | 2 << 6, 7), (1 << 1 | 2 << 6, 7));
+    }
 
     /// `spec` keeps only what the draw's path reads, so draws that differ elsewhere share a pipeline.
     #[test]

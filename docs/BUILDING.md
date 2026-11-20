@@ -160,10 +160,25 @@ Measured per platform and step in finding 151. What keeps a rebuild short:
   (`objcache.tool_output`).
 - Android compiles with half the machine's threads by default (chunks are small; wasm2c's own parts
   needed 2). With `--pgo-use`, the profile is part of every object's key, so a second build with the
-  same profile and core is all hits. A profile stays useful across core changes: clang applies a
-  function's counts only while the function is unchanged (its control-flow hash), so the changed
-  functions build as without PGO and the rest keep theirs. Record a new one when the hot code (EE,
-  VU, GS) changed, and at least once per release (finding 146).
+  same profile and core is all hits.
+- **The Android profile** (`build_apk.py --pgo-use PROFDATA`, `package_release.py --pgo-use`,
+  findings 146, 195). A function is found in a profile by its name, a static one by its unit's file
+  name and its name: `build_host64.py` passes `-static-func-full-module-prefix=false` when it
+  records and when it uses a profile, so one recorded in any checkout serves a build made in any
+  other (before finding 195 the key held the recording build's path, and no other build found its
+  static functions: the VU1 kernels, the GS recording, the graphics queue, the module's helpers).
+  `build_host64.py` refuses a profile with paths in its keys. clang applies a function's counts
+  only while the function is unchanged (its control-flow hash): a changed function builds as
+  without a profile, silently, and the rest keep theirs. So record a new one when the hot code
+  (EE, VU, GS) changed, and at least once per release:
+
+      python port/android/build_apk.py --release --pgo-generate   # refused as a release, as it must be:
+      adb install -r build/android/project/app/build/outputs/apk/release/app-release.apk
+      # run races (finding 195: finding 156's route twice, Native VU off and on); at its exit the
+      # game writes files/dhd-<pid>.profraw in the app's folder (read it by root, or build debuggable
+      # and use run-as)
+      llvm-profdata merge -o dhd.profdata dhd-*.profraw            # the NDK's llvm-profdata
+      python port/tools/package_release.py --platform android --pgo-use dhd.profdata
 
 ### Android (arm64 APK)
 
@@ -191,6 +206,63 @@ files: the disc copy, dhd.ini and the saves). The APK is checked (`apksigner ver
 badging`: not debuggable, the version, arm64-v8a only) and written as
 `build/android/DownhillRevived-<version>-android-experimental.apk`. versionCode is
 MAJOR * 10000 + MINOR * 100 + PATCH (0.7.7: 707), so it grows with every release.
+
+### iOS (iPhone and iPad, unsigned IPA)
+
+Built on a Mac (finding 224; `port/ios/AGENTS.md`). The app is `port/ios`: the host side
+(`host/ios_main.m`), the Metal layer the renderer draws into (`render/metal_bridge.m`), the app's
+entry, the shared launcher's page in a web view (`app/launcher.m` with `host/launcher_calls.c`;
+the page itself is `port/launcher/ui`, packed into the app as `launcher/`; finding 227), all linked
+with the game's static library `libdhd_ios.a` (`build_host64.py --target ios-arm64`, or
+`ios-sim-arm64` for the Simulator).
+
+What you need: a Mac with Apple silicon and Xcode (iOS 17 SDK or later; tested with Xcode 26.5),
+`xcodegen`, CMake and Ninja (Homebrew), Python 3.12, rustup with the iOS targets
+(`rustup target add --toolchain 1.97.1 aarch64-apple-ios aarch64-apple-ios-sim`), WABT's
+`include/` and `share/` and SIMDe as for the macOS build (`WABT_DIR`, `SIMDE_DIR`), `DHD_VUTEXT`,
+`DHD_CARGO_DIR` and `DHD_OBJCACHE_DIR`. The game's core comes from the Windows build as wasm2c's
+parts (`wasm2c dhd_core.wasm -n core --num-outputs=8`: `core.h`, `core-impl.h`, `core_*.c`), as
+for the macOS release; SDL3 is built for iOS by `sdl3.py` on the first run.
+
+```
+python3.12 port/ios/build_ios.py --simulator --rebuild-core --wasm core/core_*.c   # the Simulator app
+python3.12 port/ios/build_ios.py --unsigned --rebuild-core --wasm core/core_*.c    # the device app and its unsigned IPA
+python3.12 port/tools/package_release.py --platform ios --core core/core_*.c --elf PATH/SCUS_971.77
+```
+
+The Simulator app lands in `build/ios/DerivedData-Simulator/Build/Products/Release-iphonesimulator/`;
+install it with `xcrun simctl install <device> "Downhill Revived.app"` and start it with
+`xcrun simctl launch <device> app.skuza.DownhillRevived` (environment for the game:
+`SIMCTL_CHILD_DHD_...`). Its files (dhd.ini, dhd.log, saves, the disc) are in the app's data
+container (`xcrun simctl get_app_container <device> app.skuza.DownhillRevived data`, then
+`Documents/`); a disc image copied there as `SCUS-97177.iso` is the disc the launcher and the game
+use. The app opens into the launcher; for checks, `SIMCTL_CHILD_DHD_IOS_DIRECT=1` starts the game at
+once and `SIMCTL_CHILD_DHD_LAUNCHER_TEST=<file in Documents>` runs the file's lines in the page
+(`wait SECONDS`, or a JavaScript expression such as `bridge.call('snapshot')`), each result in
+`Documents/launcher-test.log` (finding 227). Set `SDL_AUDIO_DRIVER=dummy` in the simulator's
+launchd environment (`xcrun simctl spawn <device> launchctl setenv ...`) to keep the game silent.
+
+`--unsigned` writes `build/ios/DownhillRevived-<version>-unsigned.ipa` (`package_unsigned.py`:
+the bundle without any signature or provisioning profile, refused if it names a home folder, a
+device or a team; `DHD_IPA_PRIVATE` adds your own strings to that check).
+`package_release.py --platform ios` adds `LICENSE.txt` and `THIRD-PARTY-NOTICES.txt` to the app,
+checks the IPA as the APK is checked (no game data, the version, no other server or local path,
+no retail bytes but the source's own; and `port/ios/ipa_audit.py` on every member, as
+`package_unsigned.py` runs it: no signature or provisioning file, no Mach-O with a code signature or
+one that can't be read, no home folder, device, team or `DHD_IPA_PRIVATE` literal, no instruction above
+the A12, the iOS CPU floor (`port/ios/cpu_floor.py`, finding 267); a supplied
+`--ipa` too, finding 227) and writes
+`build/release/DownhillRevived-<version>-ios-experimental.ipa`, latest.json's `ios` entry and
+`SHA256SUMS`. The release page gets `port/release/IOS-NOTES.md`.
+
+Without a paid Apple developer account: the Simulator, the unsigned IPA and installs by players
+with their own Apple IDs (a sideloading tool signs it for 7 days with a free Apple ID) all work;
+what does not is a signed IPA from us, TestFlight, the App Store, and entitlements that need a
+provisioning profile (so the game's memory is reserved without the extended virtual addressing
+entitlement: wasm2c's bounds-check layout, `build_host64.py`'s `ios` targets, reserved in two
+parts at the process's start so it fits an iPhone with 3 GB, finding 258). `build_ios.py
+--team ID` (or `DHD_APPLE_TEAM`) builds a development-signed app for your own device with Xcode's
+automatic signing; keep the team out of the repository.
 
 ### macOS (Apple silicon) and Linux (x64)
 
@@ -224,6 +296,45 @@ build/host64-<macos|linux>/dhd64 --elf PATH/SCUS_971.77` (it builds the launcher
 
 Off Windows the object cache is used only when `DHD_OBJCACHE_DIR` names a folder; rustgs's target
 dirs go to `DHD_CARGO_DIR`, else `~/.cache/dhd-cargo`.
+
+### Nintendo Switch
+
+A homebrew NRO for a modded console, not a release (finding 272). Built so far only on an Intel Mac;
+the steps below have not been tried on another machine.
+
+- [devkitPro](https://devkitpro.org/wiki/Getting_Started) packages: `switch-dev`, `deko3d`, `uam`,
+  `switch-tools`. `DEVKITPRO` names the install (default `/opt/devkitpro`).
+  The `devkitpro/devkita64` Docker image has all four (its `DEVKITPRO` is `/opt/devkitpro`), enough to compile the units on any OS.
+- For the core, on a Mac: MacPorts `llvm-23` and `wabt`, wasi-sdk 34 (`WASI_SYSROOT` names its
+  `share/wasi-sysroot`), SIMDe (`SIMDE_DIR`), and `WABT_DIR=/opt/local`.
+- [naga-cli](https://crates.io/crates/naga-cli) 29.0.3, with `NAGA` naming the binary (default
+  `~/DevCaches/naga/naga`).
+- `PATH`, in this order: wasi-sdk's `bin`, MacPorts' `libexec/llvm-23/bin`, MacPorts' `bin`, then the
+  rest. MacPorts' llvm-23 has no `clang`, so `clang` must be wasi-sdk's. That one compiles only for
+  wasm, and the data image is assembled for x86, so set `DHD_IMAGE_CC=/usr/bin/clang`.
+
+Then:
+
+    python3 port/tools/build_wasm.py
+    python3 port/tools/build_host64.py --target switch-arm64 build/wasm/dhd_core.wasm
+
+The output is `build/switch/downhill-revived.nro`. Copy your own disc image and the NRO to the SD card:
+
+    /switch/downhill-revived/downhill-revived.nro
+    /switch/downhill-revived/SCUS-97177.iso
+
+The game makes `dhd.ini` there on its first start, and `dhd.log` and the saves also go in that folder.
+Start the Homebrew Menu by holding R while starting a game: the album's applet mode has too little
+memory, and the game says so.
+
+To test on a console running the sphaira menu with its FTP server (port 5000) and nxlink receiver:
+
+    python3 port/tools/nx_fulltest.py --ip CONSOLE_IP
+
+The console's address can also come from `DHD_SWITCH_IP`. `--only BC` runs chosen phases, and `--dry-run`
+shows each phase's settings without touching the network. The report is
+`build/nx-test/<timestamp>/report.md`. This tool has not yet run on a real console; finding 272 lists
+what else is unverified.
 
 ### SDL3 (window, sound, controllers)
 
@@ -350,8 +461,9 @@ tools set `DHD_SETTINGS=none`) none of them apply. Tools that drive the game (`D
 `DHD_RACE_SYNC`, ...) never run the updater.
 
 Online play is not a setting: the host decides whether it is offered (`host_service_net_offered`,
-finding 143). The Windows, macOS and Linux builds offer it; the Android build and the browser
-don't (no ONLINE row, and `server`, `DHD_NET_*` or anything else can't start a session there).
+finding 143). The Windows, macOS, Linux, Android and iOS builds offer every room (finding 237);
+the browser offers P2P rooms only, and a browser page without its online part offers none (no
+ONLINE row, and `server`, `DHD_NET_*` or anything else can't start a session there).
 On Android `auto_update = off` also turns off the once-a-day update notice.
 
 ## Releases
@@ -364,8 +476,9 @@ asset URL, the zip's SHA-256 and size) for the updater; publish both as release 
 
 Bump `port/include/version.h`, `build_wasm.py`, `package_release.py`, publish the zip and
 `latest.json` as `v<version>`, then raise `MIN_VERSION` in
-`online/server/wrangler.jsonc` and deploy when older versions should stop racing (finding 054,
-section 6; finding 088, CL3). macOS and Linux (finding 093, Release): `package_release.py
+`online/server/wrangler.jsonc` and deploy (`node online/server/tools/deploy.mjs`: a watched 10%
+canary, then 100%; rooms move between races, finding 184) when older versions should stop racing
+(finding 054, section 6; finding 088, CL3). macOS and Linux (finding 093, Release): `package_release.py
 --platform mac|linux --game PATH` on that machine (the mac zip is signed there), then
 `--merge` its `latest.json` into the Windows one; publish every zip with the one `latest.json`.
 Installers (finding 125, after 0.7.5): the same runs also make each platform's installer from the
@@ -378,6 +491,9 @@ folder and update from the zips (the AppImage from its own entry). None is code-
 Android (finding 143): `package_release.py --platform android` with the release key's
 `DHD_ANDROID_*` variables builds, checks and adds the `-android-experimental.apk` (latest.json's
 `android` entry); every run writes `SHA256SUMS`. The release page gets `port/release/ANDROID-NOTES.md`.
+iOS (finding 224): `package_release.py --platform ios --core core_*.c` on the Mac builds, checks
+and adds the unsigned `-ios-experimental.ipa` (latest.json's `ios` entry); the release page gets
+`port/release/IOS-NOTES.md`.
 Crash symbols (finding 152): `build/release/` also holds files that are kept, never published (not
 in `SHA256SUMS`): the Windows link map `-win.map` (`crash_stack.py` reads dhd.log's crash stacks
 with it) and `-android-libmain.debug.so`, the APK's `libmain.so` before stripping (copied only when

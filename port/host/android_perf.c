@@ -7,9 +7,9 @@
    - Performance hints (ADPF, APerformanceHint, API 33): one hint session holds the pipeline's
      threads; each field the game thread reports the longest CPU time any of them spent on the last
      field against a target, and a system with hint support raises their clocks until it fits. The
-     calls come from libandroid.so through dlsym (the APK's minimum is API 30); without them, or when
-     the system has no hint support (createSession answers NULL, as on the Mi 11i's MIUI 14), nothing
-     happens. DHD_PERF_HINT = 0 turns it off; DHD_PERF_TARGET_MS sets the target (default 13: under
+     calls come from libandroid.so through dlsym (the APK's minimum is API 29, finding 191);
+     without them, or when the system has no hint support (createSession answers NULL, as on the
+     Mi 11i's MIUI 14), nothing happens. DHD_PERF_HINT = 0 turns it off; DHD_PERF_TARGET_MS sets the target (default 13: under
      one 60 Hz field, with room for the hand-offs).
    - Placement: DHD_AFFINITY = name:cpus,... (cpus: 7, or 4-6, or 4+7) keeps a named thread on those
      cores. Applied from the game thread by thread ID and again every 10 fields, because the system
@@ -43,7 +43,7 @@ static const char *const hot[] = {"game", "vu", "gs", "native"};
 enum { HOT = sizeof hot / sizeof hot[0] };
 static struct { int32_t tid; clockid_t clock; volatile int set; } threads[HOT];
 
-/* host_thread_name (port/hle/host.c), on the thread itself. */
+/* host_thread_name (port/host/host_threads.c), on the thread itself. */
 void android_perf_thread(const char *name)
 {
     for (int i = 0; i < HOT; i++) {
@@ -53,6 +53,15 @@ void android_perf_thread(const char *name)
             __atomic_store_n(&threads[i].set, 1, __ATOMIC_RELEASE);
         return;
     }
+}
+
+/* host_threads.c, on a named thread as it ends: its tid and clock are no longer asked (finding 217). */
+void android_perf_thread_ended(void)
+{
+    int32_t tid = gettid();
+    for (int i = 0; i < HOT; i++)
+        if (__atomic_load_n(&threads[i].set, __ATOMIC_ACQUIRE) && threads[i].tid == tid)
+            __atomic_store_n(&threads[i].set, 0, __ATOMIC_RELEASE);
 }
 
 static int64_t cpu_ns(clockid_t clock)

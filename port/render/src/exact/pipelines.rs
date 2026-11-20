@@ -72,16 +72,21 @@ impl Pipelines {
     /// As `create`, awaiting the error scopes (the browser's async init; natively `create` blocks
     /// on this).
     pub async fn create_async(gpu: &Gpu, raster_flags: u32) -> Result<Pipelines, String> {
+        let _startup = crate::startup::step("exact pipelines and error scopes");
         check_key(raster_flags)?;
         if let Some(p) = cached(gpu, raster_flags) {
             return Ok(p);
         }
         let validation = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
         let memory = gpu.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        // A pipeline the driver did not create (the vendored wgpu-hal's map_pipeline_creation_err,
+        // finding 176).
+        let internal = gpu.device.push_error_scope(wgpu::ErrorFilter::Internal);
         let (shared, keyed) = build(gpu, raster_flags);
+        let i = internal.pop().await;
         let m = memory.pop().await;
         let v = validation.pop().await;
-        if let Some(e) = v {
+        if let Some(e) = v.or(i) {
             return Err(format!("raster.wgsl pipelines (raster key {raster_flags}): {e}"));
         }
         if let Some(e) = m {
@@ -90,15 +95,6 @@ impl Pipelines {
         store(gpu, &shared, raster_flags, &keyed);
         Ok(assemble(raster_flags, &shared, &keyed))
     }
-}
-
-/// raster.wgsl as one module of `gpu`'s device (the cached one, or a new one; the caller checks
-/// errors). For the test hooks' `depth_probe`.
-pub fn raster_module(gpu: &Gpu) -> wgpu::ShaderModule {
-    if let Some(s) = with_entry(gpu, |e| e.shared.clone()) {
-        return s.module;
-    }
-    module(gpu)
 }
 
 // ---------------------------------------------------------------- the cache
@@ -202,6 +198,7 @@ fn build(gpu: &Gpu, key: u32) -> (Shared, Keyed) {
 }
 
 fn module(gpu: &Gpu) -> wgpu::ShaderModule {
+    let _startup = crate::startup::step("shader raster.wgsl");
     gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("raster.wgsl"),
         source: wgpu::ShaderSource::Wgsl(crate::shaders::RASTER.into()),
@@ -219,6 +216,7 @@ fn buffer_entry(binding: u32, ty: wgpu::BufferBindingType, dynamic: bool, min: u
 
 fn compute(gpu: &Gpu, module: &wgpu::ShaderModule, layout: Option<&wgpu::PipelineLayout>, entry: &str,
            constants: &[(&str, f64)]) -> wgpu::ComputePipeline {
+    let _startup = crate::startup::step(entry);
     gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(entry),
         layout,
@@ -258,6 +256,7 @@ fn build_shared(gpu: &Gpu) -> Shared {
 
 /// gpu_wgpu.c:264-283: the DHD_GS_* shader options as raster.wgsl's override constants.
 fn build_keyed(gpu: &Gpu, s: &Shared, key: u32) -> Keyed {
+    let _startup = crate::startup::step(&format!("raster key {key}"));
     use crate::abi::{DHDR_RASTER_ADDRESS_SHIFT, DHDR_RASTER_EARLY_DEPTH, DHDR_RASTER_EXCLUSIVE_WORD_STORE};
     let bit = |b: u32| if key & b != 0 { 1.0 } else { 0.0 };
     let c = [

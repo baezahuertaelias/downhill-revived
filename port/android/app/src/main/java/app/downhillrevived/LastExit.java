@@ -1,16 +1,20 @@
 // Downhill Revived on Android: how the run before ended (finding 152). Android keeps a record of
-// each process's end (ActivityManager.getHistoricalProcessExitReasons, API 30, our minSdk): the
-// reason, a description, the time and, for a native crash, the system's trace (a tombstone). Read
-// once per process, before any native code runs (SetupActivity, and DhdActivity for a start that
+// each process's end (ActivityManager.getHistoricalProcessExitReasons, from Android 11, API 30): the
+// reason, a description, the time and, for a native crash, the system's trace (a tombstone). Android
+// 10 (API 29, the APK's minimum since finding 191) has no such record for apps: there the only sign
+// is the game's own crash report at the end of the run's dhd.log (CrashReport.logCrash). Read
+// once per process, before any native code runs (LauncherActivity, and DhdActivity for a start that
 // skips it), and written to files/dhd-exit.txt, which android_main.c quotes into the new dhd.log
 // ("previous run: ...") and LogShare puts at the top of a shared log. The words a player reads and
 // the trace's summary: CrashReport.java.
 package app.downhillrevived;
 
 import android.app.ActivityManager;
+import android.annotation.TargetApi;
 import android.app.ApplicationExitInfo;
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.os.Build;
 import android.util.Log;
 
 import java.io.ByteArrayOutputStream;
@@ -54,6 +58,14 @@ final class LastExit {
         File out = new File(context.getFilesDir(), FILE);
         try {
             known = find(context);
+            File startup = new File(context.getFilesDir(), "dhd-startup.txt");
+            if (startup.isFile()) {
+                String stage = CrashReport.tail(startup, 8192).trim();
+                String detail = "startup: " + stage
+                        + " (hung: >=5s observed; died: unexpected exit, including a kill)\n";
+                known = known == null ? new LastExit(startup.lastModified(), null, detail)
+                        : new LastExit(known.time, known.why, known.text + detail);
+            }
         } catch (Throwable e) {  // never in the way of the game's start
             Log.w(TAG, "no exit record: " + e);
             known = null;
@@ -88,6 +100,7 @@ final class LastExit {
 
     private static LastExit find(Context context) throws IOException {
         File log = new File(context.getFilesDir(), "dhd.log");
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return fromLog(log);
         ActivityManager am = context.getSystemService(ActivityManager.class);
         List<ApplicationExitInfo> list = am == null ? null : am.getHistoricalProcessExitReasons(context.getPackageName(), 0, 1);
         if (list == null || list.isEmpty()) {
@@ -124,7 +137,23 @@ final class LastExit {
         return new LastExit(e.getTimestamp(), why, s.toString());
     }
 
+    /** Android 10: how the run ended as far as its log says. A crash the game's handler reported
+     *  counts as "It crashed." (its time: the log's last write, which the dialog shows once per);
+     *  any other end is unknown and asks nothing. */
+    private static LastExit fromLog(File log) throws IOException {
+        if (!log.isFile()) return null;
+        String report = CrashReport.logCrash(CrashReport.tail(log, CrashReport.LOG_TAIL));
+        if (report == null)
+            return new LastExit(0, null, "how it ended: Android " + Build.VERSION.RELEASE
+                    + " keeps no record an app can read, and the log has no crash report\n");
+        long time = log.lastModified();
+        return new LastExit(time, "It crashed.", "how it ended: closed unexpectedly, it crashed (" + date(time)
+                + ", the log's last write)\nsystem record: none (Android " + Build.VERSION.RELEASE
+                + " keeps none an app can read); the game's crash report: " + report + "\n");
+    }
+
     /** The record's trace, at most max bytes, null when it has none (a native crash's only from Android 12). */
+    @TargetApi(Build.VERSION_CODES.R)  // only from find's Android 11 path
     private static byte[] readTrace(ApplicationExitInfo e, int max) {
         try (InputStream in = e.getTraceInputStream()) {
             if (in == null) return null;

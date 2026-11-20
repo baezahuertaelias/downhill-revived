@@ -103,6 +103,11 @@ struct Gs {
        every change of the CLUT's entries (host palette caches). Not PS2 state. */
     struct { uint32_t valid, cbp, cpsm, count, start, bytes; uint32_t source[256]; } clut_memo;
     uint64_t clut_writes;
+    uint64_t resets;  /* CSR.RESET writes so far (the presenter's movie hold, finding 160). Not PS2 state. */
+    /* Optional: a local-to-host transfer starts (TRXDIR 1, the registers set): the backend puts
+       pixels it drew elsewhere (the native renderer's GPU surfaces, finding 250) into GS memory,
+       which the transfer packs. After sync_range. */
+    void (*read_image)(Gs *gs);
 };
 extern Gs gs;
 
@@ -132,5 +137,21 @@ int gs_reads_pending(const Gs *g);
 void gs_settle_reads(Gs *g);
 uint32_t gs_image_pixel(const uint32_t *vram, unsigned psm, unsigned bp, unsigned bw, unsigned x, unsigned y);
 int gs_xgkick(Gs *g, const uint32_t *memory, unsigned qword);
+/* A translated VU1 mesh batch from the GS queue (GS_PATH_MESH; gs_mesh.h): its A+D texture writes
+   and PRIM (unless a shadow batch's own packet made them), then the backend's mesh hook. */
+void gs_mesh(Gs *g, const uint32_t *words, size_t count);
+/* Set by the backend: 0 no mesh drawing (vu1_mesh.inc leaves VU1 as it is), 1 mesh items drawn,
+   2 drawn while the exact path answers the Z probe (the batches also run on the VU: shadow); back
+   to 0 when the GPU refuses the mesh draws (native_mesh_check; atomic: the VU thread reads it).
+   gs_mesh_hook: the backend's drawing of a mesh item, after gs_mesh's register writes.
+   gs_vu_shadow: the packet being fed was kicked by a batch the backend draws from its mesh item
+   (only the exact Z path takes it). Outside struct Gs, whose size the core's state trace holds.
+   (The threaded browser build: gs_mesh_mode is gs_mesh.h's shared word.) */
+#include "gs_mesh.h"
+#ifndef gs_mesh_mode
+extern int gs_mesh_mode;
+#endif
+extern void (*gs_mesh_hook)(Gs *gs, const uint32_t *words, size_t count);
+extern unsigned gs_vu_shadow;
 
 #endif

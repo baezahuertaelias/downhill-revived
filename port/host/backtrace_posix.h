@@ -1,11 +1,15 @@
 /* backtrace() and backtrace_symbols_fd() for the POSIX hosts' crash reports. glibc has them in
-   <execinfo.h>; Android's libc only from API 33, and the Android build targets API 30 (finding 091),
+   <execinfo.h>; Android's libc only from API 33, and the Android build targets API 29 (findings 091, 191),
    so there they are made here from the unwinder (_Unwind_Backtrace) and dladdr: each frame is
    printed as library+offset, which llvm-addr2line -e libmain.so turns into a source line.
    Async-signal-safe enough for a report on the way out (no malloc). */
 #ifndef DHD_BACKTRACE_POSIX_H
 #define DHD_BACKTRACE_POSIX_H
-#if defined(__ANDROID__) && __ANDROID_API__ < 33
+#if defined(__SWITCH__)
+/* no unwinder here: the crash handler (port/nx/src/host_nx.c) walks the frame pointers itself */
+static inline int backtrace(void **frames, int max) { (void)frames; (void)max; return 0; }
+static inline void backtrace_symbols_fd(void *const *frames, int n, int fd) { (void)frames; (void)n; (void)fd; }
+#elif defined(__ANDROID__) && __ANDROID_API__ < 33
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>

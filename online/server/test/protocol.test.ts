@@ -6,7 +6,6 @@ import {
   isOutdated,
   minVersionOf,
   parseVersion,
-  isValidCode,
   measuredRtt,
   randomCode,
 } from "../src/protocol";
@@ -17,9 +16,8 @@ describe("join codes", () => {
     for (let i = 0; i < 200; i++) {
       const code = randomCode();
       expect(code).toHaveLength(6);
-      expect(isValidCode(code)).toBe(true);
+      for (const c of code) expect(CODE_ALPHABET).toContain(c);
     }
-    expect(isValidCode("ABC0EF")).toBe(false);
   });
 });
 
@@ -41,8 +39,9 @@ describe("version gate", () => {
     for (const bad of ["", "dhd-port 274f8c46", "1", "a.b.c", 2, null, undefined]) expect(parseVersion(bad)).toBeNull();
   });
 
-  it("takes a hello without clientVersion as 0.1.0", () => {
-    expect(clientVersionOf({ version: "dhd-port 274f8c46f1af52d6" })).toBe("0.1.0");
+  it("takes a hello without clientVersion as outdated", () => {
+    expect(clientVersionOf({ version: "dhd-port 274f8c46f1af52d6" })).toBe("");
+    expect(isOutdated(clientVersionOf({}), "0.1.0")).toBe(true);
     expect(clientVersionOf({ clientVersion: "0.2.0" })).toBe("0.2.0");
   });
 

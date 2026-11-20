@@ -9,9 +9,14 @@
 #include "state_trace.h"
 #include "pace_grid.h"
 #include "stick.h"
+#include "controls_table.h"  /* the bindings' tables (port/render/settings, finding 157) */
 #include "../gs/button_icons.h"
+#include "../host/disc_check.h"
+#include "../host/app_away.h"
+#include "../gs/gs_mesh.h"   /* gs_mesh_setting_read: Native VU (finding 194) */
 #include "../include/version.h"
 #include "../runtime/sha256.h"
+#include "../runtime/disc_recent.h"  /* the crash report's last disc files (finding 208) */
 
 #include <math.h>
 #include <stdarg.h>
@@ -33,9 +38,6 @@
 #ifdef __ANDROID__
 #include <android/log.h>
 #endif
-#ifdef __APPLE__
-#include <mach/mach.h>  /* thread_info: the bench's thread times */
-#endif
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
@@ -51,10 +53,52 @@
 #include "ps2asm.h"
 #include "../include/guest.h"
 #include "../host/host_os.h"
+#include "../host/host_end.h"
 #include "../render/include/dhd_settings.h"  /* dhd.ini (port/render/settings) */
 #include "../render/include/dhd_presence.h"  /* Discord Rich Presence (port/render/presence) */
+#include "../render/include/dhd_render_ext.h"  /* dhdr_native_pipeline_crash (finding 260) */
+#ifndef _WIN32
+#include <fcntl.h>  /* open: the pipeline crash note */
+#endif
+
+/* The crash handlers' first step (finding 260): the crash note beside the pipeline list names the
+   draw pipeline this thread was in the driver's build of ("crash KEY"), or says a crash happened
+   elsewhere ("crash"). Only a pipeline so named is refused for good at the next start; a run that
+   ended any other way during a build only makes it a suspect. Async-signal-safe: atomics in the
+   renderer, a stack buffer, open and write. */
+static void pipeline_crash_note(void)
+{
+    uint64_t key = 0;
+    const char *path = dhdr_native_pipeline_crash(&key);
+    if (!path) return;
+    char line[32] = "crash";
+    int n = 5;
+    if (key) {
+        line[n++] = ' ';
+        for (int shift = 60; shift >= 0; shift -= 4) line[n++] = "0123456789ABCDEF"[key >> shift & 15];
+    }
+    line[n++] = '\n';
+#ifdef _WIN32
+    WCHAR wide[1024];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wide, 1024)) return;
+    HANDLE file = CreateFileW(wide, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return;
+    DWORD wrote;
+    WriteFile(file, line, (DWORD)n, &wrote, NULL);
+    CloseHandle(file);
+#else
+    int file = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (file < 0) return;
+    ssize_t wrote = write(file, line, (size_t)n);
+    (void)wrote;
+    close(file);
+#endif
+}
 
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+#include <TargetConditionals.h>  /* TARGET_OS_IPHONE: the iOS app (port/ios, finding 224) */
+#endif
 
 /* The instruction pointer and stack pointer of a CONTEXT. */
 #ifdef _WIN32
@@ -63,7 +107,10 @@
 #else
 /* POSIX crash/dump signals hand a ucontext_t: x86_64, or aarch64 (Android, finding 091; macOS,
    whose registers sit behind a pointer, with fp and lr right after x0-x28). CTX_X: x0 up. */
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(__x86_64__)
+#define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__rip)
+#define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__rsp)
+#elif defined(__APPLE__)
 #define CTX_IP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__pc)
 #define CTX_SP(c) ((uintptr_t)(c)->uc_mcontext->__ss.__sp)
 #define CTX_X(c) ((const unsigned long long *)(c)->uc_mcontext->__ss.__x)
@@ -186,6 +233,12 @@ static void print_snapshot(const Snapshot *s)
     fprintf(stderr, "  pc %016llX sp %016llX lr %016llX x0 %016llX x1 %016llX x2 %016llX x19 %016llX x29 %016llX\n",
             (unsigned long long)CTX_IP(c), (unsigned long long)CTX_SP(c), x[30], x[0], x[1], x[2],
             x[19], x[29]);
+#elif defined(__APPLE__)
+    const __typeof__(c->uc_mcontext->__ss) *r = &c->uc_mcontext->__ss;
+    fprintf(stderr, "  rip %016llX rax %016llX rbx %016llX rcx %016llX rdx %016llX rsi %016llX rdi %016llX rsp %016llX\n",
+            (unsigned long long)r->__rip, (unsigned long long)r->__rax, (unsigned long long)r->__rbx,
+            (unsigned long long)r->__rcx, (unsigned long long)r->__rdx, (unsigned long long)r->__rsi,
+            (unsigned long long)r->__rdi, (unsigned long long)r->__rsp);
 #else
     const greg_t *r = c->uc_mcontext.gregs;
     fprintf(stderr, "  rip %016llX rax %016llX rbx %016llX rcx %016llX rdx %016llX rsi %016llX rdi %016llX rsp %016llX\n",
@@ -219,6 +272,16 @@ static void peek(void)
             fprintf(stderr, "%s%08X", i % 32 ? " " : i ? "\n  " : "  ", *(uint32_t *)GUEST(addr + i));
         }
     fprintf(stderr, "\n");
+}
+
+/* The disc files the game looked up last (cdvd.c note_lookup), oldest first: a crash while a
+   screen loads names what it was reading (finding 208). */
+static void disc_recent(void)
+{
+    const uint8_t *at = GUEST(PS2_DISC_RECENT);
+    char line[PS2_DISC_RECENT_SIZE + 64];
+    if (host_readable(at, PS2_DISC_RECENT_SIZE) && disc_recent_line(at, line, sizeof line))
+        fputs(line, stderr);
 }
 
 #ifdef _WIN32
@@ -340,13 +403,14 @@ static void log_start(void)
     /* Direct handle writes (and a relaunch after an update, update.c start_again) use the file. */
     SetStdHandle(STD_ERROR_HANDLE, log_file);
     SetStdHandle(STD_OUTPUT_HANDLE, log_file);
-    atexit(log_atexit);
+    host_end_add(HOST_END_LOG, "log", log_atexit);
     signal(SIGABRT, log_aborted);
 }
 
 static LONG WINAPI crashed(EXCEPTION_POINTERS *e)
 {
     EXCEPTION_RECORD *r = e->ExceptionRecord;
+    pipeline_crash_note();
     fprintf(stderr, "crash: exception %08lX at %08llX", r->ExceptionCode,
             (unsigned long long)(uintptr_t)r->ExceptionAddress);
     if (r->ExceptionCode == EXCEPTION_ACCESS_VIOLATION)
@@ -354,6 +418,7 @@ static LONG WINAPI crashed(EXCEPTION_POINTERS *e)
                 (unsigned long long)r->ExceptionInformation[1]);
     fprintf(stderr, "\n");
     report(e->ContextRecord);
+    disc_recent();
     peek();
     log_settle();
     return EXCEPTION_EXECUTE_HANDLER;
@@ -387,6 +452,7 @@ static void crashed(int sig, siginfo_t *info, void *ctx)
         _exit(3);
 #endif
     }
+    pipeline_crash_note();
     const char *name = sig == SIGSEGV ? "SIGSEGV" : sig == SIGBUS ? "SIGBUS" : sig == SIGILL ? "SIGILL" : "SIGFPE";
     char thread[17] = "?";
     pthread_getname_np(pthread_self(), thread, sizeof thread);  /* which of the port's threads (host_thread_name) */
@@ -410,6 +476,7 @@ static void crashed(int sig, siginfo_t *info, void *ctx)
         int n = backtrace(frames, 32);
         backtrace_symbols_fd(frames, n, STDERR_FILENO);
     }
+    disc_recent();
     peek();
     fflush(stderr);
     host_log_drain();
@@ -563,11 +630,20 @@ static int SDLCALL watchdog(void *seconds)
    (port/hle/dma.c, hle_render_wait), the registers the game last published and, on Windows, the
    game thread's code addresses as RVAs for port/tools/host64_rva.py. A Mac or Linux game thread
    is not stopped (that needs a signal handler on it); the rest is logged. One line when the
-   fields go on again. */
+   fields go on again. A phone's app in the background (host_app_away) is not a freeze. */
 static uint32_t freeze_word(uint32_t ee)
 {
     const void *p = GUEST(0x08000000u + ee);
     return host_readable(p, 4) ? *(volatile const uint32_t *)p : 0xFFFFFFFFu;
+}
+
+int host_service_host_came_back(void) { return app_away_came_back(); }   /* app_away.c */
+
+void host_app_away(int away)
+{
+    app_away_set(away);
+    touch_host_app_away(away);
+    host_sound_away(away);
 }
 
 static int SDLCALL freeze_watch(void *unused)
@@ -580,6 +656,10 @@ static int SDLCALL freeze_watch(void *unused)
     for (;;) {
         SDL_Delay(1000);
         uint64_t field = *(volatile uint64_t *)&kernel_vsync_count;
+        if (app_away_now()) {   /* a phone's app in the background waits: no freeze */
+            last = field, still = 0;
+            continue;
+        }
         if (field != last || !armed) {
             armed |= last && field != last;
             if (still >= 5)
@@ -624,107 +704,7 @@ static int SDLCALL freeze_watch(void *unused)
     return 0;
 }
 
-/* The port's own OS threads by name (game, vu, gs, native, sound): the bench reports each one's
-   CPU time. */
-enum { NAMED_THREADS = 16 };
-#ifdef _WIN32
-static struct { const char *name; HANDLE handle; } named[NAMED_THREADS];
-#else
-static struct { const char *name; pthread_t handle; } named[NAMED_THREADS];
-#endif
-static atomic_int named_count;
-
-void host_thread_name(const char *name)
-{
-#ifdef _WIN32  /* the OS's name too, for debuggers and profilers */
-    WCHAR wide[64];
-    if (MultiByteToWideChar(CP_UTF8, 0, name, -1, wide, 64)) SetThreadDescription(GetCurrentThread(), wide);
-#elif defined(__APPLE__)
-    pthread_setname_np(name);  /* the calling thread's own */
-#else
-    /* Linux and Android: the main thread's name is the process's own (ps, top, pgrep, a desktop's
-       system monitor), so that thread keeps "dhd" (a crash report then says thread dhd) */
-    if (gettid() != getpid()) pthread_setname_np(pthread_self(), name);
-#endif
-#ifdef __ANDROID__
-    { void android_perf_thread(const char *name); android_perf_thread(name); }  /* port/host/android_perf.c */
-#endif
-    { void perf_thread(const char *name); perf_thread(name); }  /* port/gs/perf_log.c: its waits */
-    int at = atomic_fetch_add(&named_count, 1);
-    if (at >= NAMED_THREADS) return;
-#ifdef _WIN32
-    DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &named[at].handle, 0, FALSE,
-                    DUPLICATE_SAME_ACCESS);
-#else
-    named[at].handle = pthread_self();
-#endif
-    named[at].name = name;  /* published last: a reader skips a slot still being filled */
-}
-
-unsigned host_thread_cpu(const char **names, double *seconds, unsigned max)
-{
-    unsigned n = 0;
-    for (int i = 0; i < named_count && i < NAMED_THREADS && n < max; i++) {
-#ifdef _WIN32
-        FILETIME created, exited, kernel, user;
-        if (!named[i].name || !GetThreadTimes(named[i].handle, &created, &exited, &kernel, &user)) continue;
-        names[n] = named[i].name;
-        seconds[n++] = (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
-                        ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
-#elif defined(__APPLE__)  /* no per-thread CPU clocks: Mach's thread times */
-        thread_basic_info_data_t info;
-        mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
-        if (!named[i].name || thread_info(pthread_mach_thread_np(named[i].handle), THREAD_BASIC_INFO,
-                                          (thread_info_t)&info, &count) != KERN_SUCCESS)
-            continue;
-        names[n] = named[i].name;
-        seconds[n++] = info.user_time.seconds + info.system_time.seconds +
-                       (info.user_time.microseconds + info.system_time.microseconds) / 1e6;
-#else
-        clockid_t id;
-        struct timespec t;
-        if (!named[i].name || pthread_getcpuclockid(named[i].handle, &id) != 0 ||
-            clock_gettime(id, &t) != 0)
-            continue;
-        names[n] = named[i].name;
-        seconds[n++] = (double)t.tv_sec + (double)t.tv_nsec / 1e9;
-#endif
-    }
-    return n;
-}
-
-/* Raw scheduled CPU cycles, complementary to GetThreadTimes (coarse on Windows). */
-unsigned host_thread_cycles(const char **names, uint64_t *cycles, unsigned max)
-{
-    unsigned n = 0;
-#ifdef _WIN32
-    for (int i = 0; i < named_count && i < NAMED_THREADS && n < max; i++) {
-        ULONG64 value;
-        if (!named[i].name || !QueryThreadCycleTime(named[i].handle, &value)) continue;
-        names[n] = named[i].name;
-        cycles[n++] = value;
-    }
-#else
-    (void)names; (void)cycles; (void)max;
-#endif
-    return n;
-}
-
-/* The calling thread's CPU time, and the whole process's, in seconds (the worker profiles and the
-   bench). */
-double host_current_thread_cpu(void)
-{
-#ifdef _WIN32
-    FILETIME created, exited, kernel, user;
-    if (!GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user)) return 0;
-    return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
-            ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
-#else
-    struct timespec t;
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &t)) return 0;
-    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
-#endif
-}
+/* The named threads and their CPU times: port/host/host_threads.c (finding 217). */
 
 double host_process_cpu(void)
 {
@@ -733,6 +713,12 @@ double host_process_cpu(void)
     if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
     return (((uint64_t)kernel.dwHighDateTime << 32 | kernel.dwLowDateTime) +
             ((uint64_t)user.dwHighDateTime << 32 | user.dwLowDateTime)) * 1e-7;
+#elif defined(__SWITCH__)  /* the named threads', which are the ones that work */
+    const char *names[16];
+    double seconds[16], sum = 0;
+    unsigned count = host_thread_cpu(names, seconds, 16);
+    for (unsigned i = 0; i < count; i++) sum += seconds[i];
+    return sum;
 #else
     struct timespec t;
     if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &t)) return 0;
@@ -788,7 +774,7 @@ void host_init(void)
 /* The log on Linux, macOS and Android: stdout and stderr write into a pipe and a thread copies its
    lines to dhd.log (and on Android to logcat, tag DownhillRevived), so a slow write to the disk
    holds up only that thread, as on Windows. host_log_drain: the lines still in the pipe reach the
-   file before the process ends (exit, host_exit), at most half a second. */
+   file before the process ends (host_end, exit, host_exit), at most half a second. */
 static int log_pipe[2] = {-1, -1};
 static FILE *log_file;
 static atomic_int log_busy;  /* the thread is between a read and its last line written */
@@ -857,7 +843,7 @@ static void log_start(const char *path, const char *mode)
     setvbuf(stdout, NULL, _IOLBF, 0);
     pthread_t thread;
     if (pthread_create(&thread, NULL, log_copy, NULL) == 0) pthread_detach(thread);
-    atexit(host_log_drain);
+    host_end_add(HOST_END_LOG, "log", host_log_drain);
 }
 #endif
 
@@ -985,46 +971,120 @@ void host_pad_vibrate(int port, int light, int heavy)
     if (gamepad_start()) gamepad_vibrate(port, light, heavy);
 }
 
-/* The game's controls are in riding mode (D_0029E290, func_00220550): keyboard.c moves the left
-   stick with the arrows then, and the d-pad in menus. */
-static int riding_controls(void) { return *(volatile int32_t *)GUEST(0x0829E290) != 0; }
+/* ---- keyboard and controller bindings (finding 157) ----
+   The layouts the game plays with: DHD_KEYBOARD and DHD_PAD1 to DHD_PAD4 (dhd.ini keyboard, pad1 to
+   pad4: each of the four players' controllers has its own, finding 251) as dhd_settings reads them
+   (port/render/settings/src/controls.rs: unset, the defaults), read again whenever one of them changes (PC SETTINGS > Controls sets them as it saves), and
+   logged then. The CONTROLS page's services below make every change through dhd_settings too. */
 
-/* The keyboard (layout: keyboard.c), only while the game's window has the keyboard (keyboard_focused,
-   fed by the SDL thread: sdl_host.c), and not while Alt, Ctrl or a Windows key is held, so Alt+Tab,
-   Alt+Enter, Ctrl+Esc and the like stay the system's. A key let go elsewhere is let go here too
-   (keyboard_focus clears the keys when the window loses the keyboard). Letters are read by their
-   place on a US keyboard (keyboard.c), and text_input_key_allowed takes the character the key types. */
-static void keyboard_merge(HostPad *out)
+static ControlsLayout controls[CONTROL_DEVICES];
+typedef char controls_layout_size[sizeof(ControlsLayout) == sizeof(DhdControlsLayout) && sizeof(ControlsLayout) == 52 ? 1 : -1];
+typedef char controls_device_count[CONTROL_DEVICES == DHD_CONTROLS_DEVICES ? 1 : -1];
+static char controls_seen[CONTROL_DEVICES][512];
+static int controls_ready;
+
+static void controls_problem(const char *text) { hle_log("controls: %s\n", text); }
+
+static const char *controls_value(int device)
 {
-    uint8_t down[256] = {0};
-    if (keyboard_focused() && !keyboard_is_down(VKEY_MENU) && !keyboard_is_down(VKEY_CONTROL) &&
-        !keyboard_is_down(VKEY_LWIN) && !keyboard_is_down(VKEY_RWIN)) {
-        int count;
-        const uint8_t *keys = keyboard_keys(&count);
-        for (int i = 0; i < count; i++) {
-            unsigned place = keys[i];
-            if (text_input_key_allowed(keyboard_typed_of(place)) && keyboard_position_down(place)) down[keys[i]] = 1;
-        }
-    }
-    keyboard_pad(down, riding_controls(), host_seconds(), out);
+    const char *v = getenv(control_devices[device].env);
+    return v ? v : "";
 }
 
-/* Player `port`'s controller (SDL, gamepad.c), and for player 1 the keyboard as well, merged. */
+static void controls_follow(void)
+{
+    int changed = !controls_ready;
+    for (int d = 0; d < CONTROL_DEVICES; d++) changed |= strncmp(controls_value(d), controls_seen[d], sizeof controls_seen[d]) != 0;
+    if (!changed) return;
+    const char *values[CONTROL_DEVICES];
+    for (int d = 0; d < CONTROL_DEVICES; d++) {
+        snprintf(controls_seen[d], sizeof controls_seen[d], "%s", controls_value(d));
+        values[d] = controls_seen[d];
+    }
+    dhd_controls_layouts(values, (DhdControlsLayout *)controls, controls_problem);
+    char line[CONTROL_DEVICES * (sizeof controls_seen[0] + 16)];  /* every line whole, as written */
+    int n = snprintf(line, sizeof line, "controls:");
+    for (int d = 0; d < CONTROL_DEVICES && n > 0 && (size_t)n < sizeof line; d++)
+        n += snprintf(line + n, sizeof line - (size_t)n, "%s %s %s", d ? "," : "", control_devices[d].key,
+                      *controls_seen[d] ? controls_seen[d] : "(defaults)");
+    hle_log("%s\n", line);
+    controls_ready = 1;
+}
+
+/* A device's layout (CONTROL_KEYBOARD, CONTROL_PAD1 ... CONTROL_PAD4). */
+static const ControlsLayout *controls_layout(int device)
+{
+    controls_follow();
+    return &controls[device];
+}
+
+/* Player `port`'s controller layout (0-3: each player's own, finding 251). */
+static const ControlsLayout *pad_layout(int port)
+{
+    return port >= 0 && port < 4 ? controls_layout(CONTROL_PAD1 + port) : &control_defaults[CONTROL_PAD1];
+}
+
+/* The game's controls are in riding mode (D_0029E290, func_00220550): keyboard.c moves the left
+   stick with the d-pad's keys then, and the d-pad in menus. */
+static int riding_controls(void) { return *(volatile int32_t *)GUEST(0x0829E290) != 0; }
+
+/* The keyboard (its layout: dhd.ini keyboard, keyboard.c), only while the game's window has the
+   keyboard (keyboard_focused, fed by the SDL thread: sdl_host.c), and not while Alt, Ctrl or a
+   Windows key is held, so Alt+Tab, Alt+Enter, Ctrl+Esc and the like stay the system's. A key let
+   go elsewhere is let go here too (keyboard_focus clears the keys when the window loses the
+   keyboard). Keys are read by their place on a US keyboard (keyboard.c), and
+   text_input_key_allowed takes the character the key types. */
+static void keyboard_merge(HostPad *out)
+{
+    uint8_t down[256] = {0}, keys[CONTROL_TARGETS * CONTROL_SLOTS + 1], taps[256];
+    const ControlsLayout *layout = controls_layout(CONTROL_KEYBOARD);
+    keyboard_taps_take(taps);  /* a key tapped and let go since the last field counts for this one */
+    if (keyboard_focused() && !keyboard_is_down(VKEY_MENU) && !keyboard_is_down(VKEY_CONTROL) &&
+        !keyboard_is_down(VKEY_LWIN) && !keyboard_is_down(VKEY_RWIN)) {
+        int count = keyboard_keys(layout, keys);
+        for (int i = 0; i < count; i++) {
+            unsigned place = keys[i];
+            if (text_input_key_allowed(keyboard_typed_of(place)) && (keyboard_position_down(place) || taps[place]))
+                down[keys[i]] = 1;
+        }
+    }
+    keyboard_pad(layout, down, riding_controls(), host_seconds(), out);
+    /* typing a name or a room code (text_input.c): the arrows still move the field's pad picker,
+       whatever keys the d-pad has */
+    static const struct { uint8_t vk; uint16_t bit; uint8_t pressure; } arrows[] = {
+        {0x27, PAD_RIGHT, 0}, {0x25, PAD_LEFT, 1}, {0x26, PAD_UP, 2}, {0x28, PAD_DOWN, 3}};
+    if (keyboard_focused() && text_input_active())
+        for (unsigned i = 0; i < sizeof arrows / sizeof *arrows; i++)
+            if ((keyboard_position_down(arrows[i].vk) || taps[arrows[i].vk]) && text_input_key_allowed(arrows[i].vk))
+                out->buttons |= arrows[i].bit, out->pressure[arrows[i].pressure] = 255;
+}
+
+/* Player `port`'s controller (SDL, gamepad.c) through the player's layout, and for player 1 the
+   keyboard as well, merged. */
 void host_pad_device(int port, HostPad *out)
 {
+    GamepadRaw raw;
     memset(out, 0, sizeof *out);
     out->right_x = out->right_y = out->left_x = out->left_y = 128;
+    /* D_004B25A0 + 0x288: local human count, set by the player-count screen and
+       kept through split-screen setup/racing. Online races use one local human. */
+    gamepad_set_multiplayer(*(volatile int32_t *)GUEST(0x084B2828) > 1);
+    int connected = gamepad_start() && gamepad_raw_take(port, &raw);
     /* the sticks' dead zone (stick.h), followed here on the game thread, where PC SETTINGS sets it */
-    if (port == 0 && gamepad_start()) gamepad_dead_zone(stick_dead_zone_of(getenv("DHD_STICK_DEAD_ZONE")));
-    /* the button icons (dhd.ini prompts, PC SETTINGS > Button Icons): auto follows player 1's pad */
+    if (connected) gamepad_apply(pad_layout(port), &raw, stick_dead_zone_of(getenv("DHD_STICK_DEAD_ZONE")), out);
     if (port == 0) {
-        int kind = gamepad_start() ? gamepad_kind(0) : PAD_KIND_NONE;
-        button_icons_choose(getenv("DHD_PROMPTS"), kind == PAD_KIND_XBOX ? BUTTON_ICONS_XBOX
-                                                   : kind == PAD_KIND_NINTENDO ? BUTTON_ICONS_NINTENDO : BUTTON_ICONS_GAME);
+        /* the button icons (dhd.ini prompts, PC SETTINGS > Button Icons): auto follows player 1's pad,
+           and they follow its layout while a pad is there or icons are chosen */
+        const char *prompts = getenv("DHD_PROMPTS");
+        int named = connected && touch_host_pad_prompts();  /* on a touch screen: the device in use (finding 227) */
+        int kind = named ? gamepad_kind(0) : PAD_KIND_NONE;
+        int follow = named || (prompts && SDL_strcasecmp(prompts, "auto"));
+        button_icons_choose(prompts, kind == PAD_KIND_XBOX ? BUTTON_ICONS_XBOX : kind == PAD_KIND_NINTENDO ? BUTTON_ICONS_NINTENDO
+                                                                                                           : BUTTON_ICONS_GAME,
+                            follow ? controls_layout(CONTROL_PAD1) : NULL);
+        keyboard_merge(out);
+        touch_host_merge(out);  /* the touch controls (touch_host.c, finding 141) */
     }
-    int connected = gamepad_start() && gamepad_read(port, out);
-    if (port == 0) keyboard_merge(out);
-    if (port == 0) touch_host_merge(out);  /* the touch controls (touch_host.c, finding 141) */
     out->connected = (uint8_t)(connected || port == 0);  /* player 1 always has the keyboard */
 }
 
@@ -1107,7 +1167,22 @@ void host_settings_load(void)
         }
         at += n + (at[n] == ',');
     }
+#ifdef __SWITCH__
+    /* The wait before VBLANK, not just-in-time frames (dhd.ini's DHD_LATENCY = 1 brings them back):
+       once a picture takes over a field from its pad read, host_pacing_wait reads the moved grid
+       as a queue and holds each frame to half that time past a field, 33 fields/s on the title,
+       with the cores idle. The render thread then never sleeps with a picture. */
+    if (!getenv("DHD_LATENCY")) host_putenv_s("DHD_LATENCY", "0");
+#endif
     hle_log("settings:%s\n", *settings_seen ? settings_seen : " (none)");
+    gs_mesh_setting_read();   /* Native VU for the VU thread (vu1_mesh.inc), before its first run */
+    /* The install id for the online hello (finding 161; port/net/net.c): made once and kept in
+       dhd.ini. Set straight into the environment, never through settings_set: dhd.log, which
+       players post, must not show it (whoever copied it could get its player banned). */
+    if (!getenv("DHD_NET_INSTALL_ID")) {
+        char id[40];
+        if (dhd_settings_install_id(path, id, sizeof id)) host_putenv_s("DHD_NET_INSTALL_ID", id);
+    }
 }
 
 /* One dhd.ini line (the others kept). Nonzero when saved. */
@@ -1128,7 +1203,6 @@ int host_game_options_read(char *value, size_t size)
 
 /* ---- the disc image (first start) ---- */
 
-static uint32_t le32_at(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
 
 /* The game's other releases (finding 100), from the table the launcher reads too. */
 #define OTHER_RELEASE(boot, what) {boot, what},
@@ -1167,69 +1241,46 @@ static const char *other_release(const char *boot)
     return NULL;
 }
 
-/* Whether path is Downhill Domination (USA): the ISO 9660 root holds a SYSTEM.CNF whose boot
-   line names SCUS_971.77, and SCUS_971.77 is the retail one (game_data_read: the game's data
-   comes from it). NULL if it is, else why not. disc_shallow (the Android start, before the core
-   exists) leaves out game_data_read, which runs in the core; host_disc_ready checks it later. */
+/* Whether path is Downhill Domination (USA): disc_check_image (port/host/disc_check.c, finding 227:
+   the ISO 9660 root holds a SYSTEM.CNF whose boot line names SCUS_971.77, and the file holds the
+   whole volume it declares), then SCUS_971.77 is the retail one (game_data_read: the game's data
+   comes from it). NULL if it is, else why not. disc_shallow (a phone's launcher, import and start,
+   before the core exists) leaves out game_data_read, which runs in the core; host_disc_ready
+   checks it later. */
 static int disc_shallow;
+static int disc_read(void *file, uint64_t offset, void *buffer, size_t n)
+{
+    HostFile f = *(HostFile *)file;
+    return host_file_seek(f, offset) == 0 && host_file_read(f, buffer, n) == (int64_t)n;
+}
 static const char *disc_problem(const char *path, char *why, size_t size)
 {
-    enum { SECTOR = 2048 };
-    static uint8_t sector[SECTOR];
-    static char text[SECTOR + 1];
     HostFile f = host_file_open(path, HOST_FILE_READ);
     if (f == HOST_FILE_NONE) return "The file can't be opened.";
-    const char *problem = NULL;
-    uint32_t cnf = 0, cnf_size = 0;
-#define READ(lsn) (host_file_seek(f, (uint64_t)(lsn) * SECTOR) == 0 && host_file_read(f, sector, SECTOR) == SECTOR)
-    if (!READ(16) || sector[0] != 1 || memcmp(sector + 1, "CD001", 5)) {
-        problem = "It isn't a disc image (no ISO 9660 volume in it).";
-        goto done;
-    }
-    /* The primary volume descriptor's root directory record (at 156): extent at +2, size at +10. */
-    uint32_t dir = le32_at(sector + 156 + 2), dir_size = le32_at(sector + 156 + 10);
-    for (uint32_t off = 0; off < dir_size && off < 16 * SECTOR && !cnf; off += SECTOR) {
-        if (!READ(dir + off / SECTOR)) break;
-        for (unsigned i = 0; i + 33 < SECTOR && sector[i]; i += sector[i]) {
-            const uint8_t *r = sector + i;
-            if (r[32] >= 10 && i + 33 + r[32] <= SECTOR && !SDL_strncasecmp((const char *)r + 33, "SYSTEM.CNF", 10) &&
-                (r[32] == 10 || r[33 + 10] == ';')) {
-                cnf = le32_at(r + 2);
-                cnf_size = le32_at(r + 10);
-                break;
-            }
-        }
-    }
-    if (!cnf || !READ(cnf)) {
-        problem = "It has no SYSTEM.CNF, so it isn't a PlayStation 2 game disc.";
-        goto done;
-    }
-    memcpy(text, sector, SECTOR);
-    text[cnf_size < SECTOR ? cnf_size : SECTOR] = 0;
-    if (strstr(text, "SCUS_971.77")) {
-        if (!disc_shallow) problem = game_data_read(path, NULL);  /* the game's program and data, unchanged (game_data.c) */
-        goto done;
-    }
-    /* Name the game it is: BOOT2 = cdrom0:\SLUS_123.45;1 */
-    const char *boot = strstr(text, "BOOT2");
-    char id[32] = "";
-    if (boot && (boot = strpbrk(boot, "\\:"))) {
-        while (*boot == '\\' || *boot == ':') boot++;
-        size_t n = strcspn(boot, ";\r\n");
-        snprintf(id, sizeof id, "%.*s", (int)(n < 31 ? n : 31), boot);
-    }
-    const char *release = other_release(id);
-    if (release)
-        snprintf(why, size, "This is %s. Downhill Revived needs the USA disc (SCUS-97177) for now. More: %s", release,
-                 other_releases_more);
-    else
-        snprintf(why, size, "It is another PlayStation 2 disc%s%s%s, not Downhill Domination (USA), SCUS-97177.",
-                 *id ? " (" : "", id, *id ? ")" : "");
-    problem = why;
-done:
-#undef READ
+    char id[32];
+    uint64_t volume = 0, length = host_file_size(f);
+    int kind = disc_check_image(disc_read, &f, length, id, sizeof id, &volume);
     host_file_close(f);
-    return problem;
+    switch (kind) {
+    case DISC_NOT_ISO: return "It isn't a disc image (no ISO 9660 volume in it).";
+    case DISC_NO_CNF: return "It has no SYSTEM.CNF, so it isn't a PlayStation 2 game disc.";
+    case DISC_CUT:
+        snprintf(why, size, "The disc image is incomplete: it has %.1f MB of the %.1f MB its volume declares (a download or "
+                 "copy cut short). Make or copy it again.", length / 1048576.0, volume / 1048576.0);
+        return why;
+    case DISC_OTHER: {
+        const char *release = other_release(id);
+        if (release)
+            snprintf(why, size, "This is %s. Downhill Revived needs the USA disc (SCUS-97177) for now. More: %s", release,
+                     other_releases_more);
+        else
+            snprintf(why, size, "It is another PlayStation 2 disc%s%s%s, not Downhill Domination (USA), SCUS-97177.",
+                     *id ? " (" : "", id, *id ? ")" : "");
+        return why;
+    }
+    default:
+        return disc_shallow ? NULL : game_data_read(path, NULL);  /* the game's program and data, unchanged (game_data.c) */
+    }
 }
 
 /* At start: the disc image dhd.ini names (iso), if it is there and is Downhill Domination (USA).
@@ -1274,8 +1325,9 @@ int host_disc_ready(void)
 void host_service_host_init(void) { host_init(); }
 void host_service_host_console_init(void) { host_console_init(); }
 int host_service_host_disc_ready(void) { return host_disc_ready(); }
-#ifdef __ANDROID__
-/* The Android start (port/host/android_main.c) checks the copy it made of the player's disc image:
+#if defined(__ANDROID__) || (defined(__APPLE__) && TARGET_OS_IPHONE)
+/* The phones' launchers and starts (port/host/android_main.c, android_launcher.c; iOS's
+   port/ios/app/launcher.m, ios_main.m; finding 227) check the player's disc image and its copy:
    NULL when it is Downhill Domination (USA), else why not. */
 const char *host_disc_check(const char *path)
 {
@@ -1287,6 +1339,133 @@ const char *host_disc_check(const char *path)
 }
 #endif
 int host_service_host_poll_dump(void) { return atomic_exchange(&dump_pending, 0) != 0; }
+/* ---- the CONTROLS page's services (port/hle/controls_settings.c, finding 157) ---- */
+
+/* A device's layout as the host plays with it into out (guest, 52 bytes). */
+int host_service_controls_layout(int device, uint32_t out)
+{
+    if (device < 0 || device >= CONTROL_DEVICES) return 0;
+    memcpy(GUEST(out), controls_layout(device), sizeof(ControlsLayout));
+    return 1;
+}
+
+/* Player 1's to 4's controller: its PAD_KIND_* plus 1, 0 none connected. */
+static int controls_pad_connected(int player)
+{
+    GamepadRaw raw;
+    if (player < 1 || player > 4 || !gamepad_start() || !gamepad_raw(player - 1, &raw)) return 0;
+    return gamepad_kind(player - 1) + 1;
+}
+
+/* The same for the pages' button names (SETTINGS' "Tabs" line, CONTROLS): on a touch screen a
+   controller counts once it has sent input since the last touch (touch_host_pad_prompts), so a
+   phone shows touch words until a real pad is used (finding 227). */
+int host_service_controls_pad(int player)
+{
+    return touch_host_pad_prompts() ? controls_pad_connected(player) : 0;
+}
+
+/* A change by dhd_settings' rules (dhd_controls_edit): saved to dhd.ini and played with at once
+   (the device's variable). The page's words into message (guest, size bytes). */
+int host_service_controls_change(int device, int edit, int target, int slot, int input, uint32_t message, int size)
+{
+    char value[512], *said = size > 0 ? (char *)GUEST(message) : NULL;
+    if (said) *said = 0;
+    if (device < 0 || device >= CONTROL_DEVICES) return CONTROL_UNCHANGED;
+    if (host_setting_locked(control_devices[device].env)) {
+        if (said) snprintf(said, (size_t)size, "Set by %s outside the game", control_devices[device].env);
+        return CONTROL_REFUSED;
+    }
+    controls_follow();
+    const char *values[CONTROL_DEVICES];
+    for (int d = 0; d < CONTROL_DEVICES; d++) values[d] = controls_seen[d];
+    int kind = device == CONTROL_KEYBOARD ? PAD_KIND_NONE : gamepad_start() ? gamepad_kind(device - CONTROL_PAD1) : PAD_KIND_NONE;
+    int done = dhd_controls_edit(values, device, edit, target, slot, input, kind, value, sizeof value, said,
+                                 size > 0 ? (size_t)size : 0);
+    if (done == CONTROL_CHANGED) {
+        if (!host_setting_save(control_devices[device].key, value)) hle_log("controls: dhd.ini not saved\n");
+        host_putenv_s(control_devices[device].env, value);
+    }
+    return done;
+}
+
+/* What is held for a wait: the bindable keys and Esc, and each input of a controller (a trigger
+   past half way) as a bit of its place through `layout`'s shoulder swaps (the layout the wait
+   binds for, so the input it gets reads back as the button pressed; finding 189); one player's
+   controller (1 to 4), or every one (0). */
+static int controls_key_held(int vk) { return keyboard_focused() && keyboard_position_down((unsigned)vk); }
+
+static uint32_t pad_held(int player, const ControlsLayout *layout)
+{
+    uint32_t held = 0;
+    for (int p = player ? player - 1 : 0; p < (player ? player : 4); p++) {
+        GamepadRaw raw;
+        if (!gamepad_start() || !gamepad_raw(p, &raw)) continue;
+        uint32_t inputs = raw.buttons;
+        for (int i = 0; i < CONTROL_PAD_INPUTS; i++)
+            if (control_pad_inputs[i].trigger && raw.trigger[control_pad_inputs[i].trigger - 1] > 128) inputs |= 1u << control_pad_inputs[i].id;
+        for (int id = 1; id < 32; id++)
+            if (inputs & 1u << id) held |= 1u << gamepad_place(layout, id);
+    }
+    return held;
+}
+
+static int system_keys_held(void)
+{
+    return keyboard_is_down(VKEY_MENU) || keyboard_is_down(VKEY_CONTROL) || keyboard_is_down(VKEY_LWIN) || keyboard_is_down(VKEY_RWIN);
+}
+
+/* The CONTROLS page waits for a key or a button for device: command 1 begins (what is held now
+   doesn't count until it is let go and pressed again); 0 asks: the key's vk or the controller
+   input's id pressed since (that player's controller, else any), -2 Esc (give up), -1 nothing yet;
+   2: 1 while any key or controller input is still held. */
+int host_service_controls_capture(int device, int command)
+{
+    static uint8_t keys_before[256];
+    static uint32_t pads_before;
+    int player = device >= CONTROL_PAD1 && device < CONTROL_DEVICES ? device - CONTROL_PAD1 + 1 : 0;
+    const ControlsLayout *layout = player ? controls_layout(device) : &control_defaults[CONTROL_PAD1];
+    if (player && !controls_pad_connected(player)) player = 0;  /* that player's pad isn't there: any */
+    if (command == 2) {
+        if (pad_held(0, layout) || controls_key_held(0x1B)) return 1;
+        for (int i = 0; i < CONTROL_KEYS; i++)
+            if (controls_key_held(control_keys[i].vk)) return 1;
+        return 0;
+    }
+    if (command == 1) {
+        memset(keys_before, 0, sizeof keys_before);
+        keys_before[0x1B] = (uint8_t)controls_key_held(0x1B);
+        for (int i = 0; i < CONTROL_KEYS; i++) keys_before[control_keys[i].vk] = (uint8_t)controls_key_held(control_keys[i].vk);
+        pads_before = pad_held(0, layout);
+        return 0;
+    }
+    /* a key held at the beginning counts once it was let go */
+    int esc = controls_key_held(0x1B);
+    if (!esc) keys_before[0x1B] = 0;
+    else if (!keys_before[0x1B]) return -2;
+    int pressed = 0;
+    for (int i = 0; i < CONTROL_KEYS; i++) {
+        int vk = control_keys[i].vk, down = controls_key_held(vk);
+        if (!down) keys_before[vk] = 0;
+        else if (!keys_before[vk] && !pressed) pressed = vk;
+    }
+    uint32_t held = pad_held(0, layout), mine = pad_held(player, layout);
+    pads_before &= held;
+    uint32_t fresh = mine & ~pads_before;
+    if (device == CONTROL_KEYBOARD) return pressed && !system_keys_held() ? pressed : -1;
+    for (int id = 1; id < 32; id++)
+        if (fresh & 1u << id) return id;
+    return -1;
+}
+
+/* A controller's state through player's layout (DHD_TEST_PAD, autopad.c): raw (guest GamepadRaw)
+   into out (guest HostPad), as host_pad_device turns a real pad's. */
+void host_service_controls_map(int player, uint32_t raw, uint32_t out)
+{
+    HostPad *pad = (HostPad *)GUEST(out);
+    gamepad_apply(pad_layout(player), (const GamepadRaw *)GUEST(raw), stick_dead_zone_of(getenv("DHD_STICK_DEAD_ZONE")), pad);
+}
+
 void host_service_host_settings_load(void) { host_settings_load(); }
 int host_service_host_setting_save(uint32_t a0, uint32_t a1) { return host_setting_save((const char *)GUEST(a0), (const char *)GUEST(a1)); }
 int host_service_host_setting_locked(uint32_t a0) { return host_setting_locked((const char *)GUEST(a0)); }
@@ -1300,7 +1479,8 @@ static void presence_stop(void) { dhd_presence_stop(); }
 void host_service_presence(uint32_t a0)
 {
     static int running = -1;
-    if (running < 0 && (running = dhd_presence_start(getenv("DHD_DISCORD"), presence_log))) atexit(presence_stop);
+    if (running < 0 && (running = dhd_presence_start(getenv("DHD_DISCORD"), presence_log)))
+        host_end_add(HOST_END_DEVICES, "presence", presence_stop);
     if (!running) return;
     const HostPresence *p = GUEST(a0);
     char track[sizeof p->track + 1], room[sizeof p->room + 1];
@@ -1665,9 +1845,22 @@ static int card_next, card_drawn;
 int host_widescreen_card_drawn(void) { return card_drawn; }
 int host_frame_video(double aspect, int flat_limit)
 {
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* iOS: the picture's shape follows the display while the game runs (widescreen.c's live
+       aspect); a package VU1 already holds gets its sprite widths back first. */
+    if (aspect != published_aspect) {
+        void vif1_update_widescreen_sprites(double previous);
+        graphics_wait();
+        vif1_update_widescreen_sprites(published_aspect);
+    }
+#endif
     published_aspect=aspect; published_flat_limit=flat_limit;
     card_drawn=card_next;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    card_next=aspect>0 && flat_limit>0 && gs_native_card();
+#else
     card_next=aspect>0 && gs_native_card();
+#endif
     return card_next;
 }
 

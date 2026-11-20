@@ -88,6 +88,14 @@ fn environment_overrides_and_defaults() {
         assert_eq!(env[name], want, "{name}");
     }
     assert!(!env.contains_key("DHD_ISO") && !env.contains_key("DHD_NET_NAME"));
+    // Native VU is the player's default (finding 198): on with a dhd.ini that has no line for it
+    // (every dhd.ini written before the default changed, unless the player moved the row: a save
+    // writes only its own line), off where the player's line says so, in either spelling.
+    assert_eq!(env["DHD_NATIVE_VU1"], "on");
+    assert_eq!(env_of("native_vu = off\n", &[])["DHD_NATIVE_VU1"], "off");
+    assert_eq!(env_of("DHD_NATIVE_VU1 = 0\n", &[])["DHD_NATIVE_VU1"], "off");
+    assert_eq!(env_of("native_vu =\n", &[])["DHD_NATIVE_VU1"], "on");
+    assert_eq!(dhd_settings::find("native_vu").unwrap().builtin, "off");
     // Without dhd.ini (the tools): nothing but the official server and the override list.
     let env: BTreeMap<_, _> = environment(None, |_| false).vars.into_iter().collect();
     assert_eq!(env.len(), 2);
@@ -107,6 +115,34 @@ fn environment_overrides_and_defaults() {
     let var = |n: &str| (n == "DHD_UPDATE_URL").then(|| "https://b.example/latest.json".to_string());
     assert_eq!(ini.effective("update_url", var), "https://b.example/latest.json");
     assert_eq!(ini.effective("scale", var), "3");
+}
+
+// Touch steering (finding 214): Stick, Tilt and the four-button D-pad are one setting. A dhd.ini
+// written before the D-pad has no line for it and keeps the stick; the D-pad is the value `dpad`,
+// in either spelling of the key, and a save writes only its own line.
+#[test]
+fn touch_steering_choices() {
+    let steer = dhd_settings::find("touch_steer").unwrap();
+    let values: Vec<_> = steer.choices.iter().map(|c| (c.value, c.label)).collect();
+    assert_eq!(values, [("stick", "Stick"), ("tilt", "Tilt"), ("dpad", "D-pad")]);
+    assert_eq!((steer.default, steer.builtin), ("stick", "stick"));
+    assert_eq!(steer.label("dpad"), Some("D-pad"));
+    // an older dhd.ini (touch lines, none for the steering), an empty line, none at all
+    let older = "touch_preset = thumb\ntouch_hand = left\nscale = 3\n";
+    assert_eq!(env_of(older, &[])["DHD_TOUCH_STEER"], "stick");
+    assert_eq!(env_of("touch_steer =\n", &[])["DHD_TOUCH_STEER"], "stick");
+    assert_eq!(Ini::parse(older.as_bytes()).value("touch_steer"), "stick");
+    // the new value, by key and by variable name; the environment wins
+    assert_eq!(env_of("touch_steer = dpad\n", &[])["DHD_TOUCH_STEER"], "dpad");
+    assert_eq!(env_of("DHD_TOUCH_STEER = dpad\n", &[])["DHD_TOUCH_STEER"], "dpad");
+    assert_eq!(Ini::parse(b"Touch_Steer = tilt\n").value("touch_steer"), "tilt");
+    assert!(!env_of("touch_steer = dpad\n", &["DHD_TOUCH_STEER"]).contains_key("DHD_TOUCH_STEER"));
+    // saving the choice rewrites its own line and keeps every other byte; an older file gets one line
+    assert_eq!(saved(b"touch_steer = tilt\nscale = 3\n", "touch_steer", "dpad"), b"touch_steer = dpad\nscale = 3\n");
+    let after = saved(older.as_bytes(), "touch_steer", "dpad");
+    assert!(after.starts_with(older.as_bytes()), "{}", String::from_utf8_lossy(&after));
+    assert_eq!(Ini::parse(&after).value("touch_steer"), "dpad");
+    assert!(Ini::parse(&after).unknown_keys().is_empty());
 }
 
 #[test]
@@ -181,7 +217,7 @@ fn files() {
     assert!(dhd_settings::read(&p).is_none());
     assert!(dhd_settings::save(&p, "scale", "3").unwrap());
     assert_eq!(fs::read_to_string(&p).unwrap(), format!("{}scale = 3\n", dhd_settings::HEADER));
-    assert!(!dir.join("dhd.ini.new").exists());
+    assert!(leftovers(&dir).is_empty());
     dhd_settings::create(&p).unwrap();
     assert_eq!(dhd_settings::read(&p).unwrap().value("scale"), "3");
     let fresh = dir.join("fresh.ini");
@@ -192,6 +228,113 @@ fn files() {
         assert!(dhd_settings::read(std::path::Path::new(off)).is_none());
         assert!(!dhd_settings::save(std::path::Path::new(off), "scale", "3").unwrap());
     }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// Temporary files a save left behind in dir (`<file>.<process>-<n>.new`).
+fn leftovers(dir: &std::path::Path) -> Vec<String> {
+    fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| n.ends_with(".new")).collect()
+}
+
+/// Many threads save different keys into one file at once (finding 228: the Android launcher's
+/// worker threads, the desktop launcher's commands). The file exists before anything starts; the
+/// reader and the writers start together (a barrier), so the writers overlap and the reader reads
+/// all through. Every read during the run must succeed and be a whole file: the header first, every
+/// line `key = value` of a key some save wrote (or the first one) with exactly the value that save
+/// wrote, each key once, and never a key fewer than the read before. On Windows a read that meets
+/// the replace itself (another handle in the way: access denied, a sharing or lock violation) is
+/// tried again for up to 200 ms and fails only if it lasts; any other read error fails at once.
+/// At the end every key is there with its value, and no temporary file is left.
+#[test]
+fn saves_at_once() {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Barrier};
+    let dir = std::env::temp_dir().join(format!("dhd-settings-threads-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let p = Arc::new(dir.join("dhd.ini"));
+    assert!(dhd_settings::save(&p, "first", "1").unwrap());
+    const THREADS: usize = 12;
+    const KEYS: usize = 25;
+    let expected = |key: &str| -> Option<String> {
+        if key == "first" {
+            return Some("1".into());
+        }
+        let (t, k) = key.strip_prefix('t')?.split_once("_k")?;
+        let (t, k): (usize, usize) = (t.parse().ok()?, k.parse().ok()?);
+        (t < THREADS && k < KEYS).then(|| format!("{t}.{k}"))
+    };
+    let read_during_run = |p: &std::path::Path| -> String {
+        for _ in 0..100 {
+            match fs::read(p) {
+                Ok(bytes) => return String::from_utf8(bytes).expect("dhd.ini is text"),
+                Err(e) if cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(2))
+                }
+                Err(e) => panic!("dhd.ini unreadable during the run: {e}"),
+            }
+        }
+        panic!("dhd.ini stayed unreadable for 200 ms during the run");
+    };
+    let start = Arc::new(Barrier::new(THREADS + 1));
+    let done = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let (p, start, done) = (p.clone(), start.clone(), done.clone());
+        std::thread::spawn(move || {
+            start.wait();
+            let mut reads = 0;
+            let mut seen: BTreeMap<String, String> = BTreeMap::new();
+            loop {
+                let last = done.load(Ordering::Acquire);
+                let text = read_during_run(&p);
+                assert!(text.starts_with(dhd_settings::HEADER), "a part of a file: {text:?}");
+                let body = &text[dhd_settings::HEADER.len()..];
+                assert!(body.is_empty() || body.ends_with('\n'), "a cut line: {body:?}");
+                let mut now = BTreeMap::new();
+                for line in body.lines() {
+                    let (key, value) = line.split_once(" = ").unwrap_or_else(|| panic!("a broken line {line:?}"));
+                    assert_eq!(expected(key).as_deref(), Some(value), "a key or value no save wrote: {line:?}");
+                    assert!(now.insert(key.to_string(), value.to_string()).is_none(), "{key} twice");
+                }
+                for key in seen.keys() {
+                    assert!(now.contains_key(key), "{key} was there and is gone: a change was lost");
+                }
+                seen = now;
+                reads += 1;
+                if last {
+                    return (reads, seen);
+                }
+            }
+        })
+    };
+    let writers: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let (p, start) = (p.clone(), start.clone());
+            std::thread::spawn(move || {
+                start.wait();
+                for k in 0..KEYS {
+                    assert!(dhd_settings::save(&p, &format!("t{t}_k{k}"), &format!("{t}.{k}")).unwrap());
+                }
+            })
+        })
+        .collect();
+    let mut failures = 0;
+    for w in writers {
+        failures += w.join().is_err() as usize;
+    }
+    done.store(true, Ordering::Release);
+    let (reads, last_read) = reader.join().expect("the reader saw only whole files");
+    assert_eq!(failures, 0, "{failures} of {THREADS} writers failed");
+    assert!(reads > 1, "the reader read during the run");
+    assert_eq!(last_read.len(), THREADS * KEYS + 1, "the last read has every key");
+    let ini = dhd_settings::read(&p).unwrap();
+    for t in 0..THREADS {
+        for k in 0..KEYS {
+            assert_eq!(ini.written(&format!("t{t}_k{k}")).as_deref(), Some(format!("{t}.{k}").as_str()));
+        }
+    }
+    assert!(leftovers(&dir).is_empty(), "{:?}", leftovers(&dir));
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -229,5 +372,42 @@ fn c_interface() {
     assert_eq!(set["DHD_ENV_OVERRIDES"], ",DHD_FPS,");
     assert_eq!(set["DHD_SCALE"], "2");
     assert_eq!(fs::read_to_string(&p).unwrap(), "fps = 120\ngame_options = 1 800\nscale = 5\n");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn install_id() {
+    use dhd_settings::install;
+    let a = install::fresh();
+    let b = install::fresh();
+    assert!(install::valid(&a) && install::valid(&b), "{a} {b}");
+    assert_ne!(a, b);
+    assert!(!install::valid("0123456789ABCDEF0123456789abcdef") && !install::valid("abc"));
+    let dir = std::env::temp_dir().join(format!("dhd-settings-install-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("dhd.ini");
+    // no file: an id for this run, and no dhd.ini made for it
+    let (once, kept) = install::get(&p);
+    assert!(install::valid(&once) && !kept && !p.exists());
+    // a file: made once, kept after
+    fs::write(&p, "fps = 120\ninstall_id = not-an-id\n").unwrap();
+    let (id, kept) = install::get(&p);
+    assert!(install::valid(&id) && kept);
+    assert_eq!(fs::read_to_string(&p).unwrap(), format!("fps = 120\ninstall_id = {id}\n"));
+    assert_eq!(install::get(&p), (id.clone(), true));
+    // not a setting: no variable, not an unknown line, not in the launcher's table
+    let ini = dhd_settings::Ini::parse(&fs::read(&p).unwrap());
+    assert!(ini.unknown_keys().is_empty());
+    let env = dhd_settings::environment(Some(&ini), |_| false);
+    assert!(env.vars.iter().all(|(_, v)| v != &id));
+    assert!(dhd_settings::find("install_id").is_none());
+    // the C interface
+    let path = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+    let mut out = [0 as std::ffi::c_char; 33];
+    unsafe {
+        assert_eq!(dhd_settings::c::dhd_settings_install_id(path.as_ptr(), out.as_mut_ptr(), out.len()), 1);
+        assert_eq!(std::ffi::CStr::from_ptr(out.as_ptr()).to_str().unwrap(), id);
+        assert_eq!(dhd_settings::c::dhd_settings_install_id(path.as_ptr(), out.as_mut_ptr(), 32), 0);
+    }
     fs::remove_dir_all(dir).unwrap();
 }

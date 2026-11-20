@@ -4,7 +4,8 @@
    DHDR_FN declarations of both headers.
 
    SP10 (docs/findings/090-speed.md): an indexed native picture. Finding 109: the device's largest
-   texture. Finding 129: the perf: lines' GPU counters. */
+   texture. Finding 129: the perf: lines' GPU counters. Finding 171: a lost device. Finding 194:
+   whether translated VU1 meshes can be drawn. Finding 256: the pipeline list. */
 #ifndef DHD_RENDER_EXT_H
 #define DHD_RENDER_EXT_H
 
@@ -35,6 +36,45 @@ DHDR_FN(dhdr_device_max_texture) uint32_t dhdr_device_max_texture(void);
    1 immediate, 2 mailbox, 3 fifo, 4 fifo-relaxed), [5] the adapter's kind (0 other, 1 integrated,
    2 discrete, 3 virtual, 4 cpu). Returns how many it wrote. Any thread. */
 DHDR_FN(dhdr_perf_read) uint32_t dhdr_perf_read(uint64_t *out, uint32_t count);
+
+/* Finding 171: 1 when the device was lost (the driver reset or removed it: every later call draws
+   nothing), else 0. The first 1 logs why (on D3D12 the removed reason, and DRED's breadcrumbs with
+   DHD_GPU_DRED=1). C asks after a present failed and then ends the game with a message. Any
+   thread; the browser's device always answers 0 (it has its own lost handling). */
+DHDR_FN(dhdr_device_lost) int dhdr_device_lost(void);
+
+/* Finding 194 (Native VU): 1 while the native renderer can draw translated VU1 meshes, 0 once it
+   can't (a mesh pipeline the driver refused;
+   logged once, and so for the rest of the session). C asks after each picture and sends the
+   batches back to the emulated VU. Any thread; the browser's renderer always answers 0. */
+DHDR_FN(dhdr_native_meshes) int dhdr_native_meshes(void);
+
+/* Finding 256: the file that lists the draw pipelines this device built in earlier runs (a UTF-8
+   path; NULL: none). Before dhdr_native_create, which sends the listed pipelines to a worker thread
+   to build while the game starts, so a draw state's first use in a race no longer stops the
+   render thread for the driver's compile; that thread adds every pipeline that builds. The file
+   is only a cache: without it, or for another GPU or driver, pipelines are built at first use as
+   before. DHD_PIPELINE_LIST=0: no list. The browser's renderer ignores the call. */
+DHDR_FN(dhdr_native_pipeline_list) void dhdr_native_pipeline_list(const char *path);
+
+/* Finding 260: for the game's crash handler (port/hle/host.c crashed). Returns the crash note's
+   path beside the pipeline list (NULL: no list, or the native renderer not made yet) and sets *key
+   to the draw pipeline the calling thread is in the driver's build of (0: none). The handler
+   writes "crash KEY" (16 hex digits) or "crash" there; only a pipeline so named is refused for good
+   at the next start. Atomics only, no lock and no allocation: async-signal-safe. Native only. */
+DHDR_FN(dhdr_native_pipeline_crash) const char *dhdr_native_pipeline_crash(uint64_t *key);
+
+/* Finding 250: a colour surface's pixels for a local-to-host transfer (the native renderer draws
+   only on the GPU; Poster Maker reads its frame back). begin copies GS pixels rect (x, y, w, h,
+   clipped to the texture) of colour surface index and starts mapping it (natively it blocks until
+   mapped; the browser waits in web_gpu_await before finish): 1 started, the clipped size in
+   size[2]; 0 nothing to read. finish writes size[0] * size[1] RGBA8 words, row-major, each the
+   mean of the pixel's scale x scale texels, in the bytes the CT32 import gives a surface (R G B A,
+   the GS alpha as it is): 1 ok, 0 the map failed (logged). Native render thread rules (under
+   context_lock); nothing else between begin and finish. */
+DHDR_FN(dhdr_native_surface_read_begin) int dhdr_native_surface_read_begin(DhdrNative *n, uint32_t index,
+                                                                           const uint32_t rect[4], uint32_t size[2]);
+DHDR_FN(dhdr_native_surface_read_finish) int dhdr_native_surface_read_finish(DhdrNative *n, uint32_t *pixels);
 
 #ifdef __cplusplus
 }

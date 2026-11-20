@@ -14,10 +14,49 @@ extern int D_0029E3E0,D_0029E3E8;
 extern float D_0029E3FC, D_0029E400;
 extern int func_00243CE8(int);
 static int requested;
+static int display_auto;
 static double phase, anim_phase;
 static double step_fields, previous_wall, owed;
 static int wall_mode, delta = -1;
+/* DHD_STEP_PATTERN=f1,f2,... (test switch, finding 255): a deterministic run whose updates step
+   these fields in turn (each between a step at the selected rate and two fields), so uneven
+   frames and steps of more than one field repeat exactly. Unset: nothing changes. */
+#define PATTERN_MOST 64
+static double pattern[PATTERN_MOST];
+static int pattern_n = -1, pattern_at;
+static int step_pattern(void)
+{
+    if (pattern_n < 0) {
+        const char *s = host_getenv("DHD_STEP_PATTERN");
+        pattern_n = 0;
+        while (s && *s && pattern_n < PATTERN_MOST) {
+            char *end;
+            double v = strtod(s, &end);
+            if (end == s) break;
+            pattern[pattern_n++] = v;
+            s = *end == ',' ? end + 1 : end;
+        }
+    }
+    return pattern_n;
+}
+/* This update's step is its own (the wall clock's or the pattern's), not 60/N. */
+static int own_step(void) { return wall_mode || step_pattern() > 0; }
 static unsigned clock_serial;
+static int race_loop;   /* the race's loop ran since the front end's last frame (fps.h, finding 159) */
+
+void port_loop_frame(int race)
+{
+    if (race != race_loop) hle_log(race ? "game: a race's loop runs\n" : "game: the front end runs\n");
+    race_loop = race;
+}
+
+int port_in_race(void) { return race_loop && *(int *)GUEST(0x084B26AC) != PORT_MODE_ATTRACT; }
+int port_attract_demo(void) { return race_loop && *(int *)GUEST(0x084B26AC) == PORT_MODE_ATTRACT; }
+int port_race_running(int first_phase)
+{
+    return port_race_rule(race_loop, *(int *)GUEST(0x084B26AC), *(int *)GUEST(0x0843F348), first_phase);
+}
+
 /* Online, from the countdown to the finish (race screen, race phase 1-4). */
 static int online_race(void)
 {
@@ -38,6 +77,9 @@ static double vblank_wall, vblank_debt;
 void port_clock_wall(int enabled) { wall_mode=enabled; delta=-1; port_clock_rebase(); }
 /* A wait that is no game time (a lobby, an online start): the next step starts from now. */
 void port_clock_rebase(void) { previous_wall=0; owed=0; vblank_wall=0; vblank_debt=0; }
+/* A phone's app came back from the background (the host's came-back flag, read by kernel.c after the
+   present that waited, finding 227): the time away is no game time, offline and online. */
+int port_clock_after_away(int came_back) { if (came_back) port_clock_rebase(); return came_back; }
 /* The delta-time clock's code paths (finding 067's fractional steps) are on: paced play at any
    rate, any rate but 60, or DHD_STEP_CLOCK=1 (a deterministic run of those paths at 60, for the
    rate drift check). Only a deterministic run at 60 keeps the original arithmetic, exactly. */
@@ -45,7 +87,7 @@ int port_delta_clock(void)
 {
     if (delta < 0) {
         const char *s = host_getenv("DHD_STEP_CLOCK");
-        delta = wall_mode || port_fps() != 60 || (s && atoi(s) == 1);
+        delta = wall_mode || port_fps() != 60 || (s && atoi(s) == 1) || step_pattern() > 0;
     }
     return delta;
 }
@@ -69,6 +111,10 @@ static void clock_spend(double step, double keep)
 static double clock_interval(void)
 {
     const double least=60.0/port_fps();
+    if (!wall_mode && step_pattern() > 0) {
+        double step = pattern[pattern_at++ % pattern_n];
+        return step < least ? least : step > MOST_FIELDS ? MOST_FIELDS : step;
+    }
     if (!wall_mode) return least;
     double now=host_wall_seconds();
     if (!previous_wall) {
@@ -131,7 +177,21 @@ static int whole;
 static uint64_t race_steps;  /* real race updates, for DHD_FPS_TRACE */
 
 static void reset_body_clocks(void);
-void port_fps_race_step(void) { race_steps++; }
+/* Every race update (0011A100). DHD_TEST_FINISH=S (test switch, port/tools/rate_sweep.py's
+   results scene, finding 255): offline, the player's rider finishes at race second S, through the
+   flag online.c's DHD_NET_TEST_FINISH sets (FINISH_NOW, 0x43EF22; FINISHED is 0x43EF18). */
+void port_fps_race_step(void)
+{
+    static double finish_at = -1;
+    race_steps++;
+    if (finish_at < 0) {
+        const char *s = host_getenv("DHD_TEST_FINISH");
+        finish_at = s && *s ? atof(s) : 0;
+    }
+    if (finish_at > 0 && port_race_running(2) && *(int *)GUEST(0x0843EEC8) > finish_at * 60 &&
+        !*(uint8_t *)GUEST(0x0843EF18) && !*(uint8_t *)GUEST(0x0843EF22))
+        *(uint8_t *)GUEST(0x0843EF22) = 1;
+}
 
 /* The field grid of an offline race (finding 142; port/hle/replay.c says why). The race asks for
    it every update (port_clock_grid), and the next step follows it:
@@ -150,6 +210,7 @@ static int grid_code=CODE_FIELD, grid_phase, grid_phase_before, grid_anim, grid_
 
 void port_clock_grid(int mode) { grid_asked=mode; grid_seen=1; }
 int port_clock_recording(void) { return grid==GRID_RECORD; }
+int port_clock_playing(void) { return grid==GRID_PLAY; }
 int port_clock_code(void) { return grid_code; }
 
 /* A step in fields as a code: the nearest 1/120 field, no shorter than a step at the selected
@@ -234,8 +295,9 @@ int port_fps(void)
 {
     if (!requested) {
         const char *s = host_getenv("DHD_FPS");
+        display_auto = host_getenv("DHD_IOS_DISPLAY_AUTO") != NULL;
         requested = s ? atoi(s) : 60;
-        if (s && !dhd_stricmp(s, "monitor")) {
+        if (display_auto || (s && !dhd_stricmp(s, "monitor"))) {
             requested = host_display_hz();
             if (!requested) requested = 60;
         }
@@ -245,6 +307,24 @@ int port_fps(void)
     }
     return requested;
 }
+/* At a VBLANK boundary, carry fractional fields and animation ticks into the new rate. */
+int port_fps_update_display(void)
+{
+    int previous = port_fps();
+    if (!display_auto) return 0;
+    int rate = host_display_hz();
+    if (rate != 60 && rate != 120) return 0;
+    if (rate > port_fps_max()) rate = port_fps_max();
+    if (rate == previous) return 0;
+    double ratio = (double)rate / previous;
+    phase *= ratio;
+    anim_phase *= ratio;
+    requested = rate;
+    delta = -1;
+    hle_log("fps: display target changed to %d steps/s\n", requested);
+    return 1;
+}
+
 /* The time a picture is held: one at the selected rate (59.94 Hz at 60), a field on the grid
    before GO, a recorded step in a replay. */
 double port_frame_period(void)
@@ -264,11 +344,21 @@ int port_count_down(int value) { int w = port_whole_step(); return value > 0 && 
    update with no whole field must not count it again.) */
 int port_count_reached(int value, int mark) { return value >= mark && value - port_whole_step() < mark; }
 float port_decay(float f) { return port_delta_clock() ? powf(f, port_step()) : f; }
-float port_blend(float r) { return port_delta_clock() && r > 0 && r < 1 ? (float)(1.0-pow(1.0-(double)r,(wall_mode || grid ? step_fields : 60.0/port_fps()))) : r; }
+static double blend_exponent(void) { return own_step() || grid ? step_fields : 60.0/port_fps(); }
+float port_blend(float r) { return port_delta_clock() && r > 0 && r < 1 ? (float)(1.0-pow(1.0-(double)r,blend_exponent())) : r; }
+/* The blend helpers func_00235EA8/func_00235F38 take a rate and a least step per field and apply
+   this update's part (patches_fps.py). A caller that runs once per event (a footfall), not once per
+   update, passes these instead: the helper then moves by retail's rate and least step per call
+   (finding 193). */
+float port_event_rate(float r) { return port_delta_clock() && r > 0 && r < 1 ? (float)(1.0-pow(1.0-(double)r,1.0/blend_exponent())) : r; }
+float port_event_least(float m) { return port_delta_clock() ? m/port_step() : m; }
+/* A turn limited to an angle a field, given as a unit quaternion's w at the limit (the cosine of
+   half that angle): the limit for this update's part of the field (finding 193). */
+float port_turn_limit(float w) { return port_delta_clock() && w > -1 && w < 1 ? (float)cos(acos((double)w)*port_step()) : w; }
 float port_particle_sum(float q) {
     /* Evaluate the geometric sum in double: float cancellation near q=1
        otherwise makes gently damped particles move systematically too far. */
-    return q == 1.0f ? port_step() : (float)((double)q*(1.0-pow((double)q,(wall_mode || grid ? step_fields : 60.0/port_fps())))/(1.0-q));
+    return q == 1.0f ? port_step() : (float)((double)q*(1.0-pow((double)q,(own_step() || grid ? step_fields : 60.0/port_fps())))/(1.0-q));
 }
 void port_particle_rotation(float *c,float *s)
 {
@@ -325,7 +415,7 @@ void port_clock_wait(int *out)
         grid_wait();
     } else {
         step_fields=clock_interval();
-        phase += wall_mode ? step_fields*port_fps() : 60;
+        phase += own_step() ? step_fields*port_fps() : 60;
         whole = (int)(phase / port_fps());
         phase -= whole*port_fps();
     }
@@ -334,7 +424,7 @@ void port_clock_wait(int *out)
 void port_clock_step(void)
 {
     D_0029E3D0 = whole;
-    int stepped = wall_mode || grid;  /* the step is this update's own, not 60/N */
+    int stepped = own_step() || grid;  /* the step is this update's own, not 60/N */
     /* The integer rate is rounded: truncated, the 1.001-field steps of paced 60 made it 59. Its
        readers that take a time step read the exact one (port_step_seconds, port_step_rate). */
     D_0029E3D4 = stepped ? (int)lround(60.0/step_fields) : port_fps();
@@ -366,7 +456,7 @@ int port_animation_step(void)
         grid_anim -= ticks*CODE_FIELD;
         return ticks;
     }
-    anim_phase += wall_mode ? step_fields*1024*port_fps() : 60 * 1024;
+    anim_phase += own_step() ? step_fields*1024*port_fps() : 60 * 1024;
     int ticks = (int)(anim_phase / port_fps());
     anim_phase -= ticks*port_fps();
     return ticks;
@@ -426,7 +516,7 @@ void port_fps_contact_recovery(void *body)
     if (!port_delta_clock()) return;
     unsigned char *b=body,*r=*(unsigned char **)(b+0x158);
     Air *a=air_for(body);
-    int slot=*(int *)(r+0x797C),race_phase=*(int *)GUEST(0x0843F348);
+    int slot=*(int *)(r+0x797C);
     float *p=(float *)(b+0x50);
     int contact=b[0x354]!=2 || b[0x3D4]!=2;
     int supported=contact || (a->stalled_steps && port_air_age(body,*(short *)(b+0x4A4))<4);
@@ -434,7 +524,8 @@ void port_fps_contact_recovery(void *body)
     extern float func_0012DF48(void *);
     /* AI already has the retail grounded recovery states (001100D0/103B0).
        Preserve their own field timers; this fills the human controller gap. */
-    if (*(int *)(r+0x7A5C)!=1 || slot<0 || slot>=10 || *(int *)GUEST(0x0829DED8)!=9 || race_phase<2 || race_phase>4 ||
+    /* in a race from GO, also one started from CONTINUE SAVED GAME (screen 22, finding 159) */
+    if (*(int *)(r+0x7A5C)!=1 || slot<0 || slot>=10 || !port_race_running(2) ||
         *(unsigned char *)GUEST(0x0843EF18+slot) || (r[0x4098]&4) ||
         !supported || !pedal || func_0012DF48(r)>0) {
         a->stalled_steps=0;
@@ -447,6 +538,7 @@ void port_fps_contact_recovery(void *body)
     a->stalled_steps+=port_step();
     if (a->stalled_steps<120-0.00001) return;
     a->stalled_steps=0;
+    hle_log("fps: rider %d stuck on the ground while pedalling for 2 s: the collision recovery\n", slot);
     extern void func_00155E78(void *,int);
     func_00155E78(r+0x3FD0,2);
 }
@@ -479,6 +571,10 @@ double port_field_seconds(int counter)
 }
 /* Game time still owed to wall time (an online race catching up), in seconds. */
 double port_fps_behind(void) { return wall_mode && owed>0 ? owed/60.0 : 0; }
+/* The wall moment (host_wall_seconds) the game clock has counted up to: stepped or owed. Paced, the
+   last step's; a frame's own time is counted at the next step, so a long frame is not yet time the
+   clock missed (finding 220). Unpaced (or before the first step), now. */
+double port_clock_wall_seconds(void) { return wall_mode && previous_wall ? previous_wall : host_wall_seconds(); }
 
 /* prev comes from the preceding real animation/simulation step, including at
    crash entry (001B1C20). Its displacement already has the selected step's
@@ -534,8 +630,7 @@ void port_clock_observe(void)
         const char *s = host_getenv("DHD_PERF_LOG");
         on = !s || strcmp(s, "0") != 0;
     }
-    int race_phase = *(int *)GUEST(0x0843F348);
-    if (!on || *(int *)GUEST(0x0829DED8) != 9 || race_phase < 2 || race_phase > 4) {
+    if (!on || !port_race_running(2)) {
         last_wall = 0;
         return;
     }
@@ -596,10 +691,9 @@ void port_fps_observe(void)
     static int raced, still;
     if (!out) return;
     int tick=*(int *)GUEST(0x0843EEC8);
-    /* The race is over (rate_drift.py: the finish times are in) when its screen or phase ends, or
-       when its clock stops (every rider in, the results wait) for 3600 updates (15 s at 240). */
-    if ((raced && (tick==last ? ++still : (still=0))>3600) ||
-        *(int *)GUEST(0x0829DED8)!=9 || *(int *)GUEST(0x0843F348)<2 || *(int *)GUEST(0x0843F348)>4) {
+    /* The race is over (rate_drift.py: the finish times are in) when it ends (port_race_running),
+       or when its clock stops (every rider in, the results wait) for 3600 updates (15 s at 240). */
+    if ((raced && (tick==last ? ++still : (still=0))>3600) || !port_race_running(2)) {
         if (raced) {
             fclose(out);
             fclose(steps_out);

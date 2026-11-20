@@ -836,8 +836,27 @@ static void slow_frame(void)
     last = host_wall_seconds();
 }
 
+/* A field that came long after the one before it, in dhd.log (finding 211: a phone's 2.9 s freeze
+   going from an online race to its room showed only as a perf: line's max=, not where it was):
+   "stall: field N came T ms after the last (menu M phase P)". The game's own loads are such
+   gaps too; the lines around it say which. At most 40 a run; host-side logging only. */
+static void stall_log(void)
+{
+    static double last;
+    static int lines;
+    double now = host_wall_seconds();
+    if (last > 0 && now - last > 0.4 && lines < 40) {
+        lines++;
+        hle_log("stall: field %llu came %.0f ms after the last (menu %d phase %d)\n", (unsigned long long)kernel_vsync_count + 1,
+                (now - last) * 1000, (int)*(volatile int32_t *)(uintptr_t)(0x08000000u + 0x29DED8),
+                (int)*(volatile int32_t *)(uintptr_t)(0x08000000u + 0x43F348));  /* the shell's menu word, the race phase */
+    }
+    last = now;
+}
+
 static void vsync(void)
 {
+    stall_log();
     slow_frame();
     port_clock_observe();
     int fresh = paced && jit_on();
@@ -847,6 +866,7 @@ static void vsync(void)
     /* host_pacing_wait logs this field, as jit_wait did */
     host_pacing_config(port_frame_period(),kernel_vsync_count);
     host_frame_context(kernel_vsync_count,host_seconds());
+    port_scenery_observe();  /* DHD_SCENERY_TRACE, before DHD_FPS_STOP can end the run */
     port_fps_observe();  /* DHD_FPS_TRACE */
     if (vsync_deferred && csr_exact && !vsync_flag_addr)
         host_service_graphics_vblank();  /* the CSR page turns provisional */
@@ -883,7 +903,7 @@ static void vsync(void)
     if (!graphics_ordered) host_service_graphics_wait();
 #if defined(__wasm__)
     extern int host_widescreen_flat_limit(void);
-    widescreen_card_mode(host_frame_video(host_widescreen_aspect(),host_widescreen_flat_limit()));
+    widescreen_card_mode(host_frame_video(host_widescreen_frame_aspect(),host_widescreen_flat_limit()));
     static HleEnv screenshot_env;
     const char *capture_prefix=hle_env(&screenshot_env,"DHD_SCREENSHOT");
     if (capture_prefix && host_getenv("DHD_RACE_SYNC")) {
@@ -894,12 +914,17 @@ static void vsync(void)
     }
 #endif
     host_service_gs_vsync();  /* latch the display buffer selected by the VBLANK handler */
+    /* A phone's app came back from the background during that present (port/gs/present.c's
+       app_away_wait, finding 227): the time away is no game time; the next step starts from now,
+       online too (nothing fast-forwards it), and the frames' grid starts again. */
+    if (port_clock_after_away(host_service_host_came_back())) pace_grid.base = 0;
     intc_raise(INTC_VBLANK_END);
     run_handlers(intc_handlers, intc_enabled, INTC_VBLANK_END);
     if (fresh) {
         host_pacing_wait();
         pad_refresh();  /* the game reads the pad after this VBLANK: the state at the end of the wait */
     }
+    disc_check_field(kernel_vsync_count);  /* host-side work only: no game state */
     state_trace_field(kernel_vsync_count, next_vsync);  /* DHD_STATE_TRACE: the end of the field */
 }
 
@@ -919,6 +944,7 @@ static int deliver(void)
         load_registers(&rpc_saved);
     }
     if (now >= next_vsync) {
+        port_fps_update_display();  /* pace_grid re-anchors on period changes */
         uint64_t cycles = port_fps() == 60 ? VSYNC_CYCLES : (uint64_t)(BUS_HZ / port_fps());
         next_vsync += cycles;
         if (next_vsync < now)  /* fell far behind (a debugger stop): don't replay the frames */

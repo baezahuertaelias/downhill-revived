@@ -15,7 +15,7 @@ const char *gs_gpu_backend_name(const Gs *g);
    handles (WIN32: a = HWND, b = HINSTANCE; XLIB: a = Display *, b = Window; WAYLAND: a = wl_display *,
    b = wl_surface *; ANDROID: a = ANativeWindow *; METAL_LAYER: a = CAMetalLayer *), and the
    function that tells its drawable size in pixels (0 x 0 while minimised; any thread). */
-enum { GS_WINDOW_WIN32 = 1, GS_WINDOW_XLIB = 3, GS_WINDOW_WAYLAND = 4, GS_WINDOW_ANDROID = 5, GS_WINDOW_METAL_LAYER = 6 };
+enum { GS_WINDOW_WIN32 = 1, GS_WINDOW_XLIB = 3, GS_WINDOW_WAYLAND = 4, GS_WINDOW_ANDROID = 5, GS_WINDOW_METAL_LAYER = 6, GS_WINDOW_NX = 7 };
 typedef struct GsWindow {
     unsigned kind;
     uint64_t a, b;
@@ -29,8 +29,22 @@ int gs_gpu_surface(Gs *g, const GsWindow *window);
 int gs_gpu_surface_reset(Gs *g, const GsWindow *window);
 /* present.c's SDL window: its drawable size in pixels (the GsWindow size it gives the renderer). */
 void gs_window_pixels(unsigned *width, unsigned *height);
+/* A phone's app away (native_core.inc, render_gate.h, finding 227): gs_render_leave starts an
+   absence (the platform's callback: no new GPU work from the render thread); gs_render_generation
+   the game's wait (holds too, returns the absence it waits through); gs_render_current the newest;
+   gs_render_release lets go only for the newest absence (1 released); gs_render_quiet: no GPU work
+   under way. gs_app_back (present.c): the app is back. */
+unsigned gs_render_leave(void);
+unsigned gs_render_generation(void);
+unsigned gs_render_current(void);
+int gs_render_release(unsigned generation);
+int gs_render_quiet(void);
+void gs_app_back(void);
 int gs_gpu_present(Gs *g, const uint32_t *pixels, unsigned width, unsigned height,
                    unsigned window_width, unsigned window_height);
+/* 1 once a present failed on a lost device (the driver reset or removed the GPU; finding 171): no
+   picture can be shown any more. Any thread. */
+int gs_gpu_lost(void);
 /* Counts describe submissions, not completed GPU work (the exact front end's, gpu_exact.inc). */
 enum {
     GS_GPU_HW_DISABLED, GS_GPU_HW_UNAVAILABLE, GS_GPU_HW_FORMAT, GS_GPU_HW_ALIAS,
@@ -52,7 +66,7 @@ void gs_native_vsync(Gs *g, unsigned *width, unsigned *height, int resize);
    a card, host_widescreen_card_drawn) taken at the game's vsync, for a picture the GS worker hands
    on later (present.c, deferred vsync). */
 void gs_native_vsync_handed(Gs *g, unsigned *width, unsigned *height, int resize, double due, double began,
-                            int flat_limit, int card_2d);
+                            int flat_limit, int card_2d, double output_aspect);
 void gs_native_bench(Gs *g, int end);  /* DHD_BENCH window start (0) and end (1) */
 void gs_native_lock(Gs *g, int lock);  /* the render thread's lock (EE thread) */
 void gs_native_present_options(Gs *g);  /* DHD_PRESENT_FILTER and DHD_ASPECT read again */

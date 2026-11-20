@@ -22,6 +22,7 @@ use crate::native::Native;
 /// the scope is popped at once (wgpu-core reports synchronously); in the browser a scope could
 /// only be awaited, which a C call can't, so errors go to the uncaptured-error handler (fatal).
 pub(crate) fn scoped<R>(gpu: &Gpu, what: &str, f: impl FnOnce() -> R) -> Result<R, String> {
+    let _startup = crate::startup::step(what);
     #[cfg(feature = "native")]
     {
         let scope = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
@@ -36,6 +37,98 @@ pub(crate) fn scoped<R>(gpu: &Gpu, what: &str, f: impl FnOnce() -> R) -> Result<
         let _ = (gpu, what);
         Ok(f())
     }
+}
+
+/// As `scoped`, for building one draw pipeline: a Validation and an Internal error scope. A
+/// pipeline the driver does not create is an internal error (the vendored wgpu-hal's
+/// `map_pipeline_creation_err`; PowerVR Rogue reports a shader its compilers refuse as out of
+/// memory, finding 176): Err, so that draw is not drawn and the game goes on.
+pub(crate) fn scoped_pipeline<R>(gpu: &Gpu, what: &str, f: impl FnOnce() -> R) -> Result<R, String> {
+    let _startup = crate::startup::step(what);
+    #[cfg(feature = "native")]
+    {
+        let validation = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = gpu.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let r = f();
+        let i = pollster::block_on(internal.pop());
+        let v = pollster::block_on(validation.pop());
+        match v.or(i) {
+            Some(e) => Err(format!("{what}: {e}")),
+            None => Ok(r),
+        }
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        let _ = (gpu, what);
+        Ok(f())
+    }
+}
+
+/// Native VU (finding 194): set when this device can't draw the translated VU1 meshes (a mesh
+/// draw pipeline it refused). C asks
+/// `dhdr_native_meshes` after each picture and from then on the VU runs every program; a mesh draw
+/// already recorded is skipped (`render.rs`). Once set it stays set for the session.
+static MESHES_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Marks the meshes refused, with one log line saying why (None: no line).
+pub(crate) fn refuse_meshes(why: Option<&str>) {
+    if !MESHES_REFUSED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        if let Some(why) = why {
+            crate::host::log(&format!("gs native: Native VU can't run on this GPU ({why}); the VU runs every program"));
+        }
+    }
+}
+
+pub(crate) fn meshes_refused() -> bool {
+    MESHES_REFUSED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// DHD_TEST_NO_MESHES as the browser's page gave it (`dhdr_web_test_no_meshes`; u64::MAX: unset):
+/// the browser's Rust has no environment of its own.
+#[cfg(target_arch = "wasm32")]
+static TEST_NO_MESHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// The browser's DHD_TEST_NO_MESHES (web/init.rs `dhdr_web_test_no_meshes`, before `dhdr_web_init`).
+#[cfg(target_arch = "wasm32")]
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+pub(crate) fn set_test_no_meshes(at: u32) {
+    TEST_NO_MESHES.store(at as u64, std::sync::atomic::Ordering::Release);
+}
+
+/// DHD_TEST_NO_MESHES (tests, finding 194): natively the environment's, in the browser the page's.
+fn test_no_meshes() -> Option<u64> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        static AT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+        *AT.get_or_init(|| std::env::var("DHD_TEST_NO_MESHES").ok().and_then(|v| v.trim().parse().ok()))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let at = TEST_NO_MESHES.load(std::sync::atomic::Ordering::Acquire);
+        (at != u64::MAX).then_some(at)
+    }
+}
+
+/// DHD_TEST_NO_MESHES=N (tests, finding 194): the meshes are refused at the native renderer's N-th
+/// picture (0: at its create), as a driver refusing a mesh pipeline would; the game must go on with
+/// the VU running every program. Called at each picture (`render.rs`).
+pub(crate) fn test_refusal() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PICTURES: AtomicU64 = AtomicU64::new(0);
+    let Some(at) = test_no_meshes() else {
+        return;
+    };
+    if PICTURES.fetch_add(1, Ordering::Relaxed) + 1 >= at {
+        refuse_meshes(Some("DHD_TEST_NO_MESHES"));
+    }
+}
+
+/// `dhdr_native_meshes` (`dhd_render_ext.h`): 1 while the native renderer can draw translated VU1
+/// meshes, 0 once it can't (`refuse_meshes`). Any thread.
+#[no_mangle]
+pub extern "C" fn dhdr_native_meshes() -> i32 {
+    let _g = crate::guard::Guard::enter("dhdr_native_meshes");
+    !meshes_refused() as i32
 }
 
 /// wgpu-native's pipeline compilation options: no override constants, workgroup memory not
@@ -108,6 +201,12 @@ pub struct Objects {
     pub draw_layout: wgpu::PipelineLayout,
     /// (uniform, texels): draws from a decoded texture (`_u` entry points).
     pub texels_draw_layout: wgpu::PipelineLayout,
+    /// Group 0 of the draw pipelines: the draw's constants (arenas.rs `DRAW_BYTES`, its minimum
+    /// size given, so no draw waits for a late size check) at a dynamic offset; and the draw
+    /// pipelines' layouts with it, (draws, texture) and (draws, texels).
+    pub draws_layout: wgpu::BindGroupLayout,
+    pub native_draw_layout: wgpu::PipelineLayout,
+    pub native_texels_draw_layout: wgpu::PipelineLayout,
     /// (uniform, blit)
     pub blit_pipeline_layout: wgpu::PipelineLayout,
     /// (uniform, scanout)
@@ -126,6 +225,9 @@ pub struct Objects {
     present_bgra: std::sync::OnceLock<wgpu::RenderPipeline>,
     /// Widescreen's fill beside a 4:3 picture (present.rs): `present_shrink` (draw layout) into
     /// the small RGBA8 texture, and `present_fill` into RGBA8 or BGRA8; made at the first filled picture
+    /// `present_direct` (finding 247) per surface format, each made on its first use.
+    direct_rgba: std::sync::OnceLock<wgpu::RenderPipeline>,
+    direct_bgra: std::sync::OnceLock<wgpu::RenderPipeline>,
     fill_shrink: std::sync::OnceLock<wgpu::RenderPipeline>,
     fill_rgba: std::sync::OnceLock<wgpu::RenderPipeline>,
     fill_bgra: std::sync::OnceLock<wgpu::RenderPipeline>,
@@ -142,6 +244,7 @@ pub struct Objects {
 }
 
 fn module(gpu: &Gpu, source: &str, label: &str) -> wgpu::ShaderModule {
+    let _startup = crate::startup::step(label);
     // The browser compiles WGSL itself (Tint), which wants the shifts in parentheses (below).
     #[cfg(target_arch = "wasm32")]
     let source = &match parenthesize_shifts(source) {
@@ -405,6 +508,7 @@ fn pipeline_layout(gpu: &Gpu, uniform: &wgpu::BindGroupLayout, group1: &wgpu::Bi
 /// written with Always.
 fn fullscreen_pipeline(gpu: &Gpu, module: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, entry: &str,
                        target: Option<wgpu::TextureFormat>) -> wgpu::RenderPipeline {
+    let _startup = crate::startup::step(entry);
     let depth = target.is_none();
     let target = [target.map(|format| wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })];
     gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -436,6 +540,7 @@ fn fullscreen_pipeline(gpu: &Gpu, module: &wgpu::ShaderModule, layout: &wgpu::Pi
 
 fn compute_pipeline(gpu: &Gpu, module: &wgpu::ShaderModule, layout: &wgpu::PipelineLayout, entry: &str)
                     -> wgpu::ComputePipeline {
+    let _startup = crate::startup::step(entry);
     gpu.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(entry),
         layout: Some(layout),
@@ -461,6 +566,13 @@ impl Objects {
             return &self.present_rgba;
         }
         self.present_bgra.get_or_init(|| fullscreen_pipeline(gpu, &self.module, &self.draw_layout, "present_pixel", Some(format)))
+    }
+
+    /// `present_direct` into a target of `format` (as `present_pipe`): the picture sampled from
+    /// its display surface.
+    pub fn direct_pipe(&self, gpu: &Gpu, format: wgpu::TextureFormat) -> &wgpu::RenderPipeline {
+        let pipe = if format == wgpu::TextureFormat::Rgba8Unorm { &self.direct_rgba } else { &self.direct_bgra };
+        pipe.get_or_init(|| fullscreen_pipeline(gpu, &self.module, &self.draw_layout, "present_direct", Some(format)))
     }
 
     /// The fill's pipelines (present.rs): `present_shrink` into the small RGBA8 texture, and
@@ -530,6 +642,22 @@ impl Objects {
 
         let draw_layout = pipeline_layout(gpu, &uniform_layout, &texture_layout);
         let texels_draw_layout = pipeline_layout(gpu, &uniform_layout, &texels_layout);
+        let draws_layout = layout(gpu, &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: S::VERTEX | S::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: true,
+                min_binding_size: wgpu::BufferSize::new(crate::native::arenas::DRAW_BYTES),
+            },
+            count: None,
+        }]);
+        let native_draw_layout = pipeline_layout(gpu, &draws_layout, &texture_layout);
+        let native_texels_draw_layout = pipeline_layout(gpu, &draws_layout, &texels_layout);
+        // DHD_TEST_NO_MESHES=0: Native VU refused from the start (finding 194's test).
+        if test_no_meshes() == Some(0) {
+            refuse_meshes(Some("DHD_TEST_NO_MESHES"));
+        }
         let blit_pipeline_layout = pipeline_layout(gpu, &uniform_layout, &blit_layout);
         let scanout_pipeline_layout = pipeline_layout(gpu, &uniform_layout, &scanout_layout);
         let convert_pipeline_layout = pipeline_layout(gpu, &uniform_layout, &convert_layout);
@@ -570,6 +698,9 @@ impl Objects {
             grow_layout,
             draw_layout,
             texels_draw_layout,
+            draws_layout,
+            native_draw_layout,
+            native_texels_draw_layout,
             blit_pipeline_layout,
             scanout_pipeline_layout,
             convert_pipeline_layout,
@@ -578,6 +709,8 @@ impl Objects {
             upload_pipe,
             present_rgba,
             present_bgra: std::sync::OnceLock::new(),
+            direct_rgba: std::sync::OnceLock::new(),
+            direct_bgra: std::sync::OnceLock::new(),
             fill_shrink: std::sync::OnceLock::new(),
             fill_rgba: std::sync::OnceLock::new(),
             fill_bgra: std::sync::OnceLock::new(),
@@ -607,14 +740,81 @@ fn probe_keys(dual: bool) -> Vec<u32> {
     keys
 }
 
+/// The mesh draws' pipelines the browser's init builds inside an awaited error scope
+/// (`web_prepare`): each probe key's variant as a mesh draw, with a texture and with texels.
+#[cfg_attr(not(feature = "web"), allow(dead_code))]
+fn mesh_probe_keys(dual: bool) -> Vec<u32> {
+    probe_keys(dual).into_iter().flat_map(|k| [k | pipelines::MESH, k | pipelines::MESH | pipelines::TEXELS]).collect()
+}
+
+/// The browser's objects and first pipelines, made by its async init (`web_prepare`) for the
+/// native renderer's create to take.
+#[cfg(feature = "web")]
+static PREPARED: std::sync::Mutex<Option<(Objects, Pipelines)>> = std::sync::Mutex::new(None);
+
+/// The browser's half of the mesh refusal (finding 199). Natively a refused pipeline is seen at
+/// once (`scoped_pipeline` pops its error scopes synchronously), so a mesh pipeline the driver
+/// refuses turns Native VU off where it is built. The browser reports errors only to a promise,
+/// which C's synchronous calls can't await (an error nobody captured is fatal there), so its async
+/// init (`dhdr_web_init`) builds the native renderer's objects and probe pipelines as the create
+/// does, then the mesh draws' pipelines (`mesh_probe_keys`: the mesh vertex stage with every
+/// fragment entry point the browser uses) inside error scopes it awaits:
+/// a refusal there is `refuse_meshes`, before any mesh is drawn, and the VU runs every program, as
+/// on a native GPU that refused. `Native::create` takes these objects and pipelines, so nothing is
+/// built twice.
+#[cfg(feature = "web")]
+pub async fn web_prepare(gpu: &'static Gpu) -> Result<(), String> {
+    let objects = Objects::create(gpu, false)?; // the browser asks for no dual-source blending (web/init.rs)
+    let mut pipelines = Pipelines::new();
+    for key in probe_keys(false) {
+        pipelines.get(gpu, &objects, key as u64)?;
+    }
+    if !meshes_refused() {
+        let validation = gpu.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let internal = gpu.device.push_error_scope(wgpu::ErrorFilter::Internal);
+        let mut meshes = Pipelines::new();
+        let mut built = Ok(());
+        for key in mesh_probe_keys(false) {
+            if let Err(e) = meshes.get(gpu, &objects, key as u64) {
+                built = Err(e);
+                break;
+            }
+        }
+        let i = internal.pop().await;
+        let v = validation.pop().await;
+        match built.and_then(|()| v.or(i).map_or(Ok(()), |e| Err(e.to_string()))) {
+            Ok(()) => pipelines.extend(meshes),
+            Err(e) => refuse_meshes(Some(&format!("a mesh draw pipeline was refused: {e}"))),
+        }
+    }
+    *PREPARED.lock().map_err(|_| "web_prepare: the prepared objects' lock is poisoned")? = Some((objects, pipelines));
+    Ok(())
+}
+
 impl Native {
     /// `dhdr_native_create`: `flags` `DHDR_NATIVE_*`.
     pub fn create(gpu: &'static Gpu, flags: u32) -> Result<Native, String> {
-        let objects = Objects::create(gpu, flags & DHDR_NATIVE_DUAL != 0)?;
-        let mut pipelines = Pipelines::new();
+        let _startup = crate::startup::step("native creation");
+        let dual = flags & DHDR_NATIVE_DUAL != 0;
+        // the browser: what its init made (web_prepare), when made for these flags
+        #[cfg(feature = "web")]
+        let prepared = PREPARED.lock().ok().and_then(|mut p| p.take()).filter(|(o, _)| o.dual == dual);
+        #[cfg(not(feature = "web"))]
+        let prepared: Option<(Objects, Pipelines)> = None;
+        let (objects, mut pipelines) = match prepared {
+            Some(p) => p,
+            None => (Objects::create(gpu, dual)?, Pipelines::new()),
+        };
+        // the pipelines an earlier run died building (finding 260): a mesh one turns Native VU off
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(key) = pipelines::list::recover(&gpu.info).into_iter().find(|&k| k as u32 & pipelines::MESH != 0) {
+            refuse_meshes(Some(&format!("the driver died building mesh pipeline {key:X} in an earlier run")));
+        }
         for key in probe_keys(objects.dual) {
             pipelines.get(gpu, &objects, key as u64)?;
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        pipelines.build_ahead(gpu, &objects);
         let mut n = Native {
             gpu,
             flags,
@@ -627,6 +827,7 @@ impl Native {
             pass: crate::native::render::Pass::new(),
             presenter: crate::native::present::Presenter::new(),
             zread: crate::native::zread::ZRead::new(),
+            surface_read: None,
         };
         n.options(flags); // the present filter, as native_objects' native_present_options
         Ok(n)

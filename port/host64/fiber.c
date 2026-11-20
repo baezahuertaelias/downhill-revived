@@ -8,6 +8,9 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__SWITCH__)
+#include <malloc.h>
+#include <switch.h>
 #else
 #define _GNU_SOURCE
 #include <sys/mman.h>
@@ -48,6 +51,23 @@ static char *stack_map(size_t size) {
     return p;
 }
 static void stack_unmap(char *p,size_t size) { (void)size; VirtualFree(p,0,MEM_RELEASE); }
+#elif defined(__SWITCH__)
+/* Heap memory, its lowest page made inaccessible: Horizon has no demand paging, but 8 MiB per EE
+   thread fits in title takeover's 3 GiB. */
+static size_t os_page(void) { return 0x1000; }
+static char *stack_map(size_t size) {
+    char *p=memalign(0x1000,size);
+    if (p && R_FAILED(svcSetMemoryPermission(p,page,Perm_None))) { free(p); p=NULL; }
+    return p;
+}
+static void stack_unmap(char *p,size_t size) { (void)size; svcSetMemoryPermission(p,page,Perm_Rw); free(p); }
+/* EXIT GAME's way back to the Homebrew Menu (nx_host.c), on the main thread once the game's thread has
+   ended inside a fiber: the loader hands this heap to the next NRO, which can't use a guard page left
+   inaccessible (finding 270). The fibers are not run again. */
+void host64_fiber_guards_release(void) {
+    for (int i=1;i<=SLOTS;i++) if (fibers[i].active) svcSetMemoryPermission(fibers[i].stack,page,Perm_Rw);
+    memset(fibers,0,sizeof fibers);
+}
 #else
 static size_t os_page(void) { return (size_t)sysconf(_SC_PAGESIZE); }
 static char *stack_map(size_t size) {

@@ -17,6 +17,8 @@ volatile int gs_native_view;
 double host_seconds(void) { return GetTickCount64()/1000.0; }
 double host_wall_seconds(void) { return host_seconds(); }
 void host_thread_name(const char *n) {(void)n;}
+#include "../host/host_end.h"
+void host_end_add(int stage, const char *name, void (*fn)(void)) { (void)stage; (void)name; atexit(fn); }  /* as atexit did */
 void host_putenv_s(const char *name, const char *value) {_putenv_s(name, value);}
 void pacing_handed(double *d,double *b) {*d=*b=0;}
 void pacing_present(double d,double b) {(void)d;(void)b;}
@@ -27,6 +29,7 @@ int texpack_open(const ReplaceDevice *d,uint64_t m) {(void)d; (void)m; return 0;
 int texpack_available(void) {return 0;}
 TexPackEntry *texpack_find(const Gs *g,unsigned c) {(void)g; (void)c; return NULL;}
 void *texpack_view(TexPackEntry *e,uint64_t f) {(void)e; (void)f; return NULL;}
+uint8_t *texpack_image(TexPackEntry *e,unsigned *w,unsigned *h) {(void)e; *w = *h = 0; return NULL;}
 void texpack_field(uint64_t f) {(void)f;}
 void texpack_report(void) {}
 int font_sharp_on(void) {return 0;}
@@ -34,8 +37,9 @@ int font_sharp_active(void) {return 0;}
 int font_sharp_icon_style(void) {return 0;}
 int font_sharp_icon_style_latch(void) {return 0;}
 int font_sharp_match(uint64_t t) {(void)t; return 0;}
-void *font_sharp_view(const ReplaceDevice *d,const uint32_t *p,unsigned w,unsigned h,uint64_t k)
-{(void)d; (void)p; (void)w; (void)h; (void)k; return NULL;}
+void *font_sharp_view(const ReplaceDevice *d,const uint32_t *p,unsigned w,unsigned h,uint64_t k,
+                      const FontSharpPack *pk)
+{(void)d; (void)p; (void)w; (void)h; (void)k; (void)pk; return NULL;}
 
 /* DHD_TEST_EE_MXCSR=1 (forwarded by test_gs_wgpu.py): the EE thread's MXCSR for the calls between
    test_ee_mxcsr_enter and test_ee_mxcsr_leave: round toward zero, FTZ and DAZ, exceptions masked

@@ -9,5 +9,11 @@ fn main() {
         .map(|v| v.trim().trim_matches('"').to_string())
         .expect("DHD_VERSION in version.h");
     println!("cargo:rustc-env=DHD_VERSION={version}");
+    println!("cargo:rerun-if-changed=../../host/disc_check.c");
+    println!("cargo:rerun-if-changed=../../host/disc_check.h");
+    cc::Build::new().file("../../host/disc_check.c").compile("disc_check");
+    println!("cargo:rerun-if-changed=../../host/launcher_link.h");
+    println!("cargo:rerun-if-changed=launcher_link.c");
+    cc::Build::new().file("launcher_link.c").compile("launcher_link");
     tauri_build::build()
 }

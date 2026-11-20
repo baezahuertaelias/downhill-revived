@@ -156,7 +156,6 @@ uint64_t web_q_call(uint32_t id, uint32_t wait, uint32_t flags, uint64_t a0, uin
     wait_until(at + 48);
     return WQ->result;
 }
-uint32_t web_q_vu_ready(void) { return vu_ready(); }
 
 /* worker.js's host_frame_context: the reactor's kernel_vsync_count (web_frame), in order. */
 __attribute__((export_name("web_q_frame"))) void web_q_frame(uint64_t field)
@@ -305,7 +304,7 @@ void graphics_gif_feed(unsigned path, const uint32_t *words, unsigned count)
     uint32_t at = reserve2(bytes);
     WebPacket *p = packet_in(WQ2, at);
     p->bytes = bytes;
-    p->kind = WQ_GIF;
+    p->kind = WQ_GIF | (graphics_provenance.shadow ? WQ_SHADOW : 0);   /* Native VU's shadow kicks */
     p->a = path;
     p->b = count;
     __builtin_memcpy(p + 1, words, count * 4);
@@ -468,8 +467,10 @@ __attribute__((export_name("web_q_run"))) int web_q_run(void)
         switch (p->kind & WQ_KIND) {
         case WQ_PAD:
             break;
-        case WQ_GIF:   /* host_graphics.c's: gs_feed */
+        case WQ_GIF:   /* host_graphics.c's: gs_feed (or gs_mesh), with the kick's shadow flag */
+            graphics_provenance.shadow = (p->kind & WQ_SHADOW) != 0;
             graphics_gif_feed(p->a, (const uint32_t *)(p + 1), p->b);
+            graphics_provenance.shadow = 0;
             break;
         case WQ_REF:
             answer = run_ref((const WebPacket *)(uintptr_t)p->a);

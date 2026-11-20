@@ -9,7 +9,7 @@
    sdl_host_run. The renderer's surface takes the window's native handle (window_target, the one
    platform part): Win32's HWND, X11's or Wayland's window, Android's ANativeWindow, or on Apple
    the CAMetalLayer of an SDL Metal view. On a phone the surface is dropped while the app is in
-   the background and made again when it comes back (app_background_wait, finding 091). */
+   the background and made again when it comes back (app_away_wait, findings 091, 227). */
 #include <SDL3/SDL.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -21,6 +21,8 @@
 #include "../include/guest.h"
 #include "../hle/text_input.h"
 #include "perf_log.h"
+#include "gs_mesh.h"   /* gs_mesh_setting_read (Native VU, finding 194) */
+#include "../host/host_end.h"   /* how the game ends (finding 210) */
 
 static uint32_t pixels[1024 * 1024];
 static int initialized, disabled, resize_pending;
@@ -35,6 +37,8 @@ static volatile int target_ready;   /* window_target found it (a phone: not whil
 static SDL_AtomicInt drawable;
 typedef struct { int x, y, w, h, borderless; } WindowSpec;
 static void display_of(SDL_Window *w, SDL_Rect *full, SDL_Rect *usable);
+static void window_measure(void);
+static void graphics_failed(void);
 
 /* ---- the platform part: SDL's window as the renderer's window ---- */
 #if defined(_WIN32)
@@ -45,13 +49,29 @@ static void display_of(SDL_Window *w, SDL_Rect *full, SDL_Rect *usable);
    (this file is host code). */
 __declspec(dllexport) DWORD NvOptimusEnablement = 1;
 __declspec(dllexport) int AmdPowerXpressRequestHighPerformance = 1;
+#elif defined(__SWITCH__)
+#include <switch.h>
+#define WINDOW_FLAGS 0
+#define FIXED_SCREEN 1  /* the console's screen */
 #elif defined(__ANDROID__)
 #define WINDOW_FLAGS 0
 #define FIXED_SCREEN 1  /* the whole screen, immersive (landscape: android_main.c's hint) */
 #elif defined(__APPLE__)
+#include <TargetConditionals.h>
 #define WINDOW_FLAGS SDL_WINDOW_METAL  /* the renderer draws into an SDL Metal view's layer */
+#if TARGET_OS_IPHONE
+#define FIXED_SCREEN 1  /* iOS: SwiftUI owns the window and provides its CAMetalLayer */
+extern void *ios_metal_get_layer(void);
+extern void ios_metal_get_drawable_size(int *out_w, int *out_h);
+extern int ios_metal_consume_resized(void);
+extern int ios_metal_consume_layer_changed(void);
+extern double ios_metal_display_hz(void);
+extern bool ios_game_is_active(void);
+extern void ios_text_input(int on);
+#else
 #define FIXED_SCREEN 0
 static SDL_MetalView metal_view;
+#endif
 #else
 #define WINDOW_FLAGS 0
 #define FIXED_SCREEN 0
@@ -62,13 +82,25 @@ static SDL_MetalView metal_view;
 static void window_target(void *unused)
 {
     (void)unused;
-    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window);
     memset(&target, 0, sizeof target);
     target.size = gs_window_pixels;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    target.kind = GS_WINDOW_METAL_LAYER;
+    target.a = (uintptr_t)ios_metal_get_layer();
+    window_measure();
+#else
+    SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window);
 #if defined(_WIN32)
     target.kind = GS_WINDOW_WIN32;
     target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
     target.b = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, NULL);
+#elif defined(__SWITCH__)
+    target.kind = GS_WINDOW_NX;
+    target.a = (uintptr_t)nwindowGetDefault();
+    {   /* dhd.ini's vsync = 0: presents never wait for a free image (the compositor keeps its 60 Hz: no tearing) */
+        const char *vsync = getenv("DHD_VSYNC");
+        nwindowSetSwapInterval(nwindowGetDefault(), vsync && !strcmp(vsync, "0") ? 0 : 1);
+    }
 #elif defined(__ANDROID__)
     target.kind = GS_WINDOW_ANDROID;
     target.a = (uintptr_t)SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, NULL);
@@ -87,6 +119,7 @@ static void window_target(void *unused)
         target.b = (uint64_t)SDL_GetNumberProperty(props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
     }
 #endif
+#endif
     target_ready = target.a != 0;
 }
 
@@ -95,7 +128,7 @@ static void window_target(void *unused)
    make_window's hints; SDL_SetWindowIcon would give the title bar one 512-pixel picture scaled
    down) and the APK's. Elsewhere nothing else gives the window one (Linux) or it is the bundle's
    own picture (macOS): port/res/icon.png, embedded by build_host64.py. */
-#if defined(_WIN32) || defined(__ANDROID__)
+#if defined(_WIN32) || defined(__ANDROID__) || defined(__SWITCH__)
 static void window_icon(void) {}
 #else
 #include "dhd_icon.inc"  /* dhd_icon_png: port/res/icon.png's bytes */
@@ -191,6 +224,11 @@ static void monitor_size(WindowSpec *s)
 static void window_measure(void)
 {
     int w = 0, h = 0;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    ios_metal_get_drawable_size(&w, &h);
+    SDL_SetAtomicInt(&drawable, (w > 0 ? w : 0) << 16 | (h > 0 ? h : 0));
+    perf_window(ios_game_is_active(), ios_metal_display_hz());
+#else
     /* Tool captures need the final presenter even while the window stays minimised. */
     if (sdl_window && (!(SDL_GetWindowFlags(sdl_window) & SDL_WINDOW_MINIMIZED) || getenv("DHD_CAPTURE_PRESENTED")))
         SDL_GetWindowSizeInPixels(sdl_window, &w, &h);
@@ -206,6 +244,7 @@ static void window_measure(void)
                 (test_input || (flags & SDL_WINDOW_INPUT_FOCUS));
     const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(sdl_window));
     perf_window(front, mode ? mode->refresh_rate : 0);
+#endif
 }
 
 /* SDL's window events as SDL sends them (on Windows inside a modal drag or resize too, which the
@@ -222,6 +261,15 @@ static bool SDLCALL window_watch(void *unused, SDL_Event *e)
 static void make_window(void *arg)
 {
     WindowSpec *s = arg;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    (void)s;
+    sdl_window = (SDL_Window *)1;
+    window_measure();
+    window_target(NULL);
+    unsigned pw = 0, ph = 0;
+    gs_window_pixels(&pw, &ph);
+    hle_log("gs: iOS Metal surface %ux%u\n", pw, ph);
+#else
     /* The app id, the launcher's (tauri.conf.json's identifier): Wayland's app_id and X11's
        WM_CLASS, by which desktops group the window and find its icon (from n0buholic, PR #13).
        Windows: the icon (port/res/dhd.rc) on SDL's window class, small and big (window_icon). */
@@ -255,6 +303,7 @@ static void make_window(void *arg)
     SDL_AddEventWatch(window_watch, NULL);
     window_target(NULL);
     hle_log("gs: SDL window %dx%d (video %s)\n", s->w, s->h, SDL_GetCurrentVideoDriver());
+#endif
 }
 
 /* A display's whole area and its usable part (without the taskbar), in pixels (host_dpi_aware). */
@@ -272,10 +321,14 @@ static void display_of(SDL_Window *w, SDL_Rect *full, SDL_Rect *usable)
 static void show_window(void *unused)
 {
     (void)unused;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    hle_log("gs: iOS Metal surface active\n");
+#else
     int minimised = start_minimised();
     hle_log("gs: window shown%s\n", minimised ? " minimised (a minimised start)" : "");
     if (minimised) show_minimised();
     else { SDL_ShowWindow(sdl_window); SDL_RaiseWindow(sdl_window); }
+#endif
 }
 
 /* The native handle, waited for up to tries x 10 ms (a phone makes its surface a little after the
@@ -290,9 +343,10 @@ static int wait_target(int tries)
     return 0;
 }
 
-/* ---- the app in the background (phones: SDL sends these events on Android and iOS only) ---- */
+/* ---- the app in the background (phones: SDL sends these events on Android and iOS only; the
+   Switch: nx_host.c's focus_pass sends them) ---- */
 static volatile int app_background; /* the app is in the background (lifecycle_watch): the game waits */
-static volatile int surface_dropped; /* lifecycle_watch dropped the surface: app_background_wait makes it again */
+static volatile int surface_dropped; /* lifecycle_watch dropped the surface: app_away_wait makes it again */
 
 /* SDL's app events, from the thread that pumps SDL's events (sdl_host.c), synchronously: SDL blocks
    that thread right after the background events (SDL_HINT_ANDROID_BLOCK_ON_PAUSE), so the queued
@@ -303,32 +357,124 @@ static bool SDLCALL lifecycle_watch(void *unused, SDL_Event *e)
     (void)unused;
     if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND && !app_background) {
         app_background = 1;
+        gs_render_leave();   /* an absence: no new GPU work from the render thread (render_gate.h, finding 227) */
+#ifndef __SWITCH__  /* the console's window stays ours: the swapchain stays too (app_away_wait) */
         if (surface) gs_gpu_surface_reset(&gs, NULL);
+#endif
         surface_dropped = 1;
     } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
         app_background = 0;
+        gs_app_back();   /* the renderer goes again unless the game's wait does it */
     }
     return true;
 }
 
-/* The app went to the background (game thread, at a field): the surface is dropped before the OS
-   takes the window, and the game waits (SDL pauses the sound) until the app is back, then the
-   surface is made on the new window. The close of the app ends the game as the close button does. */
-static void app_background_wait(void)
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+/* iOS: SDL's app events don't come (the app owns UIApplication, port/ios); the app's delegate says
+   when the game is not active (ios_main.m's ios_game_is_active). */
+static int app_away(void) { return app_background || surface_dropped || !ios_game_is_active(); }
+#else
+static int app_away(void) { return app_background || surface_dropped; }
+#endif
+
+/* The app left the screen (game thread, at a field or an online wait's pump), on Android and iOS
+   alike (finding 227): the surface is dropped before the OS takes the window, and while the app is
+   away nothing of the game runs:
+   - host_app_away(1) lets go of every finger and asks the touch controls to open the game's own
+     pause at the return when a race is on screen offline (online the race goes on, finding 215:
+     nothing pauses there), pauses the sound, and tells the freeze watch that no field is due;
+   - on return the surface is made on the new window and the game clock starts again from now
+     (kernel.c asks host_service_host_came_back after this present and rebases fps.c's clock): the
+     time away is no game time, offline or online, so nothing tries to catch it up.
+   The close of the app ends the game as the close button does. */
+static SDL_AtomicInt away_waiting;   /* the game thread is in app_away_wait (gs_app_back) */
+static SDL_ThreadID game_thread;     /* init's: the game thread (away_in_a_wait) */
+static const char *away_where;       /* the wait for the drawing the game thread was in (away_in_a_wait) */
+
+/* The app is back on the screen (the platform's callback): when the game thread never got to
+   app_away_wait (a quick flip), it lets the renderer go again itself; else app_away_wait does, once
+   the new surface is made. */
+void gs_app_back(void)
 {
-    hle_log("gs: in the background; the game waits\n");
-    gs_gpu_surface_reset(&gs, NULL);
-    target_ready = 0;
+    if (!SDL_GetAtomicInt(&away_waiting)) gs_render_release(gs_render_current());
+}
+
+static void app_away_wait(void)
+{
+    static int waiting;   /* gs_pump_messages, from the wait below, comes back here */
+    if (waiting || !surface) return;
+    waiting = 1;
+    SDL_SetAtomicInt(&away_waiting, 1);
+    double since = host_wall_seconds();
+    /* DHD_TEST_SLOW_AWAY=ms (checks only): the game thread late here, as in a long load, so the
+       platform's callback finds the render thread held while the game still runs */
+    const char *slow = getenv("DHD_TEST_SLOW_AWAY");
+    if (slow && atoi(slow) > 0) {
+        hle_log("gs: test: the game thread reaches the background's wait %d ms late\n", atoi(slow));
+        SDL_Delay((Uint32)atoi(slow));
+    }
+    host_app_away(1);
+    /* The platform's callback has held the render thread already (render_gate.h: it starts no new
+       GPU work; the fields stay queued, so there is no drain here: the GS worker could be waiting on
+       the held thread). The surface goes; nothing is presented until the return. The hold is
+       released only for the absence this wait went through: one that began while the surface was
+       being made again (a quick second flip) keeps it, and the wait starts over. */
+    unsigned absence = gs_render_generation();
+#ifdef __SWITCH__
+    /* The default window and its swapchain outlive the home menu and sleep: nothing to make again.
+       What was queued runs out first, so the GPU is idle for the wait. */
+    if (graphics_deferred()) graphics_wait();
+    hle_log("gs: in the background; the game waits (the renderer held)\n");
     while (app_background && !window_closed) SDL_Delay(20);
     surface_dropped = 0;
     gs_pump_messages();
-    if (!wait_target(300) || !gs_gpu_surface_reset(&gs, &target)) {
-        hle_log("gs: no surface on the window after the background\n");
+    SDL_SetAtomicInt(&away_waiting, 0);
+    gs_render_release(absence);
+    host_app_away(0);
+    hle_log("gs: back in the foreground after %.1f s\n", host_wall_seconds() - since);
+    waiting = 0;
+    return;
+#endif
+    gs_gpu_surface_reset(&gs, NULL);
+    target_ready = 0;
+    hle_log("gs: in the background; the game waits (the renderer held, no surface)%s%s\n", away_where ? ", from " : "",
+            away_where ? away_where : "");
+    away_where = NULL;
+    for (;;) {
+        while (app_away() && !window_closed) {
+            surface_dropped = 0;   /* the surface is dropped: only the app's own state is waited for */
+            SDL_Delay(20);
+        }
+        gs_pump_messages();   /* closed meanwhile: the game ends here */
+        if (!wait_target(300) || !gs_gpu_surface_reset(&gs, &target)) {
+            hle_log("gs: no surface on the window after the background\n");
+            target_ready = 0;
+        } else {
+            resize_pending = 1;
+        }
+        SDL_SetAtomicInt(&away_waiting, 0);
+        if (gs_render_release(absence)) break;   /* the held fields draw on the new surface */
+        /* a newer absence began meanwhile: its hold stays; wait through it */
+        SDL_SetAtomicInt(&away_waiting, 1);
+        absence = gs_render_generation();
+        hle_log("gs: the app left again while its surface was made; the game waits again\n");
+        gs_gpu_surface_reset(&gs, NULL);
         target_ready = 0;
-        return;
     }
-    resize_pending = 1;
-    hle_log("gs: back in the foreground\n");
+    host_app_away(0);   /* the core's clock starts again from now (kernel.c, host_service_host_came_back) */
+    hle_log("gs: back in the foreground after %.1f s; the game clock goes on from now\n", host_wall_seconds() - since);
+    waiting = 0;
+}
+
+/* graphics_queue.c's waits for the drawing, on any thread (finding 236). The callback holds the
+   render thread, so the GS worker soon waits at its handoff with a field queued, and the game
+   thread's next wait for the drawing (the VBLANK's wait for an earlier picture, a fence, a full
+   queue) would last the whole absence: it waits out the absence there instead, as at a field. */
+static void away_in_a_wait(const char *where)
+{
+    if (!app_away() || SDL_GetCurrentThreadID() != game_thread) return;
+    away_where = where;
+    app_away_wait();
 }
 
 /* The window (SDL's), then the renderer (gpu_rust.c: wgpu on Direct3D 12 or Vulkan, Metal on
@@ -354,6 +500,8 @@ static int init(void)
         return 0;
     }
     surface = 1;
+    game_thread = SDL_GetCurrentThreadID();
+    graphics_away_wait = away_in_a_wait;
     SDL_AddEventWatch(lifecycle_watch, NULL);
     hle_log("gs: WebGPU presentation (%s, window kind %u)\n", gs_gpu_backend_name(&gs), target.kind);
     sdl_host_run(show_window, NULL);
@@ -398,11 +546,14 @@ void gs_window_apply(void)
     resize_pending = 1;
 }
 
-/* The picture's filter and shape changed (DHD_PRESENT_FILTER, DHD_ASPECT): native renderer only. */
+/* The picture's filter and shape changed (DHD_PRESENT_FILTER, DHD_ASPECT): native renderer only.
+   Also the FPS & Ping counter and Native VU (gs_mesh.h: the VU thread takes it at its next batch),
+   read here on the game thread that changed them. */
 void gs_gpu_counter_apply(void);  /* port/gs/gpu_rust.c */
 void gs_present_options_apply(void)
 {
     gs_gpu_counter_apply();
+    gs_mesh_setting_read();
     if (sdl_window && gs_gpu_native(&gs)) gs_native_present_options(&gs);
 }
 
@@ -544,15 +695,22 @@ void gs_window_event(unsigned type)
 {
     if (type == SDL_EVENT_WINDOW_RESIZED) resize_pending = 1;
     else if (type == SDL_EVENT_WINDOW_CLOSE_REQUESTED || type == SDL_EVENT_QUIT) {
+#if !(defined(__APPLE__) && TARGET_OS_IPHONE)
         if (sdl_window) SDL_HideWindow(sdl_window);
+#endif
         window_closed = 1;
     }
 }
 
 /* EXIT GAME (port/hle/exit_menu.c): the window closes as when its close button is clicked, and
-   the game ends at the next gs_pump_messages. */
+   the game ends at the next gs_pump_messages (host_end: the work threads and the render thread
+   stop first, then the process leaves; finding 210). */
 void gs_window_close(void)
 {
+#ifdef __SWITCH__
+    { void nx_request_close(void); nx_request_close(); return; }  /* no event queue here: nx_host.c */
+#endif
+#if !(defined(__APPLE__) && TARGET_OS_IPHONE)
     if (sdl_window) {
         SDL_Event e;
         SDL_zero(e);
@@ -561,13 +719,45 @@ void gs_window_close(void)
         SDL_PushEvent(&e);  /* the SDL thread sees it: gs_window_event */
         return;
     }
-    exit(0);
+#endif
+    host_end(0);
 }
 
-/* The window's events are the SDL thread's (sdl_host.c); here the game ends once the window closed. */
+static void hide_window(void *unused)
+{
+    (void)unused;
+    if (sdl_window) SDL_HideWindow(sdl_window);
+}
+
+/* The GPU device was lost (finding 171): the driver reset or removed it (a GPU that stopped
+   responding, a driver crash or update). Nothing can be drawn any more, and the renderer's objects
+   live on that device for the process's life, so the game ends with a message instead of running
+   on with a frozen picture. On the game thread, from gs_pump_messages; the reason is in the log
+   already (dhdr_device_lost). */
+static void graphics_lost(void)
+{
+    hle_log("gs: the GPU device was lost; the game ends\n");
+    sdl_host_run(hide_window, NULL);  /* the box over the desktop, not under a borderless window */
+    host_error_box("Downhill Revived",
+                   "The graphics driver stopped responding and was reset, so Downhill Revived can't show "
+                   "pictures any more and has to close.\n\n"
+                   "Update the graphics driver (from the maker of your computer or of its graphics chip) "
+                   "and start the game again. If it happens again, please report it with dhd.log, which "
+                   "is next to the game.");
+    host_end(1);
+}
+
+/* The window's events are the SDL thread's (sdl_host.c); here the game ends once the window closed,
+   or with a message once the GPU device was lost. */
 void gs_pump_messages(void)
 {
-    if (window_closed) exit(0);
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    /* The app owns UIApplication's lifecycle: stop before queuing another frame (also from an
+       online wait's pump); dropping the surface drains the renderer's work before iOS suspends it. */
+    if (!ios_game_is_active()) app_away_wait();
+#endif
+    if (window_closed) host_end(0);
+    if (gs_gpu_lost()) graphics_lost();
 }
 
 /* The window's drawable size in pixels (the renderer's GsWindow.size, any thread): 0 x 0 without a
@@ -613,7 +803,14 @@ static void mouse_place(void)
     int left = mouse.left, top = mouse.top, right = mouse.right, bottom = mouse.bottom;
     float px = mouse.px, py = mouse.py;
     int ww = 0, wh = 0;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    unsigned uw = 0, uh = 0;
+    gs_window_pixels(&uw, &uh);
+    ww = (int)uw; wh = (int)uh;
+    if (ww > 0 && wh > 0) {
+#else
     if (sdl_window && SDL_GetWindowSizeInPixels(sdl_window, &ww, &wh) && ww > 0 && wh > 0) {
+#endif
         if (right <= left || mouse.w <= 0) left = top = 0, right = ww, bottom = wh;
         else px *= (float)mouse.w / ww, py *= (float)mouse.h / wh;  /* a resize the picture hasn't followed yet */
     }
@@ -633,7 +830,11 @@ void gs_mouse_event(const void *event)
     static int test_input = -1;
     const SDL_Event *e = event;
     if (test_input < 0) test_input = getenv("DHD_TEST_INPUT") != NULL;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    float density = 1.0f;
+#else
     float density = sdl_window ? SDL_GetWindowPixelDensity(sdl_window) : 1.0f;
+#endif
     if (density <= 0) density = 1.0f;
     MOUSE_LOCK();
     switch (e->type) {
@@ -700,6 +901,27 @@ void gs_window_tick(void)
 {
     static int shown = -1;
     if (!sdl_window) return;
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+    window_measure();
+    if (ios_metal_consume_resized()) resize_pending = 1;
+    if (ios_metal_consume_layer_changed()) {
+        window_target(NULL);
+        if (surface && target_ready) {
+            gs_gpu_surface_reset(&gs, &target);
+            resize_pending = 1;
+        }
+    }
+    /* a field of the game takes typing (a name, a room's code): the system keyboard while it does,
+       its characters to text_input_character (metal_bridge.m; finding 224) */
+    static int ios_typing;
+    if (text_input_active() != ios_typing) {
+        ios_typing = !ios_typing;
+        ios_text_input(ios_typing);
+        fprintf(stderr, "text input: %s (the iOS keyboard)\n", ios_typing ? "on" : "off");
+    }
+    (void)shown;
+    return;
+#else
     if (title.changed) {
         char text[sizeof title.text];
         SDL_LockSpinlock(&title.lock);
@@ -727,6 +949,7 @@ void gs_window_tick(void)
     shown = want;
     if (want) SDL_ShowCursor();
     else SDL_HideCursor();
+#endif
 }
 
 void host_service_mouse_state(uint32_t out)
@@ -818,10 +1041,37 @@ static void bench_vsync(void)
     free(frames);
     state = 2;
     const char *quit = getenv("DHD_BENCH_EXIT");
+#ifdef __SWITCH__
+    if (quit && !strcmp(quit, "1")) gs_window_close();  /* EXIT GAME's way: host_exit is the system's exit, which closes the Homebrew Menu too (finding 270) */
+#else
     if (quit && !strcmp(quit, "1")) host_exit(0);
+#endif
 }
 
 const uint32_t *movie_picture(unsigned *width, unsigned *height, unsigned *rows);  /* port/hle/movie.c */
+int movie_playing(void);
+void movie_drop(void);
+
+/* The movie's picture to show this field, or NULL. The PS2's player shows its pictures from a
+   buffer of its own (DISPFB2 at page 280, func_0020BDA0), which stays on screen after the movie,
+   between the startup movies and after a skip, until the game sets its display again: the GS reset
+   before the next screen, or that screen's own display (finding 160). The port's player never
+   touches the GS, so the game's display registers hold what they held before the movie (the
+   memory card check card, or nothing after the reset before the movies). So the movie's last
+   picture stays while the registers are the ones the game kept during the movie and no GS reset
+   came since. */
+static const uint32_t *movie_shown(const uint64_t mmio[15], unsigned *width, unsigned *height, unsigned *rows)
+{
+    static uint64_t during[15], resets;
+    const uint32_t *movie = movie_picture(width, height, rows);
+    if (!movie) return NULL;
+    if (movie_playing()) memcpy(during, mmio, sizeof during), resets = gs.resets;
+    else if (resets != gs.resets || memcmp(during, mmio, sizeof during)) {
+        movie_drop();
+        return NULL;
+    }
+    return movie;
+}
 int host_widescreen_flat_limit(void);  /* port/hle/host.c */
 int host_widescreen_card_drawn(void);
 
@@ -836,7 +1086,7 @@ static void graphics_failed(void)
                           "chips, open Windows Settings > System > Display > Graphics, add the game and choose High "
                           "performance.\n\nThe details are in dhd.log, next to the game.";
     host_error_box("Downhill Revived", message);
-    exit(1);
+    host_end(1);
 }
 
 /* Plain MMIO pages are the authoritative privileged register storage: the GS takes them at each
@@ -857,6 +1107,7 @@ static void present_registers(const uint64_t *mmio)
 typedef struct {
     uint64_t mmio[15];
     double due, began;  /* pacing_handed */
+    double output_aspect;
     int32_t resize, flat_limit, card_2d;
 } PresentMark;
 
@@ -868,7 +1119,7 @@ static void present_marked(const void *payload)
     memcpy(&m, payload, sizeof m);
     present_registers(m.mmio);
     gs_native_movie(&gs, NULL, 0, 0, 0);
-    gs_native_vsync_handed(&gs, &width, &height, m.resize, m.due, m.began, m.flat_limit, m.card_2d);
+    gs_native_vsync_handed(&gs, &width, &height, m.resize, m.due, m.began, m.flat_limit, m.card_2d, m.output_aspect);
 }
 
 void gs_vsync(void)
@@ -890,7 +1141,7 @@ void gs_vsync(void)
     perf_field(*(volatile int32_t *)GUEST(0x0829E290) != 0);  /* a race ridden (D_0029E290), or the menus */
     gs_pump_messages();  /* first: the close button ends the game even with no renderer */
     if (disabled) return;
-    if (app_background || surface_dropped) app_background_wait();
+    if (app_away()) app_away_wait();
 #ifdef __ANDROID__
     { void android_perf_field(void); android_perf_field(); }  /* port/host/android_perf.c: CPU clocks */
 #endif
@@ -898,7 +1149,7 @@ void gs_vsync(void)
     for (unsigned addr = 0; addr <= 0xE0; addr += 16) mmio[addr / 16] = *(volatile uint64_t *)GUEST(0x12000000 + addr);
     /* While a movie plays (port/hle/movie.c, finding 055) its picture is shown instead. */
     unsigned movie_width, movie_height, movie_rows;
-    const uint32_t *movie = movie_picture(&movie_width, &movie_height, &movie_rows);
+    const uint32_t *movie = movie_shown(mmio, &movie_width, &movie_height, &movie_rows);
     /* Deferred vsync: the GS worker hands the native picture on after the drawing queued before it;
        the game thread goes on. A movie or the exact renderer waits for the drawing here instead.
        (Capture and DHD_PROFILE turn deferral off: they read the GS below.) */
@@ -908,6 +1159,7 @@ void gs_vsync(void)
             memcpy(m.mmio, mmio, sizeof m.mmio);
             pacing_handed(&m.due, &m.began);
             m.resize = resize_pending, m.flat_limit = host_widescreen_flat_limit();
+            m.output_aspect = host_widescreen_aspect();
             m.card_2d = host_widescreen_card_drawn();
             resize_pending = 0;
             graphics_present_marked = present_marked;

@@ -8,10 +8,11 @@
    port/tools/build_host64.py --target android-arm64 from the module (--wasm, default build/wasm/dhd_core.wasm,
    when given or when the libraries are missing).
 2. The Gradle project in build/android/project: this folder's files (the Gradle scripts, the
-   manifest, DhdActivity.java, the strings and theme), SDL's Java sources of the same release
+   manifest, the activities, the strings and theme), SDL's Java sources of the same release
    (org.libsdl.app, from the SDL source sdl3.py unpacked), the icon (port/res/icon.png, scaled per
-   density), the two libraries (src/main/jniLibs/arm64-v8a) and the Gradle wrapper (SDL's
-   gradle-wrapper.jar, Gradle WRAPPER_GRADLE: the version already in GRADLE_USER_HOME).
+   density), the launcher's page (port/launcher/ui, as assets/launcher; finding 225), the two
+   libraries (src/main/jniLibs/arm64-v8a) and the Gradle wrapper (SDL's gradle-wrapper.jar, Gradle
+   WRAPPER_GRADLE: the version already in GRADLE_USER_HOME).
 3. gradlew assembleDebug (no daemon), signed with the debug key ANDROID_USER_HOME holds
    (DHD_DEVCACHES\\AndroidUser\\debug.keystore, made on first use). Output:
    build/android/downhill-revived-<version>-debug.apk.
@@ -20,8 +21,9 @@
    (the keystore file, outside the checkout), DHD_ANDROID_KEYSTORE_PASS, DHD_ANDROID_KEY_ALIAS,
    DHD_ANDROID_KEY_PASS (app/build.gradle reads them; nothing is written down here). The key is kept
    by the maintainer; an APK signed with another key can't update an installed one. Then the APK is
-   checked (check_release: apksigner verify with one signer, the release certificate
-   RELEASE_CERT_SHA256; aapt's badging: not debuggable, the version, arm64-v8a only) and written as build/android/DownhillRevived-<version>-android-experimental.apk, the name
+   checked (check_release: apksigner verify from the minimum API level, one signer, the release
+   certificate RELEASE_CERT_SHA256, schemes v2 and v3; aapt's badging: not debuggable, the version,
+   the minimum API level of app/build.gradle, arm64-v8a only) and written as build/android/DownhillRevived-<version>-android-experimental.apk, the name
    of the release asset (port/tools/package_release.py --platform android).
 
 The release certificate is pinned: an APK signed with any other key (a new keystore made by
@@ -57,6 +59,7 @@ PROJECT = OUT / 'project'
 WRAPPER_GRADLE = '8.10.2'   # AGP 8.7.0 (build.gradle) needs Gradle 8.9 or later
 ICON_SIZES = {'mdpi': 48, 'hdpi': 72, 'xhdpi': 96, 'xxhdpi': 144, 'xxxhdpi': 192}
 TEMPLATE = ('settings.gradle', 'build.gradle', 'gradle.properties', 'app/build.gradle', 'app/src/main')
+LAUNCHER_UI = ROOT / 'port' / 'launcher' / 'ui'
 
 
 RELEASE_ENV = ('DHD_ANDROID_KEYSTORE', 'DHD_ANDROID_KEYSTORE_PASS', 'DHD_ANDROID_KEY_ALIAS', 'DHD_ANDROID_KEY_PASS')
@@ -94,6 +97,11 @@ def build_tool(name):
     return None
 
 
+def min_sdk():
+    """The APK's minimum Android API level, as app/build.gradle sets it (29: Android 10, finding 191)."""
+    return int(re.search(r'^\s*minSdk\s*=\s*(\d+)', (HERE / 'app' / 'build.gradle').read_text(), re.M).group(1))
+
+
 def cert_digest(text):
     """A certificate SHA-256 as apksigner prints it: 64 lower-case hex digits, no colons."""
     return re.sub(r'[^0-9a-f]', '', text.lower())
@@ -101,15 +109,19 @@ def cert_digest(text):
 
 def check_release(apk, name, code, new_signing_key=False):
     """What is wrong with a release APK (a list of problems), and what it is (a dict): its signature
-    (apksigner verify --print-certs: one signer, the release certificate RELEASE_CERT_SHA256 unless
-    new_signing_key, the schemes) and aapt's badging: the package, versionCode and versionName (when
-    name is not None), not debuggable, arm64-v8a its only native code. facts['new_signer'] is true
+    (apksigner verify --print-certs --min-sdk-version min_sdk(): one signer, the release certificate
+    RELEASE_CERT_SHA256 unless new_signing_key, scheme v3; and v2, which apksigner reports only for
+    Android before 9, so a second verify asks for API 24 to 27) and aapt's badging: the package,
+    versionCode and versionName (when name is not None), the minimum API level, not debuggable,
+    arm64-v8a its only native code. facts['new_signer'] is true
     when new_signing_key let another (non-debug) certificate through."""
     problems, facts = [], {}
     apksigner, aapt = build_tool('apksigner'), build_tool('aapt') or build_tool('aapt2')
     if not apksigner or not aapt:
         return ["no apksigner or aapt in ANDROID_HOME's build-tools"], facts
-    r = subprocess.run([str(apksigner), 'verify', '--verbose', '--print-certs', str(apk)], capture_output=True, text=True)
+    # --min-sdk-version: the signature must verify on every Android from the APK's minimum (Android 10)
+    r = subprocess.run([str(apksigner), 'verify', '--verbose', '--print-certs', '--min-sdk-version', str(min_sdk()), str(apk)],
+                       capture_output=True, text=True)
     if r.returncode:
         problems.append('apksigner verify failed: %s' % (r.stderr or r.stdout).strip()[-500:])
     out = r.stdout
@@ -130,8 +142,15 @@ def check_release(apk, name, code, new_signing_key=False):
             problems.append('signed by certificate SHA-256 %s, not the release key %s (an installed copy refuses it as '
                             'an update; --new-signing-key only for a deliberate key change)'
                             % (digests[0], cert_digest(RELEASE_CERT_SHA256)))
-    if not {'v2', 'v3'} & set(facts['schemes']):
-        problems.append('no APK signature scheme v2 or v3')
+    # apksigner names only the scheme a range of Android verifies: from API 28 that is v3, so the v2
+    # signature (still in the APK, app/build.gradle) is checked for Android 7 to 8.1 (finding 191)
+    r = subprocess.run([str(apksigner), 'verify', '--verbose', '--min-sdk-version', '24', '--max-sdk-version', '27', str(apk)],
+                       capture_output=True, text=True)
+    if 'v2' not in facts['schemes'] and re.search(r'Verified using v2 scheme[^:]*: true', r.stdout):
+        facts['schemes'].insert(0, 'v2')
+    missing = [s for s in ('v2', 'v3') if s not in facts['schemes']]
+    if missing:  # v2: any installer; v3: the key's rotation (app/build.gradle, findings 143, 191)
+        problems.append('no APK signature scheme %s' % ' or '.join(missing))
     r = subprocess.run([str(aapt), 'dump', 'badging', str(apk)], capture_output=True, text=True)
     badging = r.stdout
     if r.returncode or not badging:
@@ -141,6 +160,10 @@ def check_release(apk, name, code, new_signing_key=False):
     if not package or package.group(1) != PACKAGE or (name is not None and package.groups() != (PACKAGE, str(code), name)):
         wanted = PACKAGE if name is None else '%s %d %s' % (PACKAGE, code, name)   # --check: no version to compare
         problems.append('package line %r, not %s' % (facts['badging'], wanted))
+    sdk = re.search(r"sdkVersion:'(\d+)'", badging)
+    facts['min_sdk'] = int(sdk.group(1)) if sdk else None
+    if facts['min_sdk'] != min_sdk():
+        problems.append('minimum API level %s, not %d (app/build.gradle)' % (facts['min_sdk'], min_sdk()))
     native = re.search(r'native-code: (.*)', badging)
     facts['native_code'] = native.group(1).strip() if native else ''
     if facts['native_code'] != "'arm64-v8a'":
@@ -151,6 +174,8 @@ def check_release(apk, name, code, new_signing_key=False):
             problems.append('libmain.so is the profile-collecting build (--pgo-generate)')
         with zipfile.ZipFile(apk) as z:
             split = z.read('assets/dhd-split.txt').decode().strip() if 'assets/dhd-split.txt' in z.namelist() else 'unknown'
+            if 'assets/launcher/index.html' not in z.namelist():  # the entry activity's page (finding 225)
+                problems.append("no launcher page (assets/launcher/index.html)")
         if split not in ('one', 'wasm2c'):  # finding 151: the development chunks cost the game ~1.5 %
             problems.append('libmain.so was built from %s C, not a release build (build_host64.py --release)' % split)
     except (OSError, KeyError, zipfile.BadZipFile) as e:
@@ -202,6 +227,9 @@ def project(libs, assets=None):
     icons(PROJECT / 'app' / 'src' / 'main' / 'res')
     if assets:  # files the APK carries as they are (package_release.py: the licence texts)
         shutil.copytree(assets, PROJECT / 'app' / 'src' / 'main' / 'assets')
+    # the launcher's page, the desktop launcher's own (LauncherActivity serves it, finding 225)
+    shutil.copytree(LAUNCHER_UI, PROJECT / 'app' / 'src' / 'main' / 'assets' / 'launcher', dirs_exist_ok=True,
+                    ignore=shutil.ignore_patterns('*.md'))
     # which C libmain.so was built from (build_host64's split.txt: one, wasm2c, chunks), so a release
     # check of any APK can refuse the development chunks (finding 151)
     split = OUT / 'split.txt'
