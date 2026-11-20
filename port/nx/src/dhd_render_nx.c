@@ -105,7 +105,7 @@ static Frame *frame;
 static unsigned frame_index;
 static uint64_t frame_count;
 
-static DkShader shader_vertex, shader_pixel, shader_dual, shader_fullscreen, shader_blit,
+static DkShader shader_vertex, shader_mesh, shader_pixel, shader_dual, shader_fullscreen, shader_blit,
                 shader_upload, shader_grow, shader_convert, shader_present, shader_zread;
 
 static void debug_callback(void *user, const char *context, DkResult result, const char *message)
@@ -462,7 +462,8 @@ int dhdr_device_init(const DhdrDeviceDesc *d)
     }
     uint32_t at = 0;
 #define LOAD(var, name) shader_load(&var, dksh_##name, sizeof dksh_##name, &at)
-    int ok = LOAD(shader_vertex, native_vertex) && LOAD(shader_pixel, native_pixel) && LOAD(shader_dual, native_pixel_dual) &&
+    int ok = LOAD(shader_vertex, native_vertex) && LOAD(shader_mesh, native_mesh_vertex) &&
+             LOAD(shader_pixel, native_pixel) && LOAD(shader_dual, native_pixel_dual) &&
              LOAD(shader_fullscreen, fullscreen_vertex) && LOAD(shader_blit, native_blit) &&
              LOAD(shader_upload, native_upload_alpha) && LOAD(shader_grow, native_grow_depth) && LOAD(shader_convert, native_convert) &&
              LOAD(shader_present, present_pixel) && LOAD(shader_zread, zread);
@@ -484,10 +485,10 @@ uint32_t dhdr_device_max_texture(void) { return ready > 0 ? 16384 : 0; }
 /* No GPU timestamps here yet: the timeline and perf_log read nothing (they need 4 values). */
 uint32_t dhdr_perf_read(uint64_t *out, uint32_t count) { (void)out; (void)count; return 0; }
 /* What main's renderer gained since 0.7.6 and this one has not yet (finding 270): deko3d reports
-   no device loss here; no VU1 mesh draws (native_vu stays off), so C keeps the emulated VU; no
-   pipeline list to prebuild; no surface read back (Poster Maker's frame: nothing to read). */
+   no device loss here; no pipeline list to prebuild; no surface read back (Poster Maker's frame:
+   nothing to read). VU1 mesh draws (Native VU) are drawn: native_mesh_vertex and the mesh key. */
 int dhdr_device_lost(void) { return 0; }
-int dhdr_native_meshes(void) { return 0; }
+int dhdr_native_meshes(void) { return ready > 0; }
 void dhdr_native_pipeline_list(const char *path) { (void)path; }
 int dhdr_native_surface_read_begin(DhdrNative *n, uint32_t index, const uint32_t rect[4], uint32_t size[2])
 {
@@ -745,7 +746,33 @@ static const DkVtxAttribState vertex_attributes[3] = {
     {.bufferId = 0, .isFixed = 0, .offset = 12, .size = DkVtxAttribSize_4x32, .type = DkVtxAttribType_Float, .isBgra = 0},
     {.bufferId = 0, .isFixed = 0, .offset = 28, .size = DkVtxAttribSize_4x8, .type = DkVtxAttribType_Uint, .isBgra = 0},
 };
+/* A translated VU1 mesh draw's (flag 4096, native_core.inc's native_mesh): the same 32 bytes as
+   gs_mesh.h's GsMeshVertex, the clip-space position, u v q, the colour's bytes (pipelines.rs's
+   MESH_ATTRIBUTES), for native.wgsl's native_mesh_vertex. */
+static const DkVtxAttribState mesh_attributes[3] = {
+    {.bufferId = 0, .isFixed = 0, .offset = 0, .size = DkVtxAttribSize_4x32, .type = DkVtxAttribType_Float, .isBgra = 0},
+    {.bufferId = 0, .isFixed = 0, .offset = 16, .size = DkVtxAttribSize_3x32, .type = DkVtxAttribType_Float, .isBgra = 0},
+    {.bufferId = 0, .isFixed = 0, .offset = 28, .size = DkVtxAttribSize_4x8, .type = DkVtxAttribType_Uint, .isBgra = 0},
+};
 static const DkVtxBufferState vertex_buffer = {32, 0};
+
+/* The draw key's mesh bits (render.rs's MESH and MESH_TWO_SIDED): a mesh draw culls back faces
+   unless its loop draws both sides (flag 8192, finding 167). */
+enum { KEY_MESH = 1u << 24, KEY_TWO_SIDED = 1u << 25 };
+static int raster_culls;
+
+/* The rasterizer: back faces culled for a one-sided mesh, else none (every other draw and pass).
+   A mesh's back faces have a positive area in GS pixels (y down), clockwise in clip space
+   (vu1_mesh.inc); deko3d's CCW front face is wgpu's here, both judged in clip space (y up). */
+static void raster_bind(int cull)
+{
+    if (raster_culls == cull) return;
+    DkRasterizerState raster;
+    dkRasterizerStateDefaults(&raster);
+    raster.cullMode = cull ? DkFace_Back : DkFace_None;
+    dkCmdBufBindRasterizerState(cmd, &raster);
+    raster_culls = cull;
+}
 
 /* A full-screen pass's state: no blending, no depth, all channels written. A run of them (IMPORT pages)
    binds it once; the draw state's record is out of date either way. */
@@ -753,6 +780,7 @@ static void fullscreen_state(DhdrNative *n, const DkShader *pixel)
 {
     n->bound_valid = n->blend_valid = n->scissor_valid = n->viewport_valid = 0;
     n->uniform_set = n->texture_bound = 0;
+    raster_bind(0);
     if (n->rect_pixel != pixel) {
         DkShader const *shaders[2] = {&shader_fullscreen, pixel};
         dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, 2);
@@ -970,6 +998,7 @@ static void surfaces_prepare(DhdrNative *n)
                 dkCmdBufBindRenderTarget(cmd, NULL, &s->image.view);
                 DkShader const *shaders[2] = {&shader_fullscreen, &shader_grow};
                 dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, 2);
+                raster_bind(0);
                 DkDepthStencilState depth;
                 dkDepthStencilStateDefaults(&depth);
                 depth.depthTestEnable = 1, depth.depthWriteEnable = 1, depth.depthCompareOp = DkCompareOp_Always;
@@ -1102,11 +1131,14 @@ static void set_key(DhdrNative *n, uint32_t key)
     flush_draw(n);
     n->rect_pixel = NULL;
     uint32_t blend_key = key & 0x3FFF, mask = key >> 14 & 15, depth = key >> 18 & 31;
-    int dual = key >> 23 & 1, blending = blend_key & 1;
-    if (!n->bound_valid || (n->bound_key >> 23 & 1) != (uint32_t)dual) {
-        DkShader const *shaders[2] = {&shader_vertex, dual ? &shader_dual : &shader_pixel};
+    int dual = key >> 23 & 1, blending = blend_key & 1, mesh = (key & KEY_MESH) != 0;
+    if (!n->bound_valid || (n->bound_key >> 23 & 1) != (uint32_t)dual || ((n->bound_key ^ key) & KEY_MESH)) {
+        DkShader const *shaders[2] = {mesh ? &shader_mesh : &shader_vertex, dual ? &shader_dual : &shader_pixel};
         dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, 2);
     }
+    if (!n->bound_valid || ((n->bound_key ^ key) & KEY_MESH))
+        dkCmdBufBindVtxAttribState(cmd, mesh ? mesh_attributes : vertex_attributes, 3);
+    raster_bind(mesh && !(key & KEY_TWO_SIDED));
     if (!n->bound_valid || (n->bound_key & 0x3FFF) != blend_key || (n->bound_key >> 23 & 1) != (uint32_t)dual) {
         DkColorState color;
         dkColorStateDefaults(&color);
@@ -1333,6 +1365,7 @@ static void render(DhdrNative *n, const DhdrPicture *p)
         int uses_constant = enabled && (src == BLEND_FACTOR || src == BLEND_INV_FACTOR || dst == BLEND_FACTOR || dst == BLEND_INV_FACTOR);
         uint32_t depth_bits = depth ? 16 | (dk & 4 ? 8u : 0u) | (dk & 3) : retained ? 17 : 0;
         uint32_t key = blend_key | mask << 14 | depth_bits << 18 | (uint32_t)uses_as << 23;
+        if (k->constants.flags & 4096) key |= KEY_MESH | (k->constants.flags & 8192 ? KEY_TWO_SIDED : 0);
 
         DkGpuAddr uniform = n->constants_addr;
         if (!n->constants_valid || memcmp(&n->constants_last, &constants, sizeof constants)) {
@@ -1401,16 +1434,15 @@ static int picture(DhdrNative *n, const DhdrPicture *p, const uint32_t *indices,
     n->rect_pixel = NULL;
     n->pending_count = 0;
     uint64_t record = now_ns();
-    /* The GPU keeps these for good: the rasterizer, vertex layout and descriptor tables never change. */
+    /* The GPU keeps these for good: the descriptor tables and the vertex buffer's stride never change;
+       the rasterizer and the vertex layout change only with a mesh key (set_key, raster_bind). */
     static int bound_once;
     if (!bound_once) {
         bound_once = 1;
         dkCmdBufBindImageDescriptorSet(cmd, image_set, IMAGE_DESCRIPTORS);
         dkCmdBufBindSamplerDescriptorSet(cmd, sampler_set, SAMPLER_DESCRIPTORS);
-        DkRasterizerState raster;
-        dkRasterizerStateDefaults(&raster);
-        raster.cullMode = DkFace_None;
-        dkCmdBufBindRasterizerState(cmd, &raster);
+        raster_culls = -1;
+        raster_bind(0);
         dkCmdBufBindVtxAttribState(cmd, vertex_attributes, 3);
         dkCmdBufBindVtxBufferState(cmd, &vertex_buffer, 1);
     }
@@ -1740,6 +1772,7 @@ int dhdr_native_present(DhdrNative *n, DhdrSurface *s, const DhdrPresentRect *r)
         dkCmdBufSetScissors(cmd, 0, &cut, 1);
         DkShader const *shaders[2] = {&shader_fullscreen, &shader_present};
         dkCmdBufBindShaders(cmd, DkStageFlag_GraphicsMask, shaders, 2);
+        raster_bind(0);
         dkCmdBufBindUniformBuffer(cmd, DkStage_Fragment, 0, uniform, 16);
         dkCmdBufBindTexture(cmd, DkStage_Fragment, 0, dkMakeTextureHandle((uint32_t)n->display.sampled, n->present_sampler));
         descriptors_sync();

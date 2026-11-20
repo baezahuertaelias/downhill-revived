@@ -204,6 +204,35 @@ merge in a throwaway worktree. Nothing from it is used here.
   left as code memory had stopped hbl the same way (`nx_threads_end`, `nx_guest_memory_release`).
   Open: after this run the player saw "The software was closed because an error occurred" (the error
   applet, no crash report, no erpt on the card); when it appeared and its code are not known.
+- [x] 2026-11-20 (branch `switch/mesh-path`): the uam fault narrowed offline, without a console. A
+  self-built uam (devkitPro/uam `5a5afc2`, release build) gives stock uam's bytes, and envytools'
+  `envydis -m gm107` reads the code. uam writes `ShaderLocalMemoryCrsSize` (the off-chip call/return
+  stack, SPH CommonWord3) as 0 for every graphics stage (`compiler_iface.cpp`: "TODO: Proper logic";
+  compute gets 0x800). The on-chip stack holds 16 entries, two for each nested SSY, PBK or PCNT
+  (mesa's `nvc0_program.c` has the sizing, commented out: `((maxCFDepth * 2) + 47) / 48 * 0x200`
+  when `maxCFDepth * 2 > 16`). Measured over every path of the code: main's `native_pixel` and
+  `native_pixel_dual` nest 11 deep; 0.7.6's pinned copy and main's `native_convert` nest 7; every
+  other stage nests 0-1. Every stage that draws right on the console nests 8 or less, and main's
+  broken draw stages nest deeper. A warp that overflows the stack loses where it reconverges, so its
+  pixels come out wrong as a block. `nx_shaders.py` now measures the nesting (`branch_depth`) and
+  gives a stage deeper than 8 the warp's scratch as its stack (`with_crs`: 0x800 bytes, the queue's
+  default, in the SPH and in `per_warp_scratch_sz`). This changes no stage that ships today (all 7 or
+  less). `NX_DRAWS=main` builds the draw stages from main's `native.wgsl` for a console run.
+  Not explained: `fb12874d`'s draw stages nest only 5 and were reported broken too. That commit
+  brings 20 more `f2f ... round` (`round()`) and a branch around the texel load, so a second fault
+  may remain. `native_convert` also uses `round()` and draws right.
+  Sources: mesa `src/gallium/drivers/nouveau/nvc0/nvc0_program.c` and `nvc0_screen.c`, NVIDIA's
+  open-gpu-doc "Shader Program Header" (CRS size in bytes per warp, multiples of 512), envytools, and
+  devkitPro/uam pull request 4 (a claim against its dual-issue pass, closed unmerged).
+- [x] 2026-11-20 (branch `switch/mesh-path`): step 3's first part, Native VU's mesh draws in deko3d.
+  `nx_shaders.py` builds `native_mesh_vertex` from main's `native.wgsl` (it has no branches, and its
+  outputs are the pinned pixel stages' inputs). `dhd_render_nx.c` binds it with the mesh vertex
+  layout (`mesh_attributes`, pipelines.rs's `MESH_ATTRIBUTES`) for a draw with flag 4096 (key bit 24).
+  It culls back faces unless flag 8192 is set (key bit 25; `raster_bind`, and every full-screen pass
+  sets culling off again). `dhdr_native_meshes()` now answers yes. The rest is the shared C
+  (`native_core.inc`'s `native_mesh`, `vu1_mesh.inc`). `native_vu` stays off by default in
+  `settings_nx.c` until a console run shows the meshes right. Open for that run: the front face
+  (deko3d's CCW with `OriginUpperLeft` is assumed to cull what wgpu's `Back` culls).
 - [ ] step 1: baseline on the console
 - [ ] steps 2 to 5
 
@@ -226,6 +255,10 @@ merge in a throwaway worktree. Nothing from it is used here.
 
 ## Surprises
 
+- The uam fault was not in the code it generates but in the header it writes: a graphics stage gets
+  no off-chip call/return stack, so only stages that branch deeply fail. main's draw stages branch
+  deeper than 0.7.6's (`fetch_u`, `bilinear_u`, `combine`), which is why every newer version broke in
+  a different place.
 - Native VU was assumed to be a thing to measure on the Switch; it is not present there at all (the
   renderer has no mesh hook). Step 3's first job is the mesh path.
 - The thread placement of step 2 was already in the contributor's branch.
