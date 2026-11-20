@@ -185,7 +185,7 @@ def host_tests():
     # SDL3 starts and enumerates the controllers (none needed): gamepad.c's smoke test, with the
     # SDL thread (host/sdl_host.c), the keyboard and the text field it feeds (W11)
     # and gamepad.c's reading of what SDL reports: the pads' kinds and the sticks' dead zone (finding 134)
-    gamepad = testprog.host('gamepad', [HLE / 'gamepad.c', HLE / 'keyboard.c', HLE / 'text_input.c',
+    gamepad = testprog.host('gamepad', [HLE / 'gamepad.c', HLE / 'gamepad_layout.c', HLE / 'keyboard.c', HLE / 'text_input.c',
                                         ROOT / 'port/host/sdl_host.c', HLE / 'test_gamepad.c', END_STUB],
                           sdl=True, low=True)
     testprog.run(gamepad)

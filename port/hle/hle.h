@@ -152,6 +152,7 @@ int gamepad_raw(int player, GamepadRaw *out);  /* 0: no controller for that play
 int gamepad_raw_take(int player, GamepadRaw *out);
 void gamepad_apply(const struct ControlsLayout *layout, const GamepadRaw *raw, int dead_zone, HostPad *out);
 int gamepad_place(const struct ControlsLayout *layout, int id);  /* id's place with the layout's Swap L1/L2, R1/R2 */
+int gamepad_input_id(const char *name);  /* a controls_table.h input's id by its dhd.ini name (0: none) */
 void gamepad_vibrate(int player, int light, int heavy);
 /* What a controller's buttons are labelled: for the button icons (port/gs/button_icons.c). */
 enum { PAD_KIND_NONE = 0, PAD_KIND_PLAYSTATION = 1, PAD_KIND_XBOX = 2, PAD_KIND_NINTENDO = 3 };

@@ -325,8 +325,12 @@ def number_pairs(line):
 
 
 def heartbeat_values(line):
-    """A once-a-second line's numbers: "key=1.5" and the older "field 12 pictures 3"."""
+    """A once-a-second line's numbers: "key=1.5", the older "field 12 pictures 3" and nx_host.c's
+    "fields/s 45.8" (a rate, taken as "fields": speed_rows reads a falling count as per second)."""
     values = number_pairs(line)
+    m = re.search(r'\bfields/s (-?\d+(?:\.\d+)?)', line)
+    if m:
+        values['fields'] = float(m.group(1))
     for k, v in re.findall(r'\b([A-Za-z_]+) (-?\d+(?:\.\d+)?)\b', line):
         values.setdefault(k, float(v))
     return values

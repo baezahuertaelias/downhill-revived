@@ -8,7 +8,9 @@
 #include <strings.h>
 #include <ctype.h>
 #include <unistd.h>
+#include <switch.h>
 #include "settings_table.h"
+#include "controls_table.h"
 
 typedef struct { const char *key, *env, *def; int always; } Setting;
 static const Setting settings[] = {
@@ -28,6 +30,10 @@ static const Setting settings[] = {
     {"shadows", "DHD_SHADOWS", "1", 0}, {"lens_flare", "DHD_LENS_FLARE", "1", 0}, {"particles", "DHD_PARTICLES", "1", 0},
     {"native_vu", "DHD_NATIVE_VU1", "off", 0}, {"stick_dead_zone", "DHD_STICK_DEAD_ZONE", "game", 0},
     {"room_region", "DHD_NET_ROOM_REGION", "auto", 0}, {"language", "", "", 0},
+    /* not settings, but dhd.ini's own lines: the install id (dhd_settings_install_id) and the
+       bindings (read by dhd_controls_layouts) */
+    {"install_id", "", "", 0}, {"keyboard", "DHD_KEYBOARD", "", 0}, {"pad1", "DHD_PAD1", "", 0},
+    {"pad2", "DHD_PAD2", "", 0}, {"pad3", "DHD_PAD3", "", 0}, {"pad4", "DHD_PAD4", "", 0},
 };
 enum { COUNT = sizeof settings / sizeof *settings };
 
@@ -218,6 +224,53 @@ int dhd_settings_save(const char *path, const char *key, const char *value)
     if (ok) { remove(path); ok = rename(temp, path) == 0; }
     if (!ok) remove(temp);
     return ok;
+}
+
+/* The install id (finding 161): dhd.ini's install_id when it is 32 lowercase hex digits, else a new
+   random one saved there (without the file: one for this run only). */
+int dhd_settings_install_id(const char *path, char *out, size_t size)
+{
+    static char run_id[33];
+    char id[64];
+    if (size < 33) return 0;
+    if (dhd_settings_read(path, "install_id", id, sizeof id) && strlen(id) == 32 && strspn(id, "0123456789abcdef") == 32) {
+        snprintf(out, size, "%s", id);
+        return 1;
+    }
+    if (!*run_id) {
+        uint8_t bytes[16];
+        randomGet(bytes, sizeof bytes);
+        for (int i = 0; i < 16; i++) snprintf(run_id + 2 * i, 3, "%02x", bytes[i]);
+    }
+    snprintf(out, size, "%s", run_id);
+    char *text = off(path) ? NULL : read_all(path);
+    if (text) dhd_settings_save(path, "install_id", run_id);  /* only into a dhd.ini that is there */
+    free(text);
+    return 1;
+}
+
+/* The bindings (controls.rs's rules) aren't in C yet: every device plays with its default layout,
+   and the CONTROLS page can't change one (finding 270). */
+void dhd_controls_layouts(const char *const values[DHD_CONTROLS_DEVICES], DhdControlsLayout out[DHD_CONTROLS_DEVICES],
+                          DhdSettingsUnknown problem)
+{
+    for (int d = 0; d < DHD_CONTROLS_DEVICES; d++) {
+        memcpy(&out[d], &control_defaults[d], sizeof out[d]);
+        if (problem && values[d] && *values[d]) {
+            char line[160];
+            snprintf(line, sizeof line, "%s: bindings aren't read on the Switch yet, the defaults play", control_devices[d].key);
+            problem(line);
+        }
+    }
+}
+
+int dhd_controls_edit(const char *const values[DHD_CONTROLS_DEVICES], int device, int edit, int target, int slot, int input,
+                      int kind, char *value, size_t value_size, char *message, size_t message_size)
+{
+    (void)values; (void)device; (void)edit; (void)target; (void)slot; (void)input; (void)kind;
+    if (value && value_size) *value = 0;
+    if (message && message_size) snprintf(message, message_size, "Not on the Switch yet");
+    return CONTROL_REFUSED;
 }
 
 int dhd_settings_read(const char *path, const char *key, char *out, size_t size)

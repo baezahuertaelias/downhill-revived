@@ -1,10 +1,14 @@
 /* Controllers on the Switch: gamepad.c's job over libnx's pads. Player 1 is the handheld or first
-   Joy-Con pair or Pro Controller; Nintendo's way round for confirm and back: A is Cross and B is
-   Circle; the others by position, left (Y) Square and top (X) Triangle. All of libnx's calls are on the
-   main thread (nx_host.c), which starts the pads before the game's thread; libnx's start has made
-   hid ready. The game's thread only copies states and sets wishes. No keyboard events come here,
-   so keyboard_focused stays 0 and host_pad_device's keyboard adds nothing. */
+   Joy-Con pair or Pro Controller. A state is gamepad.c's GamepadRaw, which the player's layout turns
+   into the PS2 pad's (gamepad_layout.c); with the default layout, Nintendo's way round for confirm
+   and back: A reads as the bottom input (Cross) and B as the right one (Circle); the others by
+   position, left (Y) Square and top (X) Triangle. So the kind is PAD_KIND_NONE: the PS2's symbols,
+   not Nintendo letters that would name B for Cross. All of libnx's calls are on the main thread
+   (nx_host.c), which starts the pads before the game's thread; libnx's start has made hid ready.
+   The game's thread only copies states and sets wishes. No keyboard events come here, so
+   keyboard_focused stays 0 and host_pad_device's keyboard adds nothing. */
 #include "hle.h"
+#include "controls_table.h"
 #include <SDL3/SDL.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,7 +16,8 @@
 
 enum { SLOTS = 4 };
 static PadState pads[SLOTS];
-static HostPad latest[SLOTS];
+static GamepadRaw latest[SLOTS];   /* under lock */
+static uint32_t held_since[SLOTS];  /* buttons held since the game's last read (gamepad_raw_take), under lock */
 static int present[SLOTS];
 static Mutex lock;
 /* A motor's handle depends on the style in use: each set is activated when that style first rumbles. */
@@ -26,13 +31,11 @@ static signed char rumble_state[SLOTS][RUMBLE_STYLES];  /* 0 not asked yet, 1 re
 static int want_light[SLOTS], want_heavy[SLOTS], sent_light[SLOTS], sent_heavy[SLOTS];
 static int motors_held;  /* the game is away or ending (gamepad_nx_hold) */
 
-static const uint16_t pressure_order[12] = {PAD_RIGHT, PAD_LEFT, PAD_UP, PAD_DOWN, PAD_TRIANGLE, PAD_CIRCLE,
-                                            PAD_CROSS, PAD_SQUARE, PAD_L1, PAD_R1, PAD_L2, PAD_R2};
-
-static uint8_t axis_byte(int v, int invert)
+/* libnx's stick value (+-32767, up positive) as SDL's axis (down positive) */
+static int16_t axis_value(int v, int invert)
 {
-    int x = ((invert ? -v : v) >> 8) + 128;  /* gamepad.c's scale: libnx's +-32767 to 0..255, 128 at rest */
-    return (uint8_t)(x < 0 ? 0 : x > 255 ? 255 : x);
+    int x = invert ? -v : v;
+    return (int16_t)(x < -32768 ? -32768 : x > 32767 ? 32767 : x);
 }
 
 int gamepad_thread_start(void)
@@ -92,24 +95,26 @@ void gamepad_thread_update(void)
 {
     for (int i = 0; i < SLOTS; i++) {
         padUpdate(&pads[i]);
-        HostPad p;
+        GamepadRaw p;
         memset(&p, 0, sizeof p);
         int on = padIsConnected(&pads[i]);
         u64 b = padGetButtons(&pads[i]);
         HidAnalogStickState l = padGetStickPos(&pads[i], 0), r = padGetStickPos(&pads[i], 1);
-        static const struct { u64 from; uint16_t to; } map[] = {
-            {HidNpadButton_A, PAD_CROSS}, {HidNpadButton_B, PAD_CIRCLE}, {HidNpadButton_Y, PAD_SQUARE}, {HidNpadButton_X, PAD_TRIANGLE},
-            {HidNpadButton_Minus, PAD_SELECT}, {HidNpadButton_Plus, PAD_START}, {HidNpadButton_StickL, PAD_L3}, {HidNpadButton_StickR, PAD_R3},
-            {HidNpadButton_L, PAD_L1}, {HidNpadButton_R, PAD_R1}, {HidNpadButton_ZL, PAD_L2}, {HidNpadButton_ZR, PAD_R2},
-            {HidNpadButton_Up, PAD_UP}, {HidNpadButton_Down, PAD_DOWN}, {HidNpadButton_Left, PAD_LEFT}, {HidNpadButton_Right, PAD_RIGHT},
+        static const struct { u64 from; const char *input; } map[] = {
+            {HidNpadButton_A, "south"}, {HidNpadButton_B, "east"}, {HidNpadButton_Y, "west"}, {HidNpadButton_X, "north"},
+            {HidNpadButton_Minus, "back"}, {HidNpadButton_Plus, "start"}, {HidNpadButton_StickL, "ls"}, {HidNpadButton_StickR, "rs"},
+            {HidNpadButton_L, "lb"}, {HidNpadButton_R, "rb"},
+            {HidNpadButton_Up, "dpad_up"}, {HidNpadButton_Down, "dpad_down"}, {HidNpadButton_Left, "dpad_left"}, {HidNpadButton_Right, "dpad_right"},
         };
         for (size_t k = 0; k < sizeof map / sizeof *map; k++)
-            if (b & map[k].from) p.buttons |= map[k].to;
-        p.left_x = axis_byte(l.x, 0), p.left_y = axis_byte(l.y, 1);   /* up is positive here, down there */
-        p.right_x = axis_byte(r.x, 0), p.right_y = axis_byte(r.y, 1);
-        for (int k = 0; k < 12; k++) p.pressure[k] = p.buttons & pressure_order[k] ? 255 : 0;
+            if (b & map[k].from) p.buttons |= 1u << gamepad_input_id(map[k].input);
+        p.trigger[0] = b & HidNpadButton_ZL ? 255 : 0;  /* ZL and ZR are buttons: fully pressed or not */
+        p.trigger[1] = b & HidNpadButton_ZR ? 255 : 0;
+        p.axis[0] = axis_value(l.x, 0), p.axis[1] = axis_value(l.y, 1);
+        p.axis[2] = axis_value(r.x, 0), p.axis[3] = axis_value(r.y, 1);
         mutexLock(&lock);
         latest[i] = p;
+        held_since[i] |= p.buttons;
         present[i] = on;
         mutexUnlock(&lock);
         if (!on) sent_light[i] = sent_heavy[i] = -1;  /* one that comes back is told again */
@@ -118,15 +123,23 @@ void gamepad_thread_update(void)
 }
 
 int gamepad_start(void) { return 1; }
-int gamepad_read(int player, HostPad *out)
+/* Players keep libnx's order; no first-press claim (gamepad.c's, finding 232), so nothing to publish. */
+void gamepad_set_multiplayer(int local_multiplayer) { (void)local_multiplayer; }
+
+static int read_raw(int player, GamepadRaw *out, int take)
 {
     if (player < 0 || player >= SLOTS) return 0;
     mutexLock(&lock);
     int ok = present[player];
     if (ok) *out = latest[player];
+    if (ok && take) out->buttons |= held_since[player];
+    if (take) held_since[player] = 0;
     mutexUnlock(&lock);
     return ok;
 }
+int gamepad_raw(int player, GamepadRaw *out) { return read_raw(player, out, 0); }
+int gamepad_raw_take(int player, GamepadRaw *out) { return read_raw(player, out, 1); }
+int gamepad_kind(int player) { (void)player; return PAD_KIND_NONE; }
 void gamepad_vibrate(int player, int light, int heavy)
 {
     if (player < 0 || player >= SLOTS) return;

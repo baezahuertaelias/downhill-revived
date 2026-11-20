@@ -5,6 +5,7 @@
 #include "../../hle/hle.h"
 #include "../../host/host_api.h"
 
+void touch_host_args(int argc, char **argv) { (void)argc; (void)argv; }  /* no --touch-editor */
 int touch_host_event(const union SDL_Event *e) { (void)e; return 0; }
 void touch_host_tick(void) {}
 void touch_host_merge(HostPad *out) { (void)out; }

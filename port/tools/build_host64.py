@@ -601,8 +601,10 @@ def main():
         # not start last); the link keeps the units' own order
         sources = units + [rt/'wasm-rt-impl.c', work/'imports_gen.c'] + glue(t)
         host_sources = [] if a.host_library else [ROOT/u for u in host_units(t)]
+        # devkitA64's gcc -O3 takes over 15 minutes on vu0_interp.c alone (its VU1 blocks, finding 270)
+        host_timeout = 7200 if t.switch else 900
         with ThreadPoolExecutor(jobs) as pool:
-            done = {s: pool.submit(compile_one, s, 900 if s in host_sources else 1800)
+            done = {s: pool.submit(compile_one, s, host_timeout if s in host_sources else 1800)
                     for s in sorted(sources + host_sources, key=lambda s: -Path(s).stat().st_size)}
             objects = [done[s].result() for s in sources]
             host_objects = [done[s].result() for s in host_sources]
