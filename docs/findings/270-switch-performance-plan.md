@@ -154,7 +154,51 @@ merge in a throwaway worktree. Nothing from it is used here.
   lacked what main's sound (pause, clear, gain, destroy), window state, `SDL_InitState`, `SDL_AddAtomicInt` and finger events now
   use (the audio thread now handles pause, clear, mute and close itself); `touch_host.c` is replaced on the Switch by `touch_nx.c`
   (no touch controls yet, as a desktop). NOT done: the link, the NRO and any run, which need the disc (the wasm core) and a console.
-- [ ] step 1: baseline on the console (needs a console)
+- [x] 2026-11-17: first full NRO build attempt, on Windows in Docker (an image from `devkitpro/devkita64`
+  with wasi-sdk 34, WABT 1.0.42, SIMDe and naga-cli 29.0.3; the source in a Docker volume, as a bind
+  mount from the Windows drive is slow). `vu0_interp.c` alone takes over 15 minutes under devkitA64's
+  gcc -O3 and hit the host units' 900 s timeout; the Switch's host units now get 7200 s
+  (`build_host64.py`). `--jobs 8` fits gcc's ~3.5 GB per core chunk in 32 GB. Off Windows the object
+  cache works only with `DHD_OBJCACHE_DIR` set (`objcache.py`); without it every build recompiles all.
+  The first link named what main gained since 0.7.6 and the Switch's C lacked. Now: controllers
+  give main's raw state (`gamepad_nx.c`; A stays Cross, B Circle; PS2 symbols, `PAD_KIND_NONE`),
+  through the layout code moved out of `gamepad.c` into `gamepad_layout.c` for every platform;
+  `settings_nx.c` has the install id and the default layouts, but no rebinding (the CONTROLS page
+  answers "Not on the Switch yet"; porting `controls.rs` is open); `dhd_render_nx.c` answers no
+  device loss, no mesh draws, no GPU timings, no pipeline list, no surface read back; the race ping
+  and the network cut are stubs as the rest of online.
+- [x] 2026-11-18: the NRO's first runs on a console (sphaira, nxlink, 1785/768/1600 MHz, scale 1).
+  The title's 3D scene came out as grey shards and missing blocks at 27 fields/s. Cause: ZCULL keeps
+  coarse Z per tile for the bound Z image and drops it only when the bound address changes, so a Z
+  surface written elsewhere since (another pass, a copy, the probe) left stale tiles that rejected
+  whole blocks of the scene. `dhd_render_nx.c` now flushes pending draws and invalidates ZCULL after
+  binding a target with depth; the scene draws, at 44-46 fields/s. Also added: the image descriptor
+  cache is invalidated before any draw or dispatch that samples, when a descriptor was written since
+  (a freed slot given to a new image could still read as the old one); it changed nothing visible,
+  but deko3d requires it. Test tools kept: `DHD_NX_DRAWS=N` writes picture N's commands to
+  `draws_N.csv`, and a log line names a display surface smaller than the picture.
+- [x] 2026-11-18: menus and rider select still showed warp-sized blocks of wrong texels, smears, old
+  text and a grey box on the logo, with `textures = off` too. Bisect: with the draw stages built from
+  0.7.6's `native.wgsl` and `native_dual.wgsl` (the text the contributor's port drew correctly with)
+  and everything else from main, the main menu and rider select are clean. Main's draw shaders as of
+  `fb12874d` are already broken; that commit adds a `vec2` select, `round()` and a branch around the
+  texel load, and HEAD adds a `vec4` select with `clamp` in `load_texel` and the alpha test before
+  `discard`. Removing `fb12874d`'s three did not fix HEAD. The specialisation constants
+  (`native_spec`, `native_texel_scale`) come out as plain `0` in the GLSL and are not the cause. The
+  blocks fit a uam miscompile around branches, `discard` and texture loads, which each version of
+  main's shader trips in a different place; it was not narrowed further. See the decision below.
+- [x] 2026-11-20: EXIT GAME and `DHD_NX_EXIT` return to the Homebrew Menu (phases B and C pass, no
+  crash report). hbl gives the next NRO the same heap and checks nothing, so what the game left in it
+  stopped hbl with `0xD401` (InvalidCurrentMemory) at `hbl + 0x4034`. `DHD_NX_MEMMAP=1`
+  (`exit_memory.txt`) found three leftovers, each fixed: the game thread's 64 MiB stack (it ended with
+  `svcExitThread`, so libnx's `threadClose` refused to unmap it; now `threadExit`, and a refused close
+  is logged and falls back to the system's exit), the socket service's transfer memory (`0x234000`,
+  libnx's default BSD config; `socketExit` was never called), and the guard pages of the EE fibers'
+  8 MiB stacks (`host64_fiber_guards_release`). Before those, threads left running and guest memory
+  left as code memory had stopped hbl the same way (`nx_threads_end`, `nx_guest_memory_release`).
+  Open: after this run the player saw "The software was closed because an error occurred" (the error
+  applet, no crash report, no erpt on the card); when it appeared and its code are not known.
+- [ ] step 1: baseline on the console
 - [ ] steps 2 to 5
 
 ## Decisions
@@ -163,6 +207,16 @@ merge in a throwaway worktree. Nothing from it is used here.
   stays and the branch can be compared with the first commit.
 - Clocks, the deko3d library and the route are fixed before any number counts, because finding 127
   changed descriptors and clocks together and could not split their effects.
+- The Switch's draw stages (`native_vertex`, `native_pixel`, `native_pixel_dual`) are built from a
+  pinned copy of 0.7.6's draw shaders, `port/nx/native_draws.wgsl`; `nx_shaders.py` builds every other
+  stage, the conversion included, from main's `port/gs/native.wgsl`. This is a deliberate exception to
+  the one-code-path rule (finding 099): uam miscompiles main's newer draw shaders (above), and finding
+  the exact pattern would take a console run per guess. The copy is the text `dhd_render_nx.c` was
+  written for. Cost: the Switch draws without main's shader features since 0.7.6, among them smooth
+  bilinear when upscaled (196), R32Uint texels and native VU meshes; none is in use on the Switch today
+  (scale 1, `native_vu` off). The copy goes when uam compiles main's draw shaders correctly or the
+  pattern is found and patched in `nx_shaders.py`; until then a draw shader change on main is not
+  seen by the Switch.
 
 ## Surprises
 
@@ -170,6 +224,9 @@ merge in a throwaway worktree. Nothing from it is used here.
   renderer has no mesh hook). Step 3's first job is the mesh path.
 - The thread placement of step 2 was already in the contributor's branch.
 - The merge compiled by nobody for a day hid six API breaks (above), all from main's changes since 0.7.6 and 0.8.9; the shared code gained SDL calls the Switch's hand-written shim does not have, so every merge of main needs this compile check until the build runs in CI.
+- The picture faults were not in the C renderer's reading of main's commands, as first assumed, but
+  in two places outside it: ZCULL state that deko3d leaves to the program, and uam's compile of main's
+  draw shaders. Neither shows on a PC; only a console run does.
 
 ## Result
 
