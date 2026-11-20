@@ -204,6 +204,23 @@ merge in a throwaway worktree. Nothing from it is used here.
   left as code memory had stopped hbl the same way (`nx_threads_end`, `nx_guest_memory_release`).
   Open: after this run the player saw "The software was closed because an error occurred" (the error
   applet, no crash report, no erpt on the card); when it appeared and its code are not known.
+- [x] 2026-11-20 (`switch/exit-error`, static reading only, not yet run on a console): that error
+  without a report fits the crash handler. It ended the process with `svcExitProcess` behind the
+  applet manager's back, so a fault anywhere (on the way out too, after `socketExit` took nxlink's
+  stream with the report) showed exactly that message, with no code and nothing on the card. It now
+  writes `crash.txt` beside dhd.log and gives the exception back to the kernel unhandled, so
+  Atmosphère writes its report and the error has a code. The way out writes `exit_steps.txt`, one
+  line per step, on the card at once and after nxlink's stream is gone, up to libnx's own exit
+  (`userAppExit`). It ends with a probe of the loader's heap: sphaira's loader reads the next NRO with
+  one read over the whole heap, which fails on any page that isn't plain read/write heap (as in
+  the dw3-switch port's notes on its Sphaira exit, on GitHub as Larbaco/dw3-switch: the same `0xD401` at `hbl + 0x40xx`). A heap that
+  isn't clean takes the system's exit instead of the menu. Also given back now: the `DHD_NX_SAMPLE`
+  thread (made outside the shim's list, so it outlived the game), audout when it was opened but
+  never started, and the audio buffers. The audio thread's untimed wait could keep it from seeing
+  the close while sound was stopped out of focus. The clkrst session is closed, and the main thread
+  gets the loader's priority back (the menu runs on it next). Open: the error's code and moment.
+  Also open: whether sphaira alone, closed the same way, shows it. Users report that message when
+  closing sphaira itself with + (GBAtemp, nton issue 12).
 - [ ] step 1: baseline on the console
 - [ ] steps 2 to 5
 
