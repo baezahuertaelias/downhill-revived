@@ -2,7 +2,13 @@
 
 Status: in progress
 
-Branch `perf/switch-270` from `main` bbe4acc5 (release 0.8.10), planned 2026-11-16, step 0 done, the rest waits for a console.
+Branch `perf/switch-270` from `main` bbe4acc5 (release 0.8.10), planned 2026-11-16; merged into the
+fork's `main` on 2026-11-20 with step 0, the first console runs and the return to the Homebrew Menu.
+The rest continues on branches from that merge, each keeping this file current: `switch/baseline`
+(steps 1 and 2: the console baseline, threads and cores, the sound underruns), `switch/mesh-path`
+(step 3: Native VU's mesh draws and main's renderer gains in deko3d), `switch/pacing` (step 5),
+`switch/exit-error` (the error applet seen after the return to the menu) and `switch/controls`
+(rebinding, `controls.rs`'s part in C).
 This file is the lane's plan while it runs and its finding when it merges. Someone who has only
 this file and the git log must be able to pick the lane up.
 
