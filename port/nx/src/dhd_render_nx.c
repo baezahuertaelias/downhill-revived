@@ -1731,13 +1731,25 @@ static void capture_image(const Image *t, const char *name, uint64_t picture)
     nx_logf("nx capture: %s %u x %u at picture %llu", path, t->w, t->h, (unsigned long long)picture);
 }
 
+/* A capture writes about ten BMPs to the card, about 4.7 s with the game stopped: none inside DHD_BENCH's
+   window, whose speed it would ruin (phase B's menus measured 26.8 fields/s with two of them; finding
+   270). One comes right after the window instead. */
 static void capture_pass(DhdrNative *n)
 {
-    static int on = -1, next;
+    static int on = -1, next, after_window;
+    static unsigned long long first, last;
     static const uint64_t at[] = {120, 400, 900, 1500, 2200, 5800};
-    if (on < 0) on = getenv("DHD_NX_CAPTURE") != NULL;
-    if (!on || next >= sizeof at / sizeof *at || nx_pictures < at[next]) return;
-    next++;
+    enum { AT = sizeof at / sizeof *at };
+    if (on < 0) {
+        on = getenv("DHD_NX_CAPTURE") != NULL;
+        const char *window = getenv("DHD_BENCH");
+        if (!window || sscanf(window, "%llu-%llu", &first, &last) != 2 || last <= first) first = last = 0;
+    }
+    if (!on) return;
+    while (next < AT && last && at[next] >= first && at[next] <= last) next++, after_window = 1;
+    if (after_window && nx_pictures > last) after_window = 0;
+    else if (next >= AT || nx_pictures < at[next] || (last && nx_pictures >= first && nx_pictures <= last)) return;
+    else next++;
     capture_image(&n->display, "display", nx_pictures);
     nx_logf("nx capture: display %u x %u, heap %u MiB", n->display_w, n->display_h, heap_used >> 20);
     for (int i = 0; i < SURFACES; i++)
