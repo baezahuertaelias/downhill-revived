@@ -1512,11 +1512,11 @@ struct DhdrSurface {
     DkImage const *list[SWAP_IMAGES];
     DkMemBlock block;
     int acquired, w, h;
+    int vsync, interval;  /* dhd.ini's vsync; the swap interval set last (-1: none yet) */
 };
 
 DhdrSurface *dhdr_surface_create(const DhdrWindow *w, uint32_t present_flags)
 {
-    (void)present_flags;
     if (!ready || w->kind != DHDR_WINDOW_NX) return NULL;
     DhdrSurface *s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -1540,6 +1540,8 @@ DhdrSurface *dhdr_surface_create(const DhdrWindow *w, uint32_t present_flags)
     dkSwapchainMakerDefaults(&sm, device, (void *)(uintptr_t)w->a, s->list, SWAP_IMAGES);
     s->swapchain = dkSwapchainCreate(&sm);
     s->acquired = -1;
+    s->vsync = (present_flags & DHDR_PRESENT_NO_TEARING) != 0;
+    s->interval = -1;
     screen = s;
     return s;
 }
@@ -1583,11 +1585,30 @@ void dhdr_surface_touch(DhdrSurface *s, const float *items, uint32_t count, floa
 {
     (void)s; (void)items; (void)count; (void)width_mm; (void)height_mm;
 }
+/* The swap interval follows the time a picture is held (fps.c port_frame_period), in whole
+   vblanks of the 60 Hz screen: at fps = 30 every picture stays two vblanks, so the display paces
+   the frames evenly instead of the wall-clock grid against vblank (pictures held one, two or three
+   vblanks). 1/60 before GO and at 60 (1 vblank); a rate between 30 and 60 keeps 1. vsync = 0: 0. */
+extern double port_frame_period(void);
+static void present_interval(DhdrSurface *s)
+{
+    int interval = 0;
+    if (s->vsync) {
+        interval = (int)(port_frame_period() * 60 + 0.01);
+        if (interval < 1) interval = 1;
+        if (interval > 2) interval = 2;
+    }
+    if (interval == s->interval) return;
+    dkSwapchainSetSwapInterval(s->swapchain, (uint32_t)interval);
+    nx_logf("nx present: swap interval %d", interval);
+    s->interval = interval;
+}
 void dhdr_surface_present(DhdrSurface *s)
 {
     if (s->acquired < 0) return;
     uint64_t start = now_ns();
     queue_check("a present");
+    present_interval(s);
     dkQueuePresentImage(queue, s->swapchain, s->acquired);
     s->acquired = -1;
     nx_t_present_ns += now_ns() - start;
